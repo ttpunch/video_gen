@@ -1,0 +1,16 @@
+gradio>=4.0.0
+requests
+python-dotenv
+numpy
+opencv-python
+soundfile
+torch
+torchvision
+tqdm
+onnxruntime
+librosa
+scipy
+gdown
+filterpy
+face-alignment
+kokoro-onnx

@@ -1,0 +1,38 @@
+# Python Virtual Environment
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Node / Next.js Build & Dependencies
+frontend/.next/
+frontend/node_modules/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Video Pipeline Temp, Outputs and Local Models
+temp/
+outputs/
+models/
+.env
+
+# Media outputs
+*.wav
+*.mp3
+*.mp4
+
+# Logs
+*.log
+
+# Easy-Wav2Lip checkpoints and local outputs
+Easy-Wav2Lip/checkpoints/
+Easy-Wav2Lip/__pycache__/
+Easy-Wav2Lip/temp/
+Easy-Wav2Lip/gfpgan/
+Easy-Wav2Lip/*.pkl
+Easy-Wav2Lip/installed.txt
+Easy-Wav2Lip/last_file.txt
+Easy-Wav2Lip/.DS_Store
