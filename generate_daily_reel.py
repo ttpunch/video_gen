@@ -65,6 +65,7 @@ def main():
     parser.add_argument("--disable-captions", action="store_true", help="Disable burning subtitles in the center.")
     parser.add_argument("--caption-font", type=str, default="Arial", help="Font for subtitles.")
     parser.add_argument("--caption-size", type=int, default=42, help="Font size for subtitles.")
+    parser.add_argument("--disable-transition-sfx", action="store_true", help="Disable transition whoosh/pop sound effects.")
     
     args = parser.parse_args()
 
@@ -83,13 +84,13 @@ def main():
     ollama_model = args.ollama_model
     if not ollama_model:
         models = get_ollama_models()
-        ollama_model = models[0] if models else "deepseek-v4-pro:cloud"
+        ollama_model = models[0] if models else "minimax-m3:cloud"
     print(f"Using Ollama Model: {ollama_model}")
 
     print("Running the automated viral shorts pipeline...")
     try:
         # Run the pipeline
-        output_video, storyboard, final_topic = run_viral_shorts_pipeline_new(
+        output_video, storyboard, final_topic, _ = run_viral_shorts_pipeline_new(
             prompt=topic,
             model=ollama_model,
             hook_style=args.hook_style,
@@ -101,7 +102,8 @@ def main():
             satisfying_background=args.satisfying_bg,
             enable_captions=not args.disable_captions,
             caption_font=args.caption_font,
-            caption_size=args.caption_size
+            caption_size=args.caption_size,
+            enable_transition_sfx=not args.disable_transition_sfx
         )
     except Exception as e:
         print(f"Error generating video: {e}")

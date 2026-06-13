@@ -14,3 +14,8 @@ gdown
 filterpy
 face-alignment
 kokoro-onnx
+duckduckgo-search
+pyngrok
+google-api-python-client
+google-auth-oauthlib
+google-auth-httplib2

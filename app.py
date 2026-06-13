@@ -9,8 +9,9 @@ import soundfile as sf
 import gradio as gr
 from dotenv import load_dotenv
 
-# Load environment variables
-load_dotenv()
+# Load search helper
+from search_helper import get_web_grounding_context, clean_json_response
+
 
 # API configuration
 LEONARDO_API_KEY = os.getenv("LEONARDO_API_KEY")
@@ -220,29 +221,54 @@ def download_music_preset(preset_name):
         print(f"Error downloading music preset {preset_name}: {e}")
     return None
 
-def generate_multi_scene_script(prompt, model):
+def generate_multi_scene_script(prompt, model, enable_search: bool = False):
     """Generate a structured 5-scene JSON script using Ollama."""
     url = f"{OLLAMA_HOST}/api/generate"
     
+    # 1. Handle dynamic web search fact checking
+    grounding_info = ""
+    if enable_search:
+        try:
+            grounding_data = get_web_grounding_context(prompt, model)
+            if grounding_data.get("requires_search") and grounding_data.get("context"):
+                grounding_info = f"\nVERIFIED INTERNET SEARCH FACTS:\n{grounding_data['context']}\n"
+                print(f"RAG Grounding: Query used: '{grounding_data['search_query']}'. Injected search context successfully.")
+        except Exception as e:
+            print(f"Failed to perform web search grounding: {e}")
+
     system_prompt = (
         "You are an expert viral TikTok, YouTube Shorts, and Instagram Reels writer. "
         "Your task is to generate a highly engaging 15-second script about the requested topic, "
         "broken down into exactly 5 sequential scenes. "
+        "To ensure visual continuity and keep the focus point consistent (so the video does not look like a series of unrelated random images), you MUST define:\n"
+        "1. A 'global_visual_style' representing the overall visual medium, art style, camera/lighting style, and color palette (e.g. 'cinematic 3D render, dark mood, neon green accents, highly detailed, 8k').\n"
+        "2. A 'global_subject_focus' describing the main character, subject, or object that remains constant across the entire story (e.g. 'a futuristic female astronaut wearing a white helmet with a gold visor').\n"
+        "If verified facts are provided under VERIFIED INTERNET SEARCH FACTS, you MUST strictly ground your narration in those facts to ensure correctness.\n"
         "Respond ONLY with a valid JSON object matching this exact format, with no markdown styling, no conversational filler, and no extra text:\n"
         "{\n"
         "  \"topic\": \"Engaging vertical title of the video\",\n"
         "  \"background_music_style\": \"Cinematic\",\n"
+        "  \"global_visual_style\": \"Overall art style, camera/lighting, and palette description\",\n"
+        "  \"global_subject_focus\": \"Description of the main character/object focus point\",\n"
         "  \"scenes\": [\n"
         "    {\n"
         "      \"narration\": \"A short engaging narrator sentence (approx. 7-8 words).\",\n"
-        "      \"visual_prompt\": \"Detailed photorealistic 9:16 portrait/vertical scene description for Leonardo.ai to generate a background visual. Do not include camera frames or devices in the prompt.\"\n"
+        "      \"visual_prompt\": \"Specific action, pose, or background setting representing the scene's narration, designed to be combined with the global style and subject description. Do not include camera frames or devices in the prompt.\"\n"
         "    },\n"
         "    ... (exactly 5 scenes)\n"
-        "  ]\n"
+        "  ],\n"
+        "  \"youtube_metadata\": {\n"
+        "    \"title\": \"Catchy optimized YouTube Shorts title (max 100 chars)\",\n"
+        "    \"description\": \"SEO-friendly description with relevant search keywords and tags\",\n"
+        "    \"tags\": [\"shorts\", \"facts\", \"viral\", \"topic\"]\n"
+        "  },\n"
+        "  \"instagram_metadata\": {\n"
+        "    \"caption\": \"Engaging Instagram Reels caption with emojis and relevant hashtags\"\n"
+        "  }\n"
         "}"
     )
     
-    full_prompt = f"System: {system_prompt}\nUser: Write a viral 15-second script for: {prompt}"
+    full_prompt = f"System: {system_prompt}\n{grounding_info}\nUser: Write a viral 15-second script for: {prompt}"
     
     payload = {
         "model": model,
@@ -255,7 +281,8 @@ def generate_multi_scene_script(prompt, model):
         response = requests.post(url, json=payload, timeout=45)
         if response.status_code == 200:
             resp_text = response.json().get("response", "").strip()
-            data = json.loads(resp_text)
+            cleaned = clean_json_response(resp_text)
+            data = json.loads(cleaned)
             if "scenes" in data and len(data["scenes"]) == 5:
                 return data
             else:
@@ -266,28 +293,38 @@ def generate_multi_scene_script(prompt, model):
     return {
         "topic": prompt if prompt else "Incredible Facts",
         "background_music_style": "Cinematic",
+        "global_visual_style": "realistic vertical 9:16 portrait, cinematic lighting, dramatic mood, high-detail",
+        "global_subject_focus": "a detailed mysterious mechanical box emitting faint golden light",
         "scenes": [
             {
                 "narration": f"Here is an incredible fact about {prompt or 'our world'}.",
-                "visual_prompt": f"Realistic vertical 9:16 portrait representing {prompt or 'discovery and mystery'}, cinematic lighting, 8k"
+                "visual_prompt": "resting on a dust-covered desk inside a dark ancient study room"
             },
             {
                 "narration": "Scientists were completely shocked when they discovered this secret.",
-                "visual_prompt": "Close-up expression of awe and disbelief, high-detail face, portrait view, dark modern lab background"
+                "visual_prompt": "slowly unlocking itself as gears slide outward"
             },
             {
                 "narration": "It changes everything we thought we knew about history.",
-                "visual_prompt": "Beautiful ancient ruins under a celestial night sky, glowing dust particles, photorealistic 9:16 vertical view"
+                "visual_prompt": "opening wide, revealing a small floating miniature galaxy inside"
             },
             {
                 "narration": "The implications could reshape our entire future.",
-                "visual_prompt": "Futuristic skyline of a green sustainable city, vertical view, golden hour, realistic reflections, 8k"
+                "visual_prompt": "projecting bright blue holographic stars onto the study walls"
             },
             {
                 "narration": "Follow for more mind-blowing facts every single day!",
-                "visual_prompt": "A glowing thumb-up icon styled as a holographic neon display on a dark studio wall, 9:16 portrait, cinematic"
+                "visual_prompt": "closing shut, leaving glowing golden sparks in the air"
             }
-        ]
+        ],
+        "youtube_metadata": {
+            "title": f"The Truth About {prompt or 'This Topic'}!",
+            "description": f"Amazing facts and details about {prompt or 'this topic'}. #shorts #facts #viral",
+            "tags": ["shorts", "facts", "viral", "interesting"]
+        },
+        "instagram_metadata": {
+            "caption": f"Mind-blowing facts about {prompt or 'this concept'}! 🤯✨ #reels #explore #viral #facts"
+        }
     }
 
 def generate_scene_image(prompt, model_key, aspect_ratio, progress=gr.Progress()):
@@ -388,12 +425,12 @@ def generate_leonardo_motion_api(image_id, prompt, progress=gr.Progress()):
         print(f"Error generating Leonardo motion video: {e}")
     return None
 
-def run_viral_shorts_pipeline(prompt, model, visual_mode, music_style, custom_music_file, voice_key, speed, leonardo_model, progress=gr.Progress()):
+def run_viral_shorts_pipeline(prompt, model, visual_mode, music_style, custom_music_file, voice_key, speed, leonardo_model, enable_search: bool = False, progress=gr.Progress()):
     """Execute the full 15-second multi-scene automated viral shorts generator pipeline.
     Returns: (output_video_path, storyboard_html_or_json, status_message)
     """
     progress(0.0, desc="Generating 5-scene script using Ollama...")
-    script_data = generate_multi_scene_script(prompt, model)
+    script_data = generate_multi_scene_script(prompt, model, enable_search=enable_search)
     topic = script_data.get("topic", "Viral Short")
     scenes = script_data.get("scenes", [])
     
@@ -414,6 +451,17 @@ def run_viral_shorts_pipeline(prompt, model, visual_mode, music_style, custom_mu
         sc_num = idx + 1
         progress(0.1 + (idx / 5.0) * 0.8, desc=f"Processing Scene {sc_num}/5: {scene['narration'][:30]}...")
         
+        # Combine scene prompt with global visual style and subject if present
+        global_style = script_data.get("global_visual_style", "") if script_data else ""
+        global_subject = script_data.get("global_subject_focus", "") if script_data else ""
+        combined_prompt_parts = []
+        if global_subject:
+            combined_prompt_parts.append(global_subject)
+        combined_prompt_parts.append(scene["visual_prompt"])
+        if global_style:
+            combined_prompt_parts.append(global_style)
+        final_visual_prompt = ", ".join(combined_prompt_parts)
+        
         # 1. Synthesize Scene Voiceover
         sc_text = scene["narration"]
         sc_audio, tts_msg = generate_speech_api(sc_text, voice_key, speed, "Normal")
@@ -425,8 +473,7 @@ def run_viral_shorts_pipeline(prompt, model, visual_mode, music_style, custom_mu
         scene_audios.append(sc_audio)
         
         # 2. Generate Scene Visual
-        sc_visual_prompt = scene["visual_prompt"]
-        sc_img_path, image_id = generate_scene_image(sc_visual_prompt, leonardo_model, "9:16", progress)
+        sc_img_path, image_id = generate_scene_image(final_visual_prompt, leonardo_model, "9:16", progress)
         if not sc_img_path:
             return None, None, f"Failed image generation at Scene {sc_num}"
             
@@ -436,7 +483,7 @@ def run_viral_shorts_pipeline(prompt, model, visual_mode, music_style, custom_mu
         current_visual_mode = visual_mode
         if current_visual_mode == "Leonardo Motion Video" and image_id:
             progress(0.1 + (idx / 5.0) * 0.8 + 0.08, desc=f"Scene {sc_num}/5: Generating motion video via Leonardo Motion...")
-            motion_vid = generate_leonardo_motion_api(image_id, sc_visual_prompt, progress)
+            motion_vid = generate_leonardo_motion_api(image_id, final_visual_prompt, progress)
             if motion_vid:
                 ffmpeg_cmd = [
                     "ffmpeg", "-y",
@@ -554,22 +601,74 @@ def run_viral_shorts_pipeline(prompt, model, visual_mode, music_style, custom_mu
         
     return final_output_path, storyboard_display, f"Successfully generated YouTube Reel for topic: {topic}!"
 
-def run_viral_shorts_pipeline_adapter(prompt, model, visual_mode_ui, music_style, custom_music, voice, speed, leonardo_model):
+
+def fetch_trends_gradio(geo):
+    import requests
+    try:
+        r = requests.get(f"http://localhost:8000/api/trends?geo={geo}", timeout=10)
+        if r.status_code == 200:
+            trends = r.json()
+            choices = []
+            html_content = "<div style='display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 15px; margin-top: 15px;'>"
+            for t in trends:
+                title = t.get("title", "")
+                traffic = t.get("traffic", "Unknown")
+                news_title = t.get("news_title", "")
+                news_url = t.get("news_url", "#")
+                pic = t.get("picture_url", "")
+                
+                choices.append(title)
+                
+                img_tag = f"<img src='{pic}' style='width: 100%; height: 120px; object-fit: cover; border-radius: 8px;'/>" if pic else "<div style='height: 120px; background: #1e293b; display: flex; align-items: center; justify-content: center; border-radius: 8px; color: #475569;'>No Image</div>"
+                
+                news_tag = f"<p style='font-size: 0.85em; margin: 5px 0 0 0;'><b>News</b>: <a href='{news_url}' target='_blank' style='color: #c084fc; text-decoration: none;'>{news_title}</a></p>" if news_title else ""
+                
+                html_content += f"""
+                <div style='background: #0f172a; padding: 12px; border-radius: 8px; border: 1px solid #334155;'>
+                    {img_tag}
+                    <h4 style='margin: 8px 0 2px 0; color: #f1f5f9; font-size: 1.05em;'>{title}</h4>
+                    <span style='background: #ef4444; color: #fff; font-size: 0.75em; padding: 2px 6px; border-radius: 12px; font-weight: bold;'>🔥 {traffic}</span>
+                    {news_tag}
+                </div>
+                """
+            html_content += "</div>"
+            return gr.update(choices=choices, value=choices[0] if choices else None), html_content
+    except Exception as e:
+        return gr.update(choices=[]), f"<p style='color: #ef4444;'>Failed to fetch trends: {str(e)}</p>"
+    return gr.update(choices=[]), "<p style='color: #ef4444;'>Failed to fetch trends.</p>"
+
+
+def select_trend_gradio(trend_title):
+    if not trend_title:
+        return gr.update(), gr.update()
+    return trend_title, True
+
+
+def run_viral_shorts_pipeline_adapter(prompt, model, visual_mode_ui, music_style, custom_music, voice, speed, leonardo_model, enable_search):
     mode = "Cinematic Slideshow" if "Slideshow" in visual_mode_ui else "Leonardo Motion Video"
-    return run_viral_shorts_pipeline(prompt, model, mode, music_style, custom_music, voice, speed, leonardo_model)
+    return run_viral_shorts_pipeline(prompt, model, mode, music_style, custom_music, voice, speed, leonardo_model, enable_search=enable_search)
 
 def get_ollama_models():
     """Dynamically fetch available models from local Ollama service."""
+    ollama_models = []
     try:
         response = requests.get(f"{OLLAMA_HOST}/api/tags", timeout=3)
         if response.status_code == 200:
-            models = response.json().get("models", [])
-            names = [m['name'] for m in models]
-            if names:
-                return names
+            ollama_models = [m['name'] for m in response.json().get("models", [])]
     except Exception:
         pass
-    return ["deepseek-v4-pro:cloud", "gemma4:31b-cloud", "qwen3.5:0.8b", "gpt-oss:120b-cloud"]
+    
+    # Ensure minimax-m3:cloud is at the front of the list
+    if "minimax-m3:cloud" in ollama_models:
+        ollama_models.remove("minimax-m3:cloud")
+    ollama_models.insert(0, "minimax-m3:cloud")
+    
+    # Add other fallbacks if not present
+    for fallback in ["deepseek-v4-pro:cloud", "gemma4:31b-cloud", "qwen3.5:0.8b", "gpt-oss:120b-cloud"]:
+        if fallback not in ollama_models:
+            ollama_models.append(fallback)
+            
+    return ollama_models
 
 def generate_script_api(prompt, model):
     """Call Ollama to generate a presentation script."""
@@ -589,6 +688,28 @@ def generate_script_api(prompt, model):
             return f"Error: Ollama returned status {response.status_code}: {response.text}"
     except Exception as e:
         return f"Error connecting to Ollama: {e}"
+
+def trim_audio_silence(input_path: str) -> str:
+    """Trim silence from the start and end of a WAV file using FFmpeg."""
+    if not input_path or not os.path.exists(input_path):
+        return input_path
+    trimmed_path = input_path.replace(".wav", "_trimmed.wav")
+    ffmpeg_cmd = [
+        "ffmpeg", "-y", "-i", input_path,
+        "-af", "silenceremove=start_periods=1:start_threshold=-50dB,areverse,silenceremove=start_periods=1:start_threshold=-50dB,areverse",
+        trimmed_path
+    ]
+    try:
+        subprocess.run(ffmpeg_cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if os.path.exists(trimmed_path) and os.path.getsize(trimmed_path) > 0:
+            try:
+                os.remove(input_path)
+            except Exception:
+                pass
+            return trimmed_path
+    except Exception as e:
+        print(f"Error trimming audio silence: {e}")
+    return input_path
 
 def generate_speech_api(text, voice_key, speed=1.0, effect="Normal"):
     """Synthesize voice using Kokoro-ONNX with optional pitch effect."""
@@ -612,6 +733,7 @@ def generate_speech_api(text, voice_key, speed=1.0, effect="Normal"):
         raw_output_path = os.path.abspath(os.path.join("temp", f"voice_raw_{int(time.time())}.wav"))
         sf.write(raw_output_path, samples, sample_rate)
         
+        audio_path = raw_output_path
         # Apply pitch shift using FFmpeg if requested
         if effect == "Kid (High Pitch)":
             pitch_output_path = os.path.abspath(os.path.join("temp", f"voice_kid_{int(time.time())}.wav"))
@@ -622,7 +744,11 @@ def generate_speech_api(text, voice_key, speed=1.0, effect="Normal"):
                 pitch_output_path
             ]
             subprocess.run(ffmpeg_cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            return pitch_output_path, "Speech synthesized with Kid voice effect!"
+            try:
+                os.remove(raw_output_path)
+            except Exception:
+                pass
+            audio_path = pitch_output_path
             
         elif effect == "Deep (Low Pitch)":
             pitch_output_path = os.path.abspath(os.path.join("temp", f"voice_deep_{int(time.time())}.wav"))
@@ -633,9 +759,14 @@ def generate_speech_api(text, voice_key, speed=1.0, effect="Normal"):
                 pitch_output_path
             ]
             subprocess.run(ffmpeg_cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            return pitch_output_path, "Speech synthesized with Deep voice effect!"
+            try:
+                os.remove(raw_output_path)
+            except Exception:
+                pass
+            audio_path = pitch_output_path
             
-        return raw_output_path, "Speech synthesized successfully!"
+        trimmed_path = trim_audio_silence(audio_path)
+        return trimmed_path, "Speech synthesized successfully!"
     except Exception as e:
         return None, f"Error synthesizing speech: {e}"
 
@@ -989,7 +1120,7 @@ with gr.Blocks(title="AI Video Presenter Generator") as demo:
                     ollama_model = gr.Dropdown(
                         label="Ollama Model",
                         choices=ollama_models_list,
-                        value=ollama_models_list[0] if ollama_models_list else "deepseek-v4-pro:cloud"
+                        value=ollama_models_list[0] if ollama_models_list else "minimax-m3:cloud"
                     )
                     
                     gr.HTML("<h3 style='color: #c084fc; margin-top: 15px;'>2. Voice settings (Kokoro)</h3>")
@@ -1182,7 +1313,7 @@ with gr.Blocks(title="AI Video Presenter Generator") as demo:
                     studio_ollama_model = gr.Dropdown(
                         label="Ollama Model",
                         choices=ollama_models_list,
-                        value=ollama_models_list[0] if ollama_models_list else "deepseek-v4-pro:cloud"
+                        value=ollama_models_list[0] if ollama_models_list else "minimax-m3:cloud"
                     )
                     script_gen_btn = gr.Button("✍️ Generate Script", elem_classes="secondary-btn")
                     
@@ -1268,6 +1399,27 @@ with gr.Blocks(title="AI Video Presenter Generator") as demo:
                 </p>
                 """
             )
+            
+            with gr.Accordion("🔥 Discover Trending Topics", open=False):
+                with gr.Row():
+                    geo_select = gr.Dropdown(
+                        label="Country Region",
+                        choices=["IN", "US", "GB", "CA", "AU"],
+                        value="IN",
+                        scale=2
+                    )
+                    fetch_trends_btn = gr.Button("Fetch Trending Topics", scale=1, variant="secondary")
+                
+                trends_choices = gr.Dropdown(
+                    label="Available Trends (Select to use)",
+                    choices=[],
+                    interactive=True
+                )
+                
+                trends_preview = gr.HTML(
+                    "<p style='color: #64748b;'>Click 'Fetch Trending Topics' to see what's hot today.</p>"
+                )
+            
             with gr.Row():
                 with gr.Column(scale=5):
                     gr.HTML("<h3 style='color: #c084fc;'>1. Short Video Topic</h3>")
@@ -1280,7 +1432,11 @@ with gr.Blocks(title="AI Video Presenter Generator") as demo:
                     viral_ollama_model = gr.Dropdown(
                         label="Ollama Model",
                         choices=ollama_models_list,
-                        value=ollama_models_list[0] if ollama_models_list else "deepseek-v4-pro:cloud"
+                        value=ollama_models_list[0] if ollama_models_list else "minimax-m3:cloud"
+                    )
+                    enable_search = gr.Checkbox(
+                        label="Verify facts via Web Search (Fact-Checking RAG)",
+                        value=False
                     )
                     
                     gr.HTML("<h3 style='color: #c084fc; margin-top: 15px;'>2. Visual Mode Settings</h3>")
@@ -1352,9 +1508,22 @@ with gr.Blocks(title="AI Video Presenter Generator") as demo:
                 inputs=[
                     viral_prompt, viral_ollama_model,
                     visual_mode, music_style, custom_music,
-                    viral_voice, viral_voice_speed, viral_leonardo_model
+                    viral_voice, viral_voice_speed, viral_leonardo_model,
+                    enable_search
                 ],
                 outputs=[viral_video_out, storyboard_out, viral_status]
+            )
+            
+            fetch_trends_btn.click(
+                fn=fetch_trends_gradio,
+                inputs=[geo_select],
+                outputs=[trends_choices, trends_preview]
+            )
+            
+            trends_choices.change(
+                fn=select_trend_gradio,
+                inputs=[trends_choices],
+                outputs=[viral_prompt, enable_search]
             )
 
 if __name__ == "__main__":

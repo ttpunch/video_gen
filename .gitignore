@@ -36,3 +36,11 @@ Easy-Wav2Lip/*.pkl
 Easy-Wav2Lip/installed.txt
 Easy-Wav2Lip/last_file.txt
 Easy-Wav2Lip/.DS_Store
+
+# Google API Credentials and cached tokens
+client_secret.json
+client_secrets.json
+token_youtube.json
+
+# Databases
+*.db

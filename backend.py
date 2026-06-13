@@ -2,11 +2,14 @@ import os
 import sys
 import time
 import json
+import uuid
 import requests
 import configparser
 import subprocess
 import soundfile as sf
 import shutil
+import threading
+from datetime import datetime
 from typing import Optional, List
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
@@ -16,6 +19,15 @@ from dotenv import load_dotenv
 
 # Load environment variables
 load_dotenv()
+
+# Custom imports for search and uploads
+import db_manager
+from search_helper import get_web_grounding_context, clean_json_response
+from uploader_youtube import upload_video_to_youtube, is_youtube_authenticated, trigger_youtube_auth_flow_url
+from uploader_instagram import upload_reel_to_instagram, is_instagram_configured
+
+# Global in-memory storage for upload job logs
+upload_jobs = {}
 
 LEONARDO_API_KEY = os.getenv("LEONARDO_API_KEY")
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
@@ -183,11 +195,62 @@ def format_ass_time(seconds):
         cs = 99
     return f"{h}:{m:02d}:{s:02d}.{cs:02d}"
 
-def generate_ass_subtitles(storyboard, output_path, font_name="Arial", font_size=42, margin_v=150, alignment=2, highlight_color="&H00FFFF&"):
+def map_speaker_to_voice_key(speaker_name: str) -> str:
+    """Map a character or speaker name to the full key in KOKORO_VOICES."""
+    if not speaker_name:
+        return "Sarah (Female - US - Soft)"
+    speaker_clean = speaker_name.split('(')[0].strip().lower()
+    for display_name in KOKORO_VOICES:
+        display_clean = display_name.split('(')[0].strip().lower()
+        if speaker_clean in display_clean or display_clean in speaker_clean:
+            return display_name
+    return "Sarah (Female - US - Soft)"
+
+def mix_transition_sfx(main_audio_path, output_audio_path, transition_times):
+    """Mix synthesized transition whoosh sound effects at scene boundary timestamps."""
+    whoosh_path = os.path.abspath(os.path.join("assets", "sfx", "whoosh.wav"))
+    if not os.path.exists(whoosh_path) or not transition_times:
+        shutil.copy(main_audio_path, output_audio_path)
+        return
+        
+    ffmpeg_cmd = ["ffmpeg", "-y", "-i", main_audio_path]
+    for _ in transition_times:
+        ffmpeg_cmd += ["-i", whoosh_path]
+        
+    inputs = ["[0:a]"]
+    filter_parts = []
+    
+    for idx, t_sec in enumerate(transition_times):
+        t_ms = int(t_sec * 1000)
+        sfx_label = f"[whoosh{idx}]"
+        filter_parts.append(f"[{idx+1}:a]adelay={t_ms}|{t_ms}[whoosh_del{idx}]; [whoosh_del{idx}]volume=0.20{sfx_label}")
+        inputs.append(sfx_label)
+        
+    amix_in = "".join(inputs)
+    filter_parts.append(f"{amix_in}amix=inputs={len(inputs)}:duration=first[aout]")
+    
+    ffmpeg_cmd += [
+        "-filter_complex", "; ".join(filter_parts),
+        "-map", "[aout]", "-c:a", "pcm_s16le", output_audio_path
+    ]
+    
+    try:
+        subprocess.run(ffmpeg_cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception as e:
+        print(f"Error mixing transition SFX: {e}")
+        shutil.copy(main_audio_path, output_audio_path)
+
+def generate_ass_subtitles(storyboard, output_path, font_name="Arial", font_size=42, margin_v=150, alignment=2, highlight_color="&H00FFFF&", style_mode="Viral Pop"):
     """
-    Generate an ASS subtitle file with sliding window word highlights.
-    alignment 2 is Centered Bottom.
+    Generate an ASS subtitle file with sliding window word highlights or animated central pops.
     """
+    if style_mode == "Viral Pop":
+        # Centered, larger, yellow/green highlights, thick outline for MrBeast/Hormozi style
+        style_line = f"Style: Default,{font_name},{font_size + 15},&HFFFFFF,{highlight_color},&H000000,&H00000000,-1,0,0,0,100,100,0,0,1,8,2,{alignment},50,50,{margin_v},1"
+    else:
+        # Standard centered bottom style
+        style_line = f"Style: Default,{font_name},{font_size},&HFFFFFF,{highlight_color},&H000000,&H00000000,-1,0,0,0,100,100,0,0,1,5,0,{alignment},50,50,{margin_v},1"
+
     lines = [
         "[Script Info]",
         "Title: Viral Subtitles",
@@ -198,11 +261,14 @@ def generate_ass_subtitles(storyboard, output_path, font_name="Arial", font_size
         "",
         "[V4+ Styles]",
         "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding",
-        f"Style: Default,{font_name},{font_size},&HFFFFFF,{highlight_color},&H000000,&H00000000,-1,0,0,0,100,100,0,0,1,5,0,{alignment},50,50,{margin_v},1",
+        style_line,
         "",
         "[Events]",
         "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text"
     ]
+    
+    # 80ms zoom up to 120%, 70ms decay back to 100%
+    anim_tags = r"{\fscx80\fscy80\t(0,80,\fscx120\fscy120)\t(80,150,\fscx100\fscy100)}"
     
     cumulative_time = 0.0
     for scene in storyboard:
@@ -229,13 +295,13 @@ def generate_ass_subtitles(storyboard, output_path, font_name="Arial", font_size
             times.append((current_time, current_time + d))
             current_time += d
             
-        # Group into chunks of 3 words
+        # Group into chunks
         words_per_chunk = 3
+        
         for i in range(0, len(words), words_per_chunk):
             chunk_words = words[i:i+words_per_chunk]
             chunk_times = times[i:i+words_per_chunk]
             
-            # For each word in this chunk, create a dialogue event where that word is highlighted
             for w_idx in range(len(chunk_words)):
                 word_start = chunk_times[w_idx][0]
                 word_end = chunk_times[w_idx][1]
@@ -246,11 +312,23 @@ def generate_ass_subtitles(storyboard, output_path, font_name="Arial", font_size
                 line_words = []
                 for j, word in enumerate(chunk_words):
                     if j == w_idx:
-                        # Highlight active word in selected color with bold
+                        # Highlight active word
                         line_words.append(f"{{\c{highlight_color}\b1}}{word}{{\b0\c&HFFFFFF&}}")
                     else:
                         line_words.append(word)
+                        
                 line_text = " ".join(line_words)
+                # Set style properties and pop animation
+                if style_mode == "Viral Pop":
+                    if w_idx == 0:
+                        # Pop the entire line on chunk entrance
+                        line_text = f"{anim_tags}{{\b1\c&HFFFFFF&}}{line_text}"
+                    else:
+                        # Render static line for subsequent words to prevent jitter
+                        line_text = f"{{\b1\c&HFFFFFF&\fscx100\fscy100}}{line_text}"
+                else:
+                    line_text = f"{{\c&HFFFFFF&}}{line_text}"
+                    
                 lines.append(f"Dialogue: 0,{start_str},{end_str},Default,,0,0,0,,{line_text}")
                 
         cumulative_time += duration
@@ -260,62 +338,152 @@ def generate_ass_subtitles(storyboard, output_path, font_name="Arial", font_size
     return True
 
 # Core Pipeline Functions
-def generate_ollama_script(prompt: str, model: str, hook_style: str = "None (Direct Prompt)"):
+def generate_ollama_script(prompt: str, model: str, hook_style: str = "None (Direct Prompt)", enable_search: bool = False):
     url = f"{OLLAMA_HOST}/api/generate"
     
     hook_instruction = VIRAL_HOOKS.get(hook_style, "")
     
-    system_prompt = (
-        "You are an expert viral TikTok, YouTube Shorts, and Instagram Reels writer. "
-        "Your task is to generate a highly engaging 15-second script about the requested topic, "
-        "broken down into exactly 5 sequential scenes. "
+    # 1. Handle dynamic web search fact checking
+    grounding_info = ""
+    if enable_search:
+        try:
+            grounding_data = get_web_grounding_context(prompt, model)
+            if grounding_data.get("requires_search") and grounding_data.get("context"):
+                grounding_info = f"\nVERIFIED INTERNET SEARCH FACTS:\n{grounding_data['context']}\n"
+                print(f"RAG Grounding: Query used: '{grounding_data['search_query']}'. Injected search context successfully.")
+        except Exception as e:
+            print(f"Failed to perform web search grounding: {e}")
+            
+    # Stage 1: Creative Story / Script Writer (Free-form text)
+    storyteller_system = (
+        "You are an expert creative storyteller and copywriter. "
+        "Your task is to write a highly engaging, viral 15-second story or script based on the topic. "
+        "It must flow naturally as a single narrative and keep the listener hooked from the first second. "
+        "Keep the total length to approximately 35-45 words. "
+        "Do not include scene numbers, brackets, or speaker names in this text—only write the raw narrative story text."
+    )
+    
+    storyteller_prompt = f"System: {storyteller_system}\n{grounding_info}\nUser: Write a 15-second viral story about: {prompt}."
+    if hook_instruction:
+        storyteller_prompt += f" Hook Instruction: {hook_instruction}"
+        
+    story_text = ""
+    try:
+        payload1 = {
+            "model": model,
+            "prompt": storyteller_prompt,
+            "stream": False
+        }
+        response1 = requests.post(url, json=payload1, timeout=45)
+        if response1.status_code == 200:
+            story_text = response1.json().get("response", "").strip()
+            print(f"--- Generated Cohesive Story ---\n{story_text}\n---------------------------------")
+    except Exception as e:
+        print(f"Ollama story text generation failed: {e}")
+        
+    if not story_text:
+        story_text = prompt
+        
+    # Stage 2: Storyboarder & Scene Segmenter (Strict JSON)
+    storyboarder_system = (
+        "You are an expert storyboarder. Take the provided story text and split it into exactly 5 sequential scenes. "
+        "To ensure visual continuity and keep the focus point consistent (so the video does not look like a series of unrelated random images), you MUST define:\n"
+        "1. A 'global_visual_style' representing the overall visual medium, art style, camera/lighting style, and color palette (e.g. 'cinematic 3D render, dark mood, neon green accents, highly detailed, 8k').\n"
+        "2. A 'global_subject_focus' describing the main character, subject, or object that remains constant across the entire story (e.g. 'a futuristic female astronaut wearing a white helmet with a gold visor').\n"
+        "For each scene:\n"
+        "1. Extract the exact segment of narration text from the story (usually 1 short sentence, approx. 7-8 words).\n"
+        "2. Assign a speaker name from this list: Sarah, Bella, Nicole, Sky, Alloy, Kore, River, Adam, Michael, Fenrir, Puck, Echo, Liam, Onyx, Emma, Isabella, George, Lewis.\n"
+        "3. Write a scene-specific action/setting description for 'visual_prompt'. This should describe ONLY the specific action, movement, or background setting of that scene, designed to be combined with the global style and subject description. Do not include camera frames, phone frames, or device frames in this prompt.\n\n"
         "Respond ONLY with a valid JSON object matching this exact format, with no markdown styling, no conversational filler, and no extra text:\n"
         "{\n"
         "  \"topic\": \"Engaging vertical title of the video\",\n"
         "  \"background_music_style\": \"Cinematic\",\n"
+        "  \"global_visual_style\": \"Overall art style, camera/lighting, and palette description\",\n"
+        "  \"global_subject_focus\": \"Description of the main character/object focus point\",\n"
         "  \"scenes\": [\n"
         "    {\n"
-        "      \"narration\": \"A short engaging narrator sentence (approx. 7-8 words).\",\n"
-        "      \"visual_prompt\": \"Detailed photorealistic 9:16 portrait/vertical scene description for Leonardo.ai to generate a background visual. Do not include camera frames or devices in the prompt.\"\n"
+        "      \"speaker\": \"Speaker Name (e.g. Sarah)\",\n"
+        "      \"narration\": \"Exact segment of narration text from the story.\",\n"
+        "      \"visual_prompt\": \"Specific action, pose, or background setting representing the scene's narration.\"\n"
         "    },\n"
         "    ... (exactly 5 scenes)\n"
-        "  ]\n"
+        "  ],\n"
+        "  \"youtube_metadata\": {\n"
+        "    \"title\": \"Catchy optimized YouTube Shorts title (max 100 chars)\",\n"
+        "    \"description\": \"SEO-friendly description with relevant search keywords and tags\",\n"
+        "    \"tags\": [\"shorts\", \"facts\", \"viral\"]\n"
+        "  },\n"
+        "  \"instagram_metadata\": {\n"
+        "    \"caption\": \"Engaging Instagram Reels caption with emojis and hashtags\"\n"
+        "  }\n"
         "}"
     )
     
-    full_prompt = f"System: {system_prompt}\nUser: Write a viral 15-second script for: {prompt}."
-    if hook_instruction:
-        full_prompt += f" Hook Instruction: {hook_instruction}"
-        
-    payload = {
+    storyboarder_prompt = f"System: {storyboarder_system}\nStory to segment:\n{story_text}"
+    
+    payload2 = {
         "model": model,
-        "prompt": full_prompt,
+        "prompt": storyboarder_prompt,
         "stream": False,
         "format": "json"
     }
     
     try:
-        response = requests.post(url, json=payload, timeout=45)
-        if response.status_code == 200:
-            resp_text = response.json().get("response", "").strip()
-            data = json.loads(resp_text)
+        response2 = requests.post(url, json=payload2, timeout=45)
+        if response2.status_code == 200:
+            resp_text = response2.json().get("response", "").strip()
+            cleaned = clean_json_response(resp_text)
+            data = json.loads(cleaned)
             if "scenes" in data and len(data["scenes"]) == 5:
                 return data
     except Exception as e:
-        print(f"Ollama JSON script generation failed: {e}")
+        print(f"Ollama JSON storyboard generation failed: {e}")
         
-    # Fallback script
+    # Fallback script with metadata and speakers
     return {
         "topic": prompt if prompt else "Incredible Facts",
         "background_music_style": "Cinematic",
+        "global_visual_style": "realistic vertical 9:16 portrait, cinematic lighting, dramatic mood, high-detail",
+        "global_subject_focus": "a detailed mysterious mechanical box emitting faint golden light",
         "scenes": [
-            {"narration": f"Here is an incredible fact about {prompt or 'our world'}.", "visual_prompt": f"Realistic vertical 9:16 portrait representing {prompt or 'discovery and mystery'}, cinematic lighting"},
-            {"narration": "Scientists were completely shocked when they discovered this secret.", "visual_prompt": "Close-up expression of awe and disbelief, portrait view, dark modern lab background"},
-            {"narration": "It changes everything we thought we knew about history.", "visual_prompt": "Beautiful ancient ruins under a celestial night sky, glowing dust particles, 9:16 view"},
-            {"narration": "The implications could reshape our entire future.", "visual_prompt": "Futuristic skyline of a green sustainable city, vertical view, golden hour, 8k"},
-            {"narration": "Follow for more mind-blowing facts every single day!", "visual_prompt": "Glowing neon holographic follow button on a dark studio wall, 9:16 view"}
-        ]
+            {"speaker": "Sarah", "narration": f"Here is an incredible fact about {prompt or 'our world'}.", "visual_prompt": "resting on a dust-covered desk inside a dark ancient study room"},
+            {"speaker": "Adam", "narration": "Scientists were completely shocked when they discovered this secret.", "visual_prompt": "slowly unlocking itself as gears slide outward"},
+            {"speaker": "Sarah", "narration": "It changes everything we thought we knew about history.", "visual_prompt": "opening wide, revealing a small floating miniature galaxy inside"},
+            {"speaker": "Adam", "narration": "The implications could reshape our entire future.", "visual_prompt": "projecting bright blue holographic stars onto the study walls"},
+            {"speaker": "George", "narration": "Follow for more mind-blowing facts every single day!", "visual_prompt": "closing shut, leaving glowing golden sparks in the air"}
+        ],
+        "youtube_metadata": {
+            "title": f"The Truth About {prompt or 'This Topic'}!",
+            "description": f"Amazing facts and details about {prompt or 'this topic'}. #shorts #facts #viral",
+            "tags": ["shorts", "facts", "viral", "interesting"]
+        },
+        "instagram_metadata": {
+            "caption": f"Mind-blowing facts about {prompt or 'this concept'}! 🤯✨ #reels #explore #viral #facts"
+        }
     }
+
+
+def trim_audio_silence(input_path: str) -> str:
+    """Trim silence from the start and end of a WAV file using FFmpeg."""
+    if not input_path or not os.path.exists(input_path):
+        return input_path
+    trimmed_path = input_path.replace(".wav", "_trimmed.wav")
+    ffmpeg_cmd = [
+        "ffmpeg", "-y", "-i", input_path,
+        "-af", "silenceremove=start_periods=1:start_threshold=-50dB,areverse,silenceremove=start_periods=1:start_threshold=-50dB,areverse",
+        trimmed_path
+    ]
+    try:
+        subprocess.run(ffmpeg_cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if os.path.exists(trimmed_path) and os.path.getsize(trimmed_path) > 0:
+            try:
+                os.remove(input_path)
+            except Exception:
+                pass
+            return trimmed_path
+    except Exception as e:
+        print(f"Error trimming audio silence: {e}")
+    return input_path
 
 def generate_speech_audio(text: str, voice_key: str, speed: float = 1.0, effect: str = "Normal"):
     onnx_path = os.path.abspath(os.path.join("models", "kokoro-v1.0.onnx"))
@@ -334,19 +502,29 @@ def generate_speech_audio(text: str, voice_key: str, speed: float = 1.0, effect:
         raw_output_path = os.path.abspath(os.path.join("temp", f"voice_raw_{int(time.time())}.wav"))
         sf.write(raw_output_path, samples, sample_rate)
         
+        audio_path = raw_output_path
         if effect == "Kid (High Pitch)":
             pitch_output_path = os.path.abspath(os.path.join("temp", f"voice_kid_{int(time.time())}.wav"))
             ffmpeg_cmd = ["ffmpeg", "-y", "-i", raw_output_path, "-af", "asetrate=24000*1.3,atempo=1/1.3", pitch_output_path]
             subprocess.run(ffmpeg_cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            return pitch_output_path, "Success"
+            try:
+                os.remove(raw_output_path)
+            except Exception:
+                pass
+            audio_path = pitch_output_path
             
         elif effect == "Deep (Low Pitch)":
             pitch_output_path = os.path.abspath(os.path.join("temp", f"voice_deep_{int(time.time())}.wav"))
             ffmpeg_cmd = ["ffmpeg", "-y", "-i", raw_output_path, "-af", "asetrate=24000*0.82,atempo=1/0.82", pitch_output_path]
             subprocess.run(ffmpeg_cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            return pitch_output_path, "Success"
+            try:
+                os.remove(raw_output_path)
+            except Exception:
+                pass
+            audio_path = pitch_output_path
             
-        return raw_output_path, "Success"
+        trimmed_path = trim_audio_silence(audio_path)
+        return trimmed_path, "Success"
     except Exception as e:
         return None, f"Error: {e}"
 
@@ -494,6 +672,7 @@ class ScriptRequest(BaseModel):
     prompt: str
     model: str
     hook_style: str = "None (Direct Prompt)"
+    enable_search: bool = False
 
 class SpeechRequest(BaseModel):
     text: str
@@ -534,6 +713,18 @@ class ShortRequest(BaseModel):
     caption_size: int = 42
     caption_margin_v: int = 150
     caption_color: str = "&H00FFFF&"
+    enable_search: bool = False
+    enable_transition_sfx: bool = True
+
+class UploadRequest(BaseModel):
+    video_path: str
+    platforms: List[str]  # e.g. ["youtube", "instagram"]
+    youtube_title: Optional[str] = ""
+    youtube_description: Optional[str] = ""
+    youtube_tags: Optional[List[str]] = []
+    youtube_privacy: Optional[str] = "private"
+    instagram_caption: Optional[str] = ""
+
 
 def get_ollama_models():
     """Dynamically fetch available models from local Ollama service."""
@@ -544,8 +735,17 @@ def get_ollama_models():
             ollama_models = [m['name'] for m in r.json().get("models", [])]
     except Exception:
         pass
-    if not ollama_models:
-        ollama_models = ["deepseek-v4-pro:cloud", "gemma4:31b-cloud", "qwen3.5:0.8b", "gpt-oss:120b-cloud"]
+    
+    # Ensure minimax-m3:cloud is at the front of the list
+    if "minimax-m3:cloud" in ollama_models:
+        ollama_models.remove("minimax-m3:cloud")
+    ollama_models.insert(0, "minimax-m3:cloud")
+    
+    # Add other fallbacks if not present
+    for fallback in ["deepseek-v4-pro:cloud", "gemma4:31b-cloud", "qwen3.5:0.8b", "gpt-oss:120b-cloud"]:
+        if fallback not in ollama_models:
+            ollama_models.append(fallback)
+            
     return ollama_models
 
 # API Endpoints
@@ -660,14 +860,27 @@ def run_viral_shorts_pipeline_new(
     caption_font: str = "Arial",
     caption_size: int = 42,
     caption_margin_v: int = 150,
-    caption_color: str = "&H00FFFF&"
+    caption_color: str = "&H00FFFF&",
+    enable_search: bool = False,
+    caption_style: str = "Viral Pop",
+    enable_transition_sfx: bool = True,
+    custom_storyboard: Optional[List[dict]] = None,
+    custom_script_data: Optional[dict] = None
 ):
     """
     Core automated multi-scene viral shorts pipeline.
+    Supports rendering directly from custom storyboards and multi-voice configuration.
     """
     # 1. Script
-    script_data = generate_ollama_script(prompt, model, hook_style)
-    scenes = script_data.get("scenes", [])
+    if custom_script_data:
+        script_data = custom_script_data
+        scenes = script_data.get("scenes", [])
+    elif custom_storyboard:
+        scenes = custom_storyboard
+        script_data = {"scenes": scenes}
+    else:
+        script_data = generate_ollama_script(prompt, model, hook_style, enable_search=enable_search)
+        scenes = script_data.get("scenes", [])
     
     bg_music_path = download_music_preset(music_style) if music_style != "None" else None
     
@@ -679,26 +892,49 @@ def run_viral_shorts_pipeline_new(
         sc_text = scene["narration"]
         sc_visual_prompt = scene["visual_prompt"]
         
-        # Synthesize voice
-        sc_audio, err = generate_speech_audio(sc_text, voice, speed, "Normal")
-        if not sc_audio:
-            raise Exception(f"Voice synthesis failed at scene {idx+1}: {err}")
+        # Combine scene prompt with global visual style and subject if present
+        global_style = script_data.get("global_visual_style", "") if script_data else ""
+        global_subject = script_data.get("global_subject_focus", "") if script_data else ""
+        combined_prompt_parts = []
+        if global_subject:
+            combined_prompt_parts.append(global_subject)
+        combined_prompt_parts.append(sc_visual_prompt)
+        if global_style:
+            combined_prompt_parts.append(global_style)
+        final_visual_prompt = ", ".join(combined_prompt_parts)
+        
+        # Pick speaker voice
+        if not custom_storyboard and not custom_script_data:
+            sc_voice_key = voice
+        else:
+            sc_speaker = scene.get("speaker", voice)
+            sc_voice_key = map_speaker_to_voice_key(sc_speaker) if isinstance(sc_speaker, str) else voice
+        
+        # Synthesize voice if audio doesn't exist
+        sc_audio = scene.get("audio_path")
+        if not sc_audio or not os.path.exists(sc_audio):
+            sc_audio, err = generate_speech_audio(sc_text, sc_voice_key, speed, "Normal")
+            if not sc_audio:
+                raise Exception(f"Voice synthesis failed at scene {idx+1}: {err}")
             
         info = sf.info(sc_audio)
         sc_duration = info.duration
         scene_audios.append(sc_audio)
         
-        # Generate Image
-        sc_img, image_id = generate_leonardo_image(sc_visual_prompt, leonardo_model, "9:16")
-        if not sc_img:
-            raise Exception(f"Image generation failed at scene {idx+1}")
+        # Generate Image if not exists
+        sc_img = scene.get("image_path")
+        image_id = scene.get("image_id")
+        if not sc_img or not os.path.exists(sc_img):
+            sc_img, image_id = generate_leonardo_image(final_visual_prompt, leonardo_model, "9:16")
+            if not sc_img:
+                raise Exception(f"Image generation failed at scene {idx+1}")
             
         scene_video_path = os.path.abspath(os.path.join("temp", f"scene_vid_{int(time.time())}_{idx}.mp4"))
         
         # Make video segment (slideshow with zoompan or motion video)
         motion_vid_path = None
         if visual_mode == "Leonardo Motion Video" and image_id:
-            motion_vid_path = generate_leonardo_motion(image_id, sc_visual_prompt)
+            motion_vid_path = generate_leonardo_motion(image_id, final_visual_prompt)
             
         if motion_vid_path:
             ffmpeg_cmd = [
@@ -721,9 +957,14 @@ def run_viral_shorts_pipeline_new(
         aud_rel = os.path.relpath(sc_audio, os.path.abspath(os.path.curdir))
         storyboard.append({
             "scene": idx + 1,
+            "speaker": sc_speaker,
             "narration": sc_text,
+            "visual_prompt": final_visual_prompt,
             "image_url": f"http://localhost:8000/{img_rel.replace(os.path.sep, '/')}",
+            "image_path": sc_img,
+            "image_id": image_id,
             "audio_url": f"http://localhost:8000/{aud_rel.replace(os.path.sep, '/')}",
+            "audio_path": sc_audio,
             "duration": sc_duration
         })
         
@@ -763,6 +1004,19 @@ def run_viral_shorts_pipeline_new(
     else:
         shutil.copy(merged_audio, audio_mixed)
         
+    # Mix transition SFX into audio_mixed
+    transition_times = []
+    curr_t = 0.0
+    for sc in storyboard[:-1]:
+        curr_t += sc["duration"]
+        transition_times.append(curr_t)
+        
+    audio_final_mixed = os.path.abspath(os.path.join("temp", f"audio_final_mixed_{timestamp}.wav"))
+    if enable_transition_sfx:
+        mix_transition_sfx(audio_mixed, audio_final_mixed, transition_times)
+    else:
+        shutil.copy(audio_mixed, audio_final_mixed)
+        
     # Composite Video with Satisfying Split-screen (if selected)
     satisfying_path = None
     if satisfying_background != "None":
@@ -770,7 +1024,6 @@ def run_viral_shorts_pipeline_new(
         
     processed_video = os.path.abspath(os.path.join("temp", f"processed_video_{timestamp}.mp4"))
     if satisfying_path and os.path.exists(satisfying_path):
-        # Split-Screen layout: scale both to 1080x960 and stack vertically
         filter_complex = (
             f"[0:v]scale=1080:960:force_original_aspect_ratio=increase,crop=1080:960[top]; "
             f"[1:v]scale=1080:960:force_original_aspect_ratio=increase,crop=1080:960[bottom]; "
@@ -778,14 +1031,13 @@ def run_viral_shorts_pipeline_new(
         )
         ffmpeg_cmd = [
             "ffmpeg", "-y", "-i", merged_video, "-stream_loop", "-1", "-i", satisfying_path,
-            "-i", audio_mixed, "-filter_complex", filter_complex, "-map", "[v]", "-map", "2:a",
+            "-i", audio_final_mixed, "-filter_complex", filter_complex, "-map", "[v]", "-map", "2:a",
             "-shortest", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", processed_video
         ]
         subprocess.run(ffmpeg_cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     else:
-        # Just merge video and mixed audio
         ffmpeg_cmd = [
-            "ffmpeg", "-y", "-i", merged_video, "-i", audio_mixed, "-map", "0:v", "-map", "1:a",
+            "ffmpeg", "-y", "-i", merged_video, "-i", audio_final_mixed, "-map", "0:v", "-map", "1:a",
             "-c:v", "copy", "-c:a", "aac", processed_video
         ]
         subprocess.run(ffmpeg_cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -794,11 +1046,11 @@ def run_viral_shorts_pipeline_new(
     final_rendered_video = os.path.abspath(os.path.join("outputs", f"viral_reel_{timestamp}.mp4"))
     if enable_captions:
         ass_path = os.path.abspath(os.path.join("temp", f"subtitles_{timestamp}.ass"))
-        # Alignment 2 is Centered Bottom
         align = 2
         generate_ass_subtitles(
             storyboard, ass_path, caption_font, caption_size,
-            margin_v=caption_margin_v, alignment=align, highlight_color=caption_color
+            margin_v=caption_margin_v, alignment=align, highlight_color=caption_color,
+            style_mode=caption_style
         )
         
         # Compile with subtitles
@@ -811,16 +1063,188 @@ def run_viral_shorts_pipeline_new(
     else:
         shutil.copy(processed_video, final_rendered_video)
         
-    return final_rendered_video, storyboard, script_data.get("topic", prompt)
+    return final_rendered_video, storyboard, script_data.get("topic", prompt), script_data
 
+
+# New Request Models & APIs
+class DraftRequest(BaseModel):
+    prompt: str
+    model: str
+    hook_style: str = "None (Direct Prompt)"
+    enable_search: bool = False
+    voice: Optional[str] = "Sarah (Female - US - Soft)"
+
+class RenderRequest(BaseModel):
+    generation_id: str
+    storyboard: List[dict]
+    visual_mode: str = "Cinematic Slideshow"
+    leonardo_model: str = "Lucid Realism (High Quality Face)"
+    voice: str = "Sarah (Female - US - Soft)"
+    speed: float = 1.0
+    music_style: str = "Cinematic"
+    satisfying_background: str = "None"
+    enable_captions: bool = True
+    caption_font: str = "Arial"
+    caption_size: int = 42
+    caption_margin_v: int = 150
+    caption_color: str = "&H00FFFF&"
+    caption_style: str = "Viral Pop"  # 'Viral Pop' or 'Standard'
+    enable_transition_sfx: bool = True
+
+class SingleAssetRegenRequest(BaseModel):
+    generation_id: str
+    scene_index: int
+    asset_type: str
+    prompt: Optional[str] = None
+    voice: Optional[str] = None
+    speed: Optional[float] = 1.0
+    leonardo_model: Optional[str] = None
+
+class DbUploadRequest(BaseModel):
+    video_generation_id: str
+    platforms: List[str]
+    youtube_title: Optional[str] = ""
+    youtube_description: Optional[str] = ""
+    youtube_tags: Optional[List[str]] = []
+    youtube_privacy: Optional[str] = "private"
+    instagram_caption: Optional[str] = ""
+    scheduled_time: Optional[str] = None
+
+@app.post("/api/draft-script")
+def api_draft_script(req: DraftRequest):
+    try:
+        gen_id = str(uuid.uuid4())
+        script_data = generate_ollama_script(req.prompt, req.model, req.hook_style, enable_search=req.enable_search)
+        scenes = script_data.get("scenes", [])
+        
+        # Build initial storyboard structure
+        storyboard = []
+        for idx, scene in enumerate(scenes):
+            storyboard.append({
+                "scene": idx + 1,
+                "speaker": req.voice if req.voice else scene.get("speaker", "Sarah"),
+                "narration": scene.get("narration", ""),
+                "visual_prompt": scene.get("visual_prompt", ""),
+                "image_url": "",
+                "image_path": "",
+                "audio_url": "",
+                "audio_path": "",
+                "duration": 0.0
+            })
+            
+        db_manager.create_video_generation(
+            gen_id, req.prompt, script_data.get("topic", req.prompt), script_data, storyboard, status="draft"
+        )
+        return {
+            "success": True,
+            "generation_id": gen_id,
+            "topic": script_data.get("topic", req.prompt),
+            "storyboard": storyboard,
+            "youtube_metadata": script_data.get("youtube_metadata"),
+            "instagram_metadata": script_data.get("instagram_metadata")
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/regenerate-scene-asset")
+def api_regenerate_scene_asset(req: SingleAssetRegenRequest):
+    gen = db_manager.get_video_generation(req.generation_id)
+    if not gen:
+        raise HTTPException(status_code=404, detail="Video generation not found")
+        
+    storyboard = gen["storyboard"]
+    if req.scene_index < 0 or req.scene_index >= len(storyboard):
+        raise HTTPException(status_code=400, detail="Invalid scene index")
+        
+    scene = storyboard[req.scene_index]
+    
+    try:
+        if req.asset_type == "image":
+            prompt = req.prompt or scene.get("visual_prompt")
+            model = req.leonardo_model or "Lucid Realism (High Quality Face)"
+            path, image_id = generate_leonardo_image(prompt, model, "9:16")
+            if not path:
+                raise ValueError("Leonardo image generation failed")
+                
+            rel_path = os.path.relpath(path, os.path.abspath(os.path.curdir))
+            scene["image_path"] = path
+            scene["image_url"] = f"http://localhost:8000/{rel_path.replace(os.path.sep, '/')}"
+            scene["image_id"] = image_id
+            scene["visual_prompt"] = prompt
+            
+        elif req.asset_type == "audio":
+            text = req.prompt or scene.get("narration")
+            voice = req.voice or scene.get("speaker", "Sarah")
+            path, msg = generate_speech_audio(text, voice, req.speed or 1.0, "Normal")
+            if not path:
+                raise ValueError(f"Kokoro voice synthesis failed: {msg}")
+                
+            info = sf.info(path)
+            duration = info.duration
+            rel_path = os.path.relpath(path, os.path.abspath(os.path.curdir))
+            scene["audio_path"] = path
+            scene["audio_url"] = f"http://localhost:8000/{rel_path.replace(os.path.sep, '/')}"
+            scene["duration"] = duration
+            scene["narration"] = text
+            scene["speaker"] = voice
+            
+        else:
+            raise HTTPException(status_code=400, detail="Invalid asset type")
+            
+        db_manager.update_video_generation(req.generation_id, storyboard=storyboard)
+        return {
+            "success": True,
+            "scene": scene
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+def run_render_task(generation_id: str, req: RenderRequest):
+    try:
+        db_manager.update_video_generation(generation_id, status="rendering")
+        
+        final_video, storyboard, topic, script_data = run_viral_shorts_pipeline_new(
+            prompt="",
+            model="",
+            visual_mode=req.visual_mode,
+            leonardo_model=req.leonardo_model,
+            voice=req.voice,
+            speed=req.speed,
+            music_style=req.music_style,
+            satisfying_background=req.satisfying_background,
+            enable_captions=req.enable_captions,
+            caption_font=req.caption_font,
+            caption_size=req.caption_size,
+            caption_margin_v=req.caption_margin_v,
+            caption_color=req.caption_color,
+            caption_style=req.caption_style,
+            enable_transition_sfx=req.enable_transition_sfx,
+            custom_storyboard=req.storyboard
+        )
+        
+        db_manager.update_video_generation(
+            generation_id, storyboard=storyboard, final_video_path=final_video, status="completed"
+        )
+    except Exception as e:
+        print(f"Rendering failed: {e}")
+        db_manager.update_video_generation(generation_id, status="failed")
+
+@app.post("/api/render-storyboard")
+def api_render_storyboard(req: RenderRequest, background_tasks: BackgroundTasks):
+    background_tasks.add_task(run_render_task, req.generation_id, req)
+    return {"success": True, "generation_id": req.generation_id}
 
 @app.post("/api/generate-short")
 def api_generate_short(req: ShortRequest):
     """
-    Complete automated multi-scene viral shorts pipeline endpoint.
+    Automated pipeline endpoint. Logs the resulting video generation directly to DB.
     """
     try:
-        final_video, storyboard, topic = run_viral_shorts_pipeline_new(
+        gen_id = str(uuid.uuid4())
+        # Log initial draft status
+        db_manager.create_video_generation(gen_id, req.prompt, req.prompt, None, None, status="rendering")
+        
+        final_video, storyboard, topic, script_data = run_viral_shorts_pipeline_new(
             prompt=req.prompt,
             model=req.model,
             hook_style=req.hook_style,
@@ -834,17 +1258,320 @@ def api_generate_short(req: ShortRequest):
             caption_font=req.caption_font,
             caption_size=req.caption_size,
             caption_margin_v=req.caption_margin_v,
-            caption_color=req.caption_color
+            caption_color=req.caption_color,
+            enable_search=req.enable_search,
+            caption_style="Viral Pop",
+            enable_transition_sfx=req.enable_transition_sfx
         )
         rel_out = os.path.relpath(final_video, os.path.abspath(os.path.curdir))
+        
+        db_manager.update_video_generation(
+            gen_id, topic=topic, script_data=script_data, storyboard=storyboard, final_video_path=final_video, status="completed"
+        )
+        
         return {
             "success": True,
             "video_url": f"http://localhost:8000/{rel_out.replace(os.path.sep, '/')}",
             "storyboard": storyboard,
-            "topic": topic
+            "topic": topic,
+            "youtube_metadata": script_data.get("youtube_metadata"),
+            "instagram_metadata": script_data.get("instagram_metadata"),
+            "generation_id": gen_id
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/youtube/auth-status")
+def get_youtube_auth_status():
+    return {"authenticated": is_youtube_authenticated()}
+
+@app.get("/api/youtube/auth-init")
+def init_youtube_auth():
+    try:
+        msg = trigger_youtube_auth_flow_url()
+        return {"success": True, "message": msg}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/instagram/auth-status")
+def get_instagram_auth_status():
+    return {"configured": is_instagram_configured()}
+
+def process_upload_job(job_id: str):
+    """Executes upload processes for direct API uploads (persisted in DB)."""
+    job = db_manager.get_upload_job(job_id)
+    if not job:
+        print(f"Error: Job {job_id} not found in database.")
+        return
+        
+    db_manager.update_upload_job(job_id, status="running", logs=job.get("logs", []) + ["Job started processing..."])
+    logs = job.get("logs", []) + ["Job started processing..."]
+    
+    def log_message(msg):
+        logs.append(msg)
+        db_manager.update_upload_job(job_id, logs=logs)
+        print(f"[Job {job_id}] {msg}")
+        
+    try:
+        # Get final video path
+        video_gen = db_manager.get_video_generation(job["video_generation_id"])
+        if not video_gen or not video_gen.get("final_video_path"):
+            # Check if video_path is passed directly in some legacy way
+            raise ValueError("Associated video generation or final video file not found.")
+            
+        video_file = video_gen["final_video_path"]
+        
+        # Extract relative path from URL if a localhost URL was passed
+        if video_file.startswith("http://") or video_file.startswith("https://"):
+            parsed_path = video_file.split("localhost:8000/")[-1]
+            from urllib.parse import unquote
+            video_file = unquote(parsed_path)
+            
+        video_file = os.path.abspath(video_file)
+        
+        if not os.path.exists(video_file):
+            raise FileNotFoundError(f"Video file not found locally at: {video_file}")
+            
+        if "youtube" in job["platforms"]:
+            log_message("YouTube upload starting...")
+            yt_meta = job.get("youtube_metadata") or {}
+            
+            def yt_progress(pct):
+                if logs and logs[-1].startswith("YouTube upload progress:"):
+                    logs[-1] = f"YouTube upload progress: {pct}%"
+                else:
+                    logs.append(f"YouTube upload progress: {pct}%")
+                db_manager.update_upload_job(job_id, logs=logs)
+                
+            vid_id = upload_video_to_youtube(
+                video_file,
+                yt_meta.get("title", "AI Generated Short"),
+                yt_meta.get("description", ""),
+                yt_meta.get("tags", []),
+                yt_meta.get("privacy", "private"),
+                progress_callback=yt_progress
+            )
+            log_message(f"YouTube upload successful! Video URL: https://youtu.be/{vid_id}")
+            
+        if "instagram" in job["platforms"]:
+            log_message("Instagram Reels upload starting...")
+            ig_meta = job.get("instagram_metadata") or {}
+            
+            def ig_progress(msg):
+                log_message(msg)
+                
+            media_id = upload_reel_to_instagram(
+                video_file,
+                ig_meta.get("caption", ""),
+                progress_callback=ig_progress
+            )
+            log_message(f"Instagram upload successful! Media ID: {media_id}")
+            
+        log_message("Upload process complete!")
+        db_manager.update_upload_job(job_id, status="completed", logs=logs)
+    except Exception as e:
+        log_message(f"Upload failed: {str(e)}")
+        db_manager.update_upload_job(job_id, status="failed", logs=logs)
+
+def upload_scheduler_loop():
+    """Background polling thread for scheduled uploads."""
+    print("Starting background upload scheduler thread...")
+    while True:
+        try:
+            # Query db for scheduled jobs
+            now_iso = datetime.utcnow().isoformat() + "Z"
+            pending_jobs = db_manager.get_pending_scheduled_jobs(now_iso)
+            for job in pending_jobs:
+                job_id = job["id"]
+                # Mark job as running and process in a separate thread
+                db_manager.update_upload_job(job_id, status="running")
+                t = threading.Thread(target=process_upload_job, args=(job_id,))
+                t.daemon = True
+                t.start()
+        except Exception as e:
+            print(f"Error in upload scheduler loop: {e}")
+        time.sleep(10)
+
+@app.on_event("startup")
+def startup_event():
+    scheduler_thread = threading.Thread(target=upload_scheduler_loop)
+    scheduler_thread.daemon = True
+    scheduler_thread.start()
+
+@app.get("/api/history")
+def api_get_history():
+    rows = db_manager.list_video_generations()
+    for row in rows:
+        if row.get("final_video_path"):
+            rel = os.path.relpath(row["final_video_path"], os.path.abspath(os.path.curdir))
+            row["video_url"] = f"http://localhost:8000/{rel.replace(os.path.sep, '/')}"
+        else:
+            row["video_url"] = ""
+    return rows
+
+@app.get("/api/upload-queue")
+def api_get_upload_queue():
+    return db_manager.list_upload_jobs()
+
+@app.post("/api/schedule-upload")
+def api_schedule_upload(req: DbUploadRequest):
+    job_id = str(uuid.uuid4())
+    status = "scheduled" if req.scheduled_time else "running"
+    
+    db_manager.create_upload_job(
+        job_id,
+        req.video_generation_id,
+        req.platforms,
+        {
+            "title": req.youtube_title,
+            "description": req.youtube_description,
+            "tags": req.youtube_tags,
+            "privacy": req.youtube_privacy
+        },
+        {
+            "caption": req.instagram_caption
+        },
+        status=status,
+        scheduled_time=req.scheduled_time
+    )
+    
+    if status == "running":
+        t = threading.Thread(target=process_upload_job, args=(job_id,))
+        t.daemon = True
+        t.start()
+        
+    return {"success": True, "job_id": job_id}
+
+@app.get("/api/generation-status/{generation_id}")
+def api_generation_status(generation_id: str):
+    gen = db_manager.get_video_generation(generation_id)
+    if not gen:
+        raise HTTPException(status_code=404, detail="Generation not found")
+        
+    rel_path = ""
+    if gen.get("final_video_path"):
+        rel_path = os.path.relpath(gen["final_video_path"], os.path.abspath(os.path.curdir))
+        
+    return {
+        "status": gen["status"],
+        "video_url": f"http://localhost:8000/{rel_path.replace(os.path.sep, '/')}" if rel_path else "",
+        "storyboard": gen["storyboard"],
+        "youtube_metadata": gen.get("script_data", {}).get("youtube_metadata") if gen.get("script_data") else None,
+        "instagram_metadata": gen.get("script_data", {}).get("instagram_metadata") if gen.get("script_data") else None,
+    }
+
+# Backward compatibility endpoints for legacy app.js uploads
+class UploadRequest(BaseModel):
+    video_path: str
+    platforms: List[str]
+    youtube_title: Optional[str] = ""
+    youtube_description: Optional[str] = ""
+    youtube_tags: Optional[List[str]] = []
+    youtube_privacy: Optional[str] = "private"
+    instagram_caption: Optional[str] = ""
+
+@app.post("/api/upload")
+def api_upload(req: UploadRequest):
+    # Find matching generation by final_video_path relative or absolute
+    # If not found, create a placeholder generation
+    generations = db_manager.list_video_generations()
+    matching_gen_id = None
+    for g in generations:
+        if g.get("final_video_path") and (req.video_path in g["final_video_path"] or g["final_video_path"] in req.video_path):
+            matching_gen_id = g["id"]
+            break
+            
+    if not matching_gen_id:
+        matching_gen_id = str(uuid.uuid4())
+        db_manager.create_video_generation(matching_gen_id, "Legacy upload", "Legacy upload", None, None, status="completed")
+        db_manager.update_video_generation(matching_gen_id, final_video_path=req.video_path)
+        
+    job_id = str(uuid.uuid4())
+    db_manager.create_upload_job(
+        job_id,
+        matching_gen_id,
+        req.platforms,
+        {
+            "title": req.youtube_title,
+            "description": req.youtube_description,
+            "tags": req.youtube_tags,
+            "privacy": req.youtube_privacy
+        },
+        {
+            "caption": req.instagram_caption
+        },
+        status="running"
+    )
+    
+    t = threading.Thread(target=process_upload_job, args=(job_id,))
+    t.daemon = True
+    t.start()
+    return {"job_id": job_id}
+
+@app.get("/api/upload-status/{job_id}")
+def get_upload_status(job_id: str):
+    job = db_manager.get_upload_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Upload job not found")
+    return job
+
+
+@app.get("/api/trends")
+def get_trends(geo: str = "IN"):
+    import xml.etree.ElementTree as ET
+    url = f"https://trends.google.com/trending/rss?geo={geo.upper()}"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+    }
+    try:
+        response = requests.get(url, headers=headers, timeout=10)
+        if response.status_code != 200:
+            raise HTTPException(status_code=response.status_code, detail=f"Failed to fetch Google Trends: HTTP {response.status_code}")
+        
+        root = ET.fromstring(response.text)
+        namespaces = {
+            'ht': 'https://trends.google.com/trending/rss'
+        }
+        
+        items = []
+        for item in root.findall('.//item'):
+            title = item.find('title').text
+            
+            traffic_el = item.find('ht:approx_traffic', namespaces)
+            traffic = traffic_el.text if traffic_el is not None else "Unknown"
+            
+            picture_el = item.find('ht:picture', namespaces)
+            picture_url = picture_el.text if picture_el is not None else ""
+            
+            news_items = []
+            for news in item.findall('ht:news_item', namespaces):
+                news_title = news.find('ht:news_item_title', namespaces)
+                news_snippet = news.find('ht:news_item_snippet', namespaces)
+                news_url = news.find('ht:news_item_url', namespaces)
+                
+                news_items.append({
+                    "title": news_title.text if news_title is not None else "",
+                    "snippet": news_snippet.text if news_snippet is not None else "",
+                    "url": news_url.text if news_url is not None else ""
+                })
+            
+            top_news_title = news_items[0]["title"] if news_items else ""
+            top_news_url = news_items[0]["url"] if news_items else ""
+            top_news_snippet = news_items[0]["snippet"] if news_items else ""
+            
+            items.append({
+                "title": title,
+                "traffic": traffic,
+                "picture_url": picture_url,
+                "news_title": top_news_title,
+                "news_url": top_news_url,
+                "news_snippet": top_news_snippet,
+                "all_news": news_items
+            })
+        return items
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error parsing Google Trends feed: {str(e)}")
+
 
 if __name__ == "__main__":
     import uvicorn
