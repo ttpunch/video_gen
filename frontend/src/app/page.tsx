@@ -100,9 +100,19 @@ export default function Home() {
   const [uploadLogs, setUploadLogs] = useState<string[]>([]);
   const [expandedJobId, setExpandedJobId] = useState<string | null>(null);
   
-  // Scheduling states
-  const [publishImmediate, setPublishImmediate] = useState(true);
-  const [scheduledTime, setScheduledTime] = useState("");
+  // YouTube specific upload states
+  const [ytIsUploading, setYtIsUploading] = useState(false);
+  const [ytUploadJobId, setYtUploadJobId] = useState<string | null>(null);
+  const [ytUploadLogs, setYtUploadLogs] = useState<string[]>([]);
+  const [ytPublishImmediate, setYtPublishImmediate] = useState(true);
+  const [ytScheduledTime, setYtScheduledTime] = useState("");
+
+  // Instagram specific upload states
+  const [igIsUploading, setIgIsUploading] = useState(false);
+  const [igUploadJobId, setIgUploadJobId] = useState<string | null>(null);
+  const [igUploadLogs, setIgUploadLogs] = useState<string[]>([]);
+  const [igPublishImmediate, setIgPublishImmediate] = useState(true);
+  const [igScheduledTime, setIgScheduledTime] = useState("");
 
   // Input states: Full talking presenter pipeline
   const [scriptPrompt, setScriptPrompt] = useState("Write a highly engaging 15-second script about a fascinating science fact.");
@@ -594,34 +604,25 @@ export default function Home() {
     }
   };
 
-  const handleUpload = async () => {
-    const selectedPlatforms = Object.keys(uploadPlatforms).filter(
-      (p) => uploadPlatforms[p as keyof typeof uploadPlatforms]
-    );
-    
-    if (selectedPlatforms.length === 0) {
-      alert("Please select at least one platform (YouTube or Instagram) to upload.");
-      return;
-    }
-    
-    if (uploadPlatforms.youtube && !isYtAuthenticated) {
-      alert("YouTube is selected but not authorized. Please authorize your account first.");
+  const handleYoutubeUpload = async () => {
+    if (!isYtAuthenticated) {
+      alert("YouTube is not authorized. Please authorize your account first.");
       return;
     }
 
-    setIsUploading(true);
-    setUploadLogs(["Initiating upload request..."]);
+    setYtIsUploading(true);
+    setYtUploadLogs(["Initiating YouTube upload request..."]);
     
     try {
       const payload = {
         video_generation_id: generationId || "",
-        platforms: selectedPlatforms,
+        platforms: ["youtube"],
         youtube_title: uploadTitle,
         youtube_description: uploadDescription,
         youtube_tags: uploadTags.split(",").map(t => t.trim()).filter(Boolean),
         youtube_privacy: uploadPrivacy,
-        instagram_caption: uploadCaption,
-        scheduled_time: publishImmediate ? null : (scheduledTime ? new Date(scheduledTime).toISOString() : null)
+        instagram_caption: "",
+        scheduled_time: ytPublishImmediate ? null : (ytScheduledTime ? new Date(ytScheduledTime).toISOString() : null)
       };
 
       const res = await fetch("http://localhost:8000/api/schedule-upload", {
@@ -632,50 +633,113 @@ export default function Home() {
 
       if (!res.ok) {
         const data = await res.json();
-        throw new Error(data.detail || "Upload job queue failed");
+        throw new Error(data.detail || "YouTube upload job queue failed");
       }
 
       const result = await res.json();
-      setUploadJobId(result.job_id);
-      addLog(publishImmediate ? "🚀 Upload job queued immediately!" : `🕒 Upload scheduled for: ${new Date(scheduledTime).toLocaleString()}`);
+      setYtUploadJobId(result.job_id);
+      
+      const newLog = ytPublishImmediate ? "🚀 YouTube upload job queued immediately!" : `🕒 YouTube upload scheduled for: ${new Date(ytScheduledTime).toLocaleString()}`;
+      setYtUploadLogs(prev => [...prev, newLog]);
       loadUploadQueue(); // refresh queue list
       
-      if (publishImmediate) {
+      if (ytPublishImmediate) {
         // Poll job status
         const interval = setInterval(async () => {
           try {
             const statusRes = await fetch(`http://localhost:8000/api/upload-status/${result.job_id}`);
             if (statusRes.ok) {
               const statusData = await statusRes.json();
-              setUploadLogs(statusData.logs);
+              setYtUploadLogs(statusData.logs);
               
               if (statusData.status === "completed" || statusData.status === "failed") {
-                setIsUploading(false);
+                setYtIsUploading(false);
                 clearInterval(interval);
                 loadUploadQueue();
-                if (statusData.status === "completed") {
-                  addLog("🎉 Video successfully published to selected social media platforms!");
-                } else {
-                  addLog("❌ Social media upload failed. Check the upload terminal logs.");
-                }
               }
             }
           } catch (err) {
-            console.error("Error polling upload job status:", err);
+            console.error("Error polling YouTube upload status:", err);
           }
         }, 1500);
 
         setTimeout(() => {
           clearInterval(interval);
-          setIsUploading(false);
+          setYtIsUploading(false);
         }, 300000);
       } else {
-        setIsUploading(false);
+        setYtIsUploading(false);
+      }
+    } catch (error: any) {
+      setYtUploadLogs(prev => [...prev, `❌ Error: ${error.message || error}`]);
+      setYtIsUploading(false);
+    }
+  };
+
+  const handleInstagramUpload = async () => {
+    setIgIsUploading(true);
+    setIgUploadLogs(["Initiating Instagram upload request..."]);
+    
+    try {
+      const payload = {
+        video_generation_id: generationId || "",
+        platforms: ["instagram"],
+        youtube_title: "",
+        youtube_description: "",
+        youtube_tags: [],
+        youtube_privacy: "private",
+        instagram_caption: uploadCaption,
+        scheduled_time: igPublishImmediate ? null : (igScheduledTime ? new Date(igScheduledTime).toISOString() : null)
+      };
+
+      const res = await fetch("http://localhost:8000/api/schedule-upload", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload)
+      });
+
+      if (!res.ok) {
+        const data = await res.json();
+        throw new Error(data.detail || "Instagram upload job queue failed");
       }
 
-    } catch (err: any) {
-      setUploadLogs((prev) => [...prev, `❌ Error: ${err.message || err}`]);
-      setIsUploading(false);
+      const result = await res.json();
+      setIgUploadJobId(result.job_id);
+      
+      const newLog = igPublishImmediate ? "🚀 Instagram upload job queued immediately!" : `🕒 Instagram upload scheduled for: ${new Date(igScheduledTime).toLocaleString()}`;
+      setIgUploadLogs(prev => [...prev, newLog]);
+      loadUploadQueue(); // refresh queue list
+      
+      if (igPublishImmediate) {
+        // Poll job status
+        const interval = setInterval(async () => {
+          try {
+            const statusRes = await fetch(`http://localhost:8000/api/upload-status/${result.job_id}`);
+            if (statusRes.ok) {
+              const statusData = await statusRes.json();
+              setIgUploadLogs(statusData.logs);
+              
+              if (statusData.status === "completed" || statusData.status === "failed") {
+                setIgIsUploading(false);
+                clearInterval(interval);
+                loadUploadQueue();
+              }
+            }
+          } catch (err) {
+            console.error("Error polling Instagram upload status:", err);
+          }
+        }, 1500);
+
+        setTimeout(() => {
+          clearInterval(interval);
+          setIgIsUploading(false);
+        }, 300000);
+      } else {
+        setIgIsUploading(false);
+      }
+    } catch (error: any) {
+      setIgUploadLogs(prev => [...prev, `❌ Error: ${error.message || error}`]);
+      setIgIsUploading(false);
     }
   };
 
@@ -1555,7 +1619,7 @@ export default function Home() {
                   Publish this generated short directly to YouTube Shorts and Instagram Reels.
                 </p>
 
-                <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(300px, 1fr))", gap: "15px", marginBottom: "15px" }}>
+                <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(300px, 1fr))", gap: "15px", marginBottom: 0 }}>
                   
                   {/* YouTube Shorts Section */}
                   <div style={{ background: "rgba(255,255,255,0.02)", padding: "15px", borderRadius: "8px", border: "1px solid rgba(239, 68, 68, 0.15)" }}>
@@ -1633,6 +1697,73 @@ export default function Home() {
                             </select>
                           </div>
                         </div>
+
+                        {/* Scheduling UI inside YouTube Section */}
+                        <div style={{ background: "rgba(0,0,0,0.15)", padding: "10px", borderRadius: "6px", margin: "12px 0 10px 0", border: "1px solid rgba(255,255,255,0.03)" }}>
+                          <span style={{ color: "#f87171", fontSize: "11px", fontWeight: 600, display: "block", marginBottom: "6px", textTransform: "uppercase" }}>Scheduling</span>
+                          <div style={{ display: "flex", gap: "15px", marginBottom: "6px" }}>
+                            <label style={{ display: "flex", alignItems: "center", cursor: "pointer", margin: 0 }}>
+                              <input 
+                                type="radio" 
+                                name="yt_publish_time_opt"
+                                checked={ytPublishImmediate}
+                                onChange={() => setYtPublishImmediate(true)}
+                                style={{ marginRight: "4px" }}
+                              />
+                              <span style={{ fontSize: "12px", color: "#cbd5e1" }}>Immediate</span>
+                            </label>
+
+                            <label style={{ display: "flex", alignItems: "center", cursor: "pointer", margin: 0 }}>
+                              <input 
+                                type="radio" 
+                                name="yt_publish_time_opt"
+                                checked={!ytPublishImmediate}
+                                onChange={() => setYtPublishImmediate(false)}
+                                style={{ marginRight: "4px" }}
+                              />
+                              <span style={{ fontSize: "12px", color: "#cbd5e1" }}>Later</span>
+                            </label>
+                          </div>
+
+                          {!ytPublishImmediate && (
+                            <input 
+                              type="datetime-local" 
+                              className="form-input" 
+                              value={ytScheduledTime}
+                              onChange={(e) => setYtScheduledTime(e.target.value)}
+                              style={{ height: "32px", fontSize: "12px", padding: "4px 8px", marginTop: "4px", colorScheme: "dark" }}
+                            />
+                          )}
+                        </div>
+
+                        {/* YouTube Publish Button */}
+                        <button 
+                          onClick={handleYoutubeUpload}
+                          disabled={ytIsUploading}
+                          className="btn btn-primary"
+                          style={{ 
+                            background: "linear-gradient(135deg, #ef4444 0%, #dc2626 100%)",
+                            boxShadow: "0 4px 12px rgba(239, 68, 68, 0.2)",
+                            marginTop: "5px",
+                            padding: "8px 12px",
+                            fontSize: "13px",
+                            width: "100%"
+                          }}
+                        >
+                          🚀 {ytIsUploading ? "Uploading..." : (ytPublishImmediate ? "Publish to YouTube Now" : "Schedule to YouTube")}
+                        </button>
+
+                        {/* YouTube logs console */}
+                        {(ytIsUploading || ytUploadLogs.length > 0) && (
+                          <div style={{ marginTop: "12px" }}>
+                            <span className="form-label" style={{ fontSize: "10px", textTransform: "uppercase", display: "block", marginBottom: "4px" }}>YouTube Progress Logs</span>
+                            <div className="log-console" style={{ height: "90px", fontSize: "11px", overflowY: "auto", padding: "6px" }}>
+                              {ytUploadLogs.map((log, i) => (
+                                <div key={i} style={{ color: log.startsWith("❌") ? "#ef4444" : log.startsWith("✅") || log.includes("successful") ? "#10b981" : "#e2e8f0", marginBottom: "2px" }}>{log}</div>
+                              ))}
+                            </div>
+                          </div>
+                        )}
                       </div>
                     ) : (
                       <p style={{ fontSize: "12px", color: "#64748b", margin: "10px 0 0 0" }}>Check the box above to enable YouTube Shorts publishing configuration.</p>
@@ -1659,15 +1790,84 @@ export default function Home() {
                     </div>
 
                     {uploadPlatforms.instagram ? (
-                      <div className="form-group" style={{ margin: 0 }}>
-                        <label className="form-label" style={{ fontSize: "12px", marginBottom: "4px" }}>Reels Caption & Hashtags</label>
-                        <textarea 
-                          className="form-textarea" 
-                          rows={6}
-                          value={uploadCaption}
-                          onChange={(e) => setUploadCaption(e.target.value)}
-                          placeholder="Write caption... #reels #explore"
-                        />
+                      <div>
+                        <div className="form-group" style={{ marginBottom: "10px" }}>
+                          <label className="form-label" style={{ fontSize: "12px", marginBottom: "4px" }}>Reels Caption & Hashtags</label>
+                          <textarea 
+                            className="form-textarea" 
+                            rows={4}
+                            value={uploadCaption}
+                            onChange={(e) => setUploadCaption(e.target.value)}
+                            placeholder="Write caption... #reels #explore"
+                          />
+                        </div>
+
+                        {/* Scheduling UI inside Instagram Section */}
+                        <div style={{ background: "rgba(0,0,0,0.15)", padding: "10px", borderRadius: "6px", margin: "12px 0 10px 0", border: "1px solid rgba(255,255,255,0.03)" }}>
+                          <span style={{ color: "#f472b6", fontSize: "11px", fontWeight: 600, display: "block", marginBottom: "6px", textTransform: "uppercase" }}>Scheduling</span>
+                          <div style={{ display: "flex", gap: "15px", marginBottom: "6px" }}>
+                            <label style={{ display: "flex", alignItems: "center", cursor: "pointer", margin: 0 }}>
+                              <input 
+                                type="radio" 
+                                name="ig_publish_time_opt"
+                                checked={igPublishImmediate}
+                                onChange={() => setIgPublishImmediate(true)}
+                                style={{ marginRight: "4px" }}
+                              />
+                              <span style={{ fontSize: "12px", color: "#cbd5e1" }}>Immediate</span>
+                            </label>
+
+                            <label style={{ display: "flex", alignItems: "center", cursor: "pointer", margin: 0 }}>
+                              <input 
+                                type="radio" 
+                                name="ig_publish_time_opt"
+                                checked={!igPublishImmediate}
+                                onChange={() => setIgPublishImmediate(false)}
+                                style={{ marginRight: "4px" }}
+                              />
+                              <span style={{ fontSize: "12px", color: "#cbd5e1" }}>Later</span>
+                            </label>
+                          </div>
+
+                          {!igPublishImmediate && (
+                            <input 
+                              type="datetime-local" 
+                              className="form-input" 
+                              value={igScheduledTime}
+                              onChange={(e) => setIgScheduledTime(e.target.value)}
+                              style={{ height: "32px", fontSize: "12px", padding: "4px 8px", marginTop: "4px", colorScheme: "dark" }}
+                            />
+                          )}
+                        </div>
+
+                        {/* Instagram Publish Button */}
+                        <button 
+                          onClick={handleInstagramUpload}
+                          disabled={igIsUploading}
+                          className="btn btn-primary"
+                          style={{ 
+                            background: "linear-gradient(135deg, #ec4899 0%, #db2777 100%)",
+                            boxShadow: "0 4px 12px rgba(236, 72, 153, 0.2)",
+                            marginTop: "5px",
+                            padding: "8px 12px",
+                            fontSize: "13px",
+                            width: "100%"
+                          }}
+                        >
+                          🚀 {igIsUploading ? "Uploading..." : (igPublishImmediate ? "Publish to Instagram Now" : "Schedule to Instagram")}
+                        </button>
+
+                        {/* Instagram logs console */}
+                        {(igIsUploading || igUploadLogs.length > 0) && (
+                          <div style={{ marginTop: "12px" }}>
+                            <span className="form-label" style={{ fontSize: "10px", textTransform: "uppercase", display: "block", marginBottom: "4px" }}>Instagram Progress Logs</span>
+                            <div className="log-console" style={{ height: "90px", fontSize: "11px", overflowY: "auto", padding: "6px" }}>
+                              {igUploadLogs.map((log, i) => (
+                                <div key={i} style={{ color: log.startsWith("❌") ? "#ef4444" : log.startsWith("✅") || log.includes("successful") ? "#10b981" : "#e2e8f0", marginBottom: "2px" }}>{log}</div>
+                              ))}
+                            </div>
+                          </div>
+                        )}
                       </div>
                     ) : (
                       <p style={{ fontSize: "12px", color: "#64748b", margin: "10px 0 0 0" }}>Check the box above to enable Instagram Reels publishing configuration.</p>
@@ -1675,73 +1875,6 @@ export default function Home() {
                   </div>
 
                 </div>
-
-                {/* Scheduling UI */}
-                <div style={{ background: "rgba(255,255,255,0.02)", padding: "12px", borderRadius: "8px", marginBottom: "15px", border: "1px solid rgba(255,255,255,0.05)" }}>
-                  <h4 style={{ color: "#c084fc", fontSize: "14px", fontWeight: 600, margin: "0 0 10px 0" }}>Scheduling Options</h4>
-                  <div style={{ display: "flex", gap: "20px", marginBottom: "10px" }}>
-                    <label className="checkbox-container" style={{ margin: 0, display: "flex", alignItems: "center", cursor: "pointer" }}>
-                      <input 
-                        type="radio" 
-                        name="publish_time_opt"
-                        checked={publishImmediate}
-                        onChange={() => setPublishImmediate(true)}
-                        style={{ marginRight: "6px" }}
-                      />
-                      <span style={{ fontSize: "13px", fontWeight: 500, color: "#cbd5e1" }}>Publish Immediately</span>
-                    </label>
-
-                    <label className="checkbox-container" style={{ margin: 0, display: "flex", alignItems: "center", cursor: "pointer" }}>
-                      <input 
-                        type="radio" 
-                        name="publish_time_opt"
-                        checked={!publishImmediate}
-                        onChange={() => setPublishImmediate(false)}
-                        style={{ marginRight: "6px" }}
-                      />
-                      <span style={{ fontSize: "13px", fontWeight: 500, color: "#cbd5e1" }}>Schedule for Later</span>
-                    </label>
-                  </div>
-
-                  {!publishImmediate && (
-                    <div className="form-group" style={{ margin: "10px 0 0 0" }}>
-                      <label className="form-label" style={{ fontSize: "12px", marginBottom: "4px" }}>Select Date & Time</label>
-                      <input 
-                        type="datetime-local" 
-                        className="form-input" 
-                        value={scheduledTime}
-                        onChange={(e) => setScheduledTime(e.target.value)}
-                        style={{ height: "38px", colorScheme: "dark" }}
-                      />
-                    </div>
-                  )}
-                </div>
-
-                {/* Publish Button */}
-                <button 
-                  onClick={handleUpload}
-                  disabled={isUploading}
-                  className="btn btn-primary"
-                  style={{ 
-                    background: "linear-gradient(135deg, #a855f7 0%, #ec4899 100%)",
-                    boxShadow: "0 4px 15px rgba(236, 72, 153, 0.3)",
-                    marginTop: "10px"
-                  }}
-                >
-                  🚀 {isUploading ? "Uploading in Background..." : (publishImmediate ? "Publish Video Now" : "Schedule Publishing")}
-                </button>
-
-                {/* Upload logs console */}
-                {(isUploading || uploadLogs.length > 0) && (
-                  <div style={{ marginTop: "15px" }}>
-                    <span className="form-label" style={{ fontSize: "11px", textTransform: "uppercase", display: "block", marginBottom: "6px" }}>Upload Progress Logs</span>
-                    <div className="log-console" style={{ height: "120px", fontSize: "12px", overflowY: "auto" }}>
-                      {uploadLogs.map((log, i) => (
-                        <div key={i} className="log-entry" style={{ color: log.startsWith("❌") ? "#ef4444" : log.startsWith("✅") || log.includes("successful") ? "#10b981" : "#e2e8f0", marginBottom: "4px" }}>{log}</div>
-                      ))}
-                    </div>
-                  </div>
-                )}
               </div>
             )}
 
