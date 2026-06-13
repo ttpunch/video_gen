@@ -1555,34 +1555,20 @@ export default function Home() {
                   Publish this generated short directly to YouTube Shorts and Instagram Reels.
                 </p>
 
-                {/* Platforms selection */}
-                <div style={{ display: "flex", gap: "20px", marginBottom: "15px", borderBottom: "1px solid rgba(255,255,255,0.05)", paddingBottom: "15px" }}>
-                  <label className="checkbox-container" style={{ margin: 0, display: "flex", alignItems: "center", cursor: "pointer" }}>
-                    <input 
-                      type="checkbox" 
-                      checked={uploadPlatforms.youtube}
-                      onChange={(e) => setUploadPlatforms({ ...uploadPlatforms, youtube: e.target.checked })}
-                      style={{ marginRight: "6px" }}
-                    />
-                    <span style={{ fontSize: "14px", fontWeight: 600 }}>YouTube Shorts</span>
-                  </label>
-
-                  <label className="checkbox-container" style={{ margin: 0, display: "flex", alignItems: "center", cursor: "pointer" }}>
-                    <input 
-                      type="checkbox" 
-                      checked={uploadPlatforms.instagram}
-                      onChange={(e) => setUploadPlatforms({ ...uploadPlatforms, instagram: e.target.checked })}
-                      style={{ marginRight: "6px" }}
-                    />
-                    <span style={{ fontSize: "14px", fontWeight: 600 }}>Instagram Reels</span>
-                  </label>
-                </div>
-
-                {/* YouTube Metadata Sub-Form */}
-                {uploadPlatforms.youtube && (
-                  <div style={{ background: "rgba(255,255,255,0.02)", padding: "12px", borderRadius: "8px", marginBottom: "15px", border: "1px solid rgba(255,255,255,0.05)" }}>
-                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "10px" }}>
-                      <h4 style={{ color: "#f43f5e", fontSize: "14px", fontWeight: 600, margin: 0 }}>YouTube Channel Integration</h4>
+                <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(300px, 1fr))", gap: "15px", marginBottom: "15px" }}>
+                  
+                  {/* YouTube Shorts Section */}
+                  <div style={{ background: "rgba(255,255,255,0.02)", padding: "15px", borderRadius: "8px", border: "1px solid rgba(239, 68, 68, 0.15)" }}>
+                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "12px", borderBottom: "1px solid rgba(255,255,255,0.05)", paddingBottom: "8px" }}>
+                      <label className="checkbox-container" style={{ margin: 0, display: "flex", alignItems: "center", cursor: "pointer" }}>
+                        <input 
+                          type="checkbox" 
+                          checked={uploadPlatforms.youtube}
+                          onChange={(e) => setUploadPlatforms({ ...uploadPlatforms, youtube: e.target.checked })}
+                          style={{ marginRight: "8px" }}
+                        />
+                        <span style={{ fontSize: "15px", fontWeight: 600, color: "#f87171" }}>YouTube Shorts</span>
+                      </label>
                       {isYtAuthenticated ? (
                         <span style={{ fontSize: "11px", color: "#10b981", fontWeight: 700 }}>Connected ✅</span>
                       ) : (
@@ -1591,87 +1577,104 @@ export default function Home() {
                           className="btn btn-secondary" 
                           style={{ padding: "4px 8px", fontSize: "11px", width: "auto", margin: 0 }}
                         >
-                          Authorize YouTube
+                          Authorize
                         </button>
                       )}
                     </div>
 
-                    <div className="form-group" style={{ marginBottom: "10px" }}>
-                      <label className="form-label" style={{ fontSize: "12px", marginBottom: "4px" }}>YouTube Shorts Title (Catchy, max 100 chars)</label>
-                      <input 
-                        type="text" 
-                        className="form-input" 
-                        maxLength={100}
-                        value={uploadTitle}
-                        onChange={(e) => setUploadTitle(e.target.value)}
-                        placeholder="E.g. Inside the Quantum Physics Realm! 🧪"
-                      />
-                      <span className="form-label-info" style={{ textAlign: "right", display: "block", fontSize: "10px", marginTop: "2px" }}>{uploadTitle.length}/100</span>
-                    </div>
+                    {uploadPlatforms.youtube ? (
+                      <div>
+                        <div className="form-group" style={{ marginBottom: "10px" }}>
+                          <label className="form-label" style={{ fontSize: "12px", marginBottom: "4px" }}>Shorts Title (Catchy, max 100 chars)</label>
+                          <input 
+                            type="text" 
+                            className="form-input" 
+                            maxLength={100}
+                            value={uploadTitle}
+                            onChange={(e) => setUploadTitle(e.target.value)}
+                            placeholder="E.g. Inside the Quantum Physics Realm! 🧪"
+                          />
+                          <span className="form-label-info" style={{ textAlign: "right", display: "block", fontSize: "10px", marginTop: "2px" }}>{uploadTitle.length}/100</span>
+                        </div>
 
-                    <div className="form-group" style={{ marginBottom: "10px" }}>
-                      <label className="form-label" style={{ fontSize: "12px", marginBottom: "4px" }}>Shorts Description</label>
-                      <textarea 
-                        className="form-textarea" 
-                        rows={3}
-                        value={uploadDescription}
-                        onChange={(e) => setUploadDescription(e.target.value)}
-                        placeholder="Tell viewers what your short is about..."
-                      />
-                    </div>
+                        <div className="form-group" style={{ marginBottom: "10px" }}>
+                          <label className="form-label" style={{ fontSize: "12px", marginBottom: "4px" }}>Shorts Description</label>
+                          <textarea 
+                            className="form-textarea" 
+                            rows={3}
+                            value={uploadDescription}
+                            onChange={(e) => setUploadDescription(e.target.value)}
+                            placeholder="Tell viewers what your short is about..."
+                          />
+                        </div>
 
-                    <div className="form-row" style={{ gap: "12px", marginBottom: 0 }}>
-                      <div className="form-group" style={{ flex: 1, margin: 0 }}>
-                        <label className="form-label" style={{ fontSize: "12px", marginBottom: "4px" }}>Tags (comma-separated)</label>
-                        <input 
-                          type="text" 
-                          className="form-input" 
-                          value={uploadTags}
-                          onChange={(e) => setUploadTags(e.target.value)}
-                          placeholder="shorts, science, viral"
-                        />
+                        <div className="form-row" style={{ gap: "10px", marginBottom: 0 }}>
+                          <div className="form-group" style={{ flex: 1, margin: 0 }}>
+                            <label className="form-label" style={{ fontSize: "12px", marginBottom: "4px" }}>Tags (comma-separated)</label>
+                            <input 
+                              type="text" 
+                              className="form-input" 
+                              value={uploadTags}
+                              onChange={(e) => setUploadTags(e.target.value)}
+                              placeholder="shorts, science, viral"
+                            />
+                          </div>
+                          <div className="form-group" style={{ width: "110px", margin: 0 }}>
+                            <label className="form-label" style={{ fontSize: "12px", marginBottom: "4px" }}>Privacy</label>
+                            <select 
+                              className="form-select"
+                              value={uploadPrivacy}
+                              onChange={(e) => setUploadPrivacy(e.target.value)}
+                              style={{ height: "38px" }}
+                            >
+                              <option value="private">Private</option>
+                              <option value="unlisted">Unlisted</option>
+                              <option value="public">Public</option>
+                            </select>
+                          </div>
+                        </div>
                       </div>
-                      <div className="form-group" style={{ width: "120px", margin: 0 }}>
-                        <label className="form-label" style={{ fontSize: "12px", marginBottom: "4px" }}>Privacy</label>
-                        <select 
-                          className="form-select"
-                          value={uploadPrivacy}
-                          onChange={(e) => setUploadPrivacy(e.target.value)}
-                          style={{ height: "38px" }}
-                        >
-                          <option value="private">Private</option>
-                          <option value="unlisted">Unlisted</option>
-                          <option value="public">Public</option>
-                        </select>
-                      </div>
-                    </div>
+                    ) : (
+                      <p style={{ fontSize: "12px", color: "#64748b", margin: "10px 0 0 0" }}>Check the box above to enable YouTube Shorts publishing configuration.</p>
+                    )}
                   </div>
-                )}
 
-                {/* Instagram Metadata Sub-Form */}
-                {uploadPlatforms.instagram && (
-                  <div style={{ background: "rgba(255,255,255,0.02)", padding: "12px", borderRadius: "8px", marginBottom: "15px", border: "1px solid rgba(255,255,255,0.05)" }}>
-                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "10px" }}>
-                      <h4 style={{ color: "#ec4899", fontSize: "14px", fontWeight: 600, margin: 0 }}>Instagram Graph API Integration</h4>
+                  {/* Instagram Reels Section */}
+                  <div style={{ background: "rgba(255,255,255,0.02)", padding: "15px", borderRadius: "8px", border: "1px solid rgba(236, 72, 153, 0.15)" }}>
+                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "12px", borderBottom: "1px solid rgba(255,255,255,0.05)", paddingBottom: "8px" }}>
+                      <label className="checkbox-container" style={{ margin: 0, display: "flex", alignItems: "center", cursor: "pointer" }}>
+                        <input 
+                          type="checkbox" 
+                          checked={uploadPlatforms.instagram}
+                          onChange={(e) => setUploadPlatforms({ ...uploadPlatforms, instagram: e.target.checked })}
+                          style={{ marginRight: "8px" }}
+                        />
+                        <span style={{ fontSize: "15px", fontWeight: 600, color: "#f472b6" }}>Instagram Reels</span>
+                      </label>
                       {isIgConfigured ? (
-                        <span style={{ fontSize: "11px", color: "#10b981", fontWeight: 700 }}>Ready (ngrok Tunnel) Connected ✅</span>
+                        <span style={{ fontSize: "11px", color: "#10b981", fontWeight: 700 }}>Ready ✅</span>
                       ) : (
-                        <span style={{ fontSize: "11px", color: "#eab308", fontWeight: 700 }}>Not Configured (needs .env keys) ⚠️</span>
+                        <span style={{ fontSize: "11px", color: "#eab308", fontWeight: 700 }}>Not Configured ⚠️</span>
                       )}
                     </div>
 
-                    <div className="form-group" style={{ margin: 0 }}>
-                      <label className="form-label" style={{ fontSize: "12px", marginBottom: "4px" }}>Reels Caption & Hashtags</label>
-                      <textarea 
-                        className="form-textarea" 
-                        rows={3}
-                        value={uploadCaption}
-                        onChange={(e) => setUploadCaption(e.target.value)}
-                        placeholder="Write caption... #reels #explore"
-                      />
-                    </div>
+                    {uploadPlatforms.instagram ? (
+                      <div className="form-group" style={{ margin: 0 }}>
+                        <label className="form-label" style={{ fontSize: "12px", marginBottom: "4px" }}>Reels Caption & Hashtags</label>
+                        <textarea 
+                          className="form-textarea" 
+                          rows={6}
+                          value={uploadCaption}
+                          onChange={(e) => setUploadCaption(e.target.value)}
+                          placeholder="Write caption... #reels #explore"
+                        />
+                      </div>
+                    ) : (
+                      <p style={{ fontSize: "12px", color: "#64748b", margin: "10px 0 0 0" }}>Check the box above to enable Instagram Reels publishing configuration.</p>
+                    )}
                   </div>
-                )}
+
+                </div>
 
                 {/* Scheduling UI */}
                 <div style={{ background: "rgba(255,255,255,0.02)", padding: "12px", borderRadius: "8px", marginBottom: "15px", border: "1px solid rgba(255,255,255,0.05)" }}>
