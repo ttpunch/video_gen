@@ -3,7 +3,8 @@
 import React, { useState, useEffect, useRef } from "react";
 import { 
   Tv, Sparkles, Sliders, Play, Settings, AlertCircle, FileText, CheckCircle2, 
-  Layers, Volume2, Image as ImageIcon, Music, RefreshCw, Subtitles, HelpCircle
+  Layers, Volume2, Image as ImageIcon, Music, RefreshCw, Subtitles, HelpCircle,
+  Trash2
 } from "lucide-react";
 
 interface StoryboardScene {
@@ -59,6 +60,11 @@ export default function Home() {
   // History & Queue states
   const [history, setHistory] = useState<any[]>([]);
   const [uploadQueue, setUploadQueue] = useState<any[]>([]);
+
+  // Auto Agent Scheduler states
+  const [schedulerConfig, setSchedulerConfig] = useState<any>(null);
+  const [schedulerLogs, setSchedulerLogs] = useState<any[]>([]);
+  const [triggerLoading, setTriggerLoading] = useState(false);
 
   // Input states: Viral Shorts Studio
   const [viralPrompt, setViralPrompt] = useState("The giant hidden ocean underneath Jupiter's moon Europa");
@@ -192,6 +198,7 @@ export default function Home() {
 
   useEffect(() => {
     loadConfig();
+    loadSchedulerData();
   }, []);
 
   useEffect(() => {
@@ -424,6 +431,113 @@ export default function Home() {
       }
     } catch (err) {
       console.error("Failed to load history:", err);
+    }
+  };
+
+  const handleDeleteGeneration = async (genId: string, topic: string) => {
+    if (!window.confirm(`Are you sure you want to permanently delete the video "${topic || "Untitled"}" and all its associated assets (images and audio files)? This action cannot be undone.`)) {
+      return;
+    }
+    
+    try {
+      const res = await fetch(`http://localhost:8000/api/generation/${genId}`, {
+        method: "DELETE",
+      });
+      if (res.ok) {
+        addLog(`🗑️ Deleted video generation "${topic || "Untitled"}" and all its assets successfully.`);
+        // If the deleted generation is currently loaded in the publisher/editor state, clear it:
+        if (generationId === genId) {
+          setGenerationId(null);
+          setFinalVideoUrl(null);
+          setStoryboard([]);
+          setGeneratedTopic("");
+          setUploadTitle("");
+          setUploadDescription("");
+          setUploadTags("");
+          setUploadCaption("");
+          addLog(`🧹 Cleared deleted generation from publisher/editor panel.`);
+        }
+        // Reload history
+        loadHistory();
+      } else {
+        const errorData = await res.json();
+        alert(`Failed to delete generation: ${errorData.detail || res.statusText}`);
+      }
+    } catch (err: any) {
+      console.error("Failed to delete generation:", err);
+      alert(`Error deleting generation: ${err.message || err}`);
+    }
+  };
+
+  const loadSchedulerData = async () => {
+    try {
+      const resConfig = await fetch("http://localhost:8000/api/scheduler/config");
+      if (resConfig.ok) {
+        setSchedulerConfig(await resConfig.json());
+      }
+      const resLogs = await fetch("http://localhost:8000/api/scheduler/logs");
+      if (resLogs.ok) {
+        setSchedulerLogs(await resLogs.json());
+      }
+    } catch (err) {
+      console.error("Error loading scheduler data:", err);
+    }
+  };
+
+  const handleClearSchedulerLogs = async () => {
+    if (!window.confirm("Are you sure you want to clear all scheduler execution logs? This action cannot be undone.")) {
+      return;
+    }
+    try {
+      const res = await fetch("http://localhost:8000/api/scheduler/logs", {
+        method: "DELETE"
+      });
+      if (res.ok) {
+        setSchedulerLogs([]);
+        addLog("🗑️ Scheduler execution logs cleared successfully.");
+      } else {
+        alert("Failed to clear scheduler execution logs");
+      }
+    } catch (err) {
+      console.error("Error clearing scheduler logs:", err);
+    }
+  };
+
+  const saveSchedulerConfig = async (updatedConfig: any) => {
+    try {
+      const res = await fetch("http://localhost:8000/api/scheduler/config", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(updatedConfig)
+      });
+      if (res.ok) {
+        setSchedulerConfig(updatedConfig);
+        addLog("💾 Scheduler settings updated successfully.");
+      } else {
+        alert("Failed to save scheduler configuration");
+      }
+    } catch (err) {
+      console.error("Error saving scheduler config:", err);
+      alert("Error saving settings");
+    }
+  };
+
+  const triggerSchedulerAgent = async () => {
+    setTriggerLoading(true);
+    try {
+      const res = await fetch("http://localhost:8000/api/scheduler/trigger", {
+        method: "POST"
+      });
+      if (res.ok) {
+        addLog("🚀 Manual Agent Run triggered in the background. Generating viral short...");
+        setTimeout(loadSchedulerData, 2000);
+      } else {
+        alert("Failed to trigger agent");
+      }
+    } catch (err) {
+      console.error("Error triggering agent:", err);
+    } finally {
+      setTriggerLoading(false);
     }
   };
 
@@ -873,10 +987,16 @@ export default function Home() {
         >
           <Layers size={18} /> 🕒 Upload Queue
         </button>
+        <button 
+          onClick={() => { setActiveTab("scheduler"); loadSchedulerData(); }} 
+          className={`tab-btn ${activeTab === "scheduler" ? "tab-btn-active" : ""}`}
+        >
+          <Settings size={18} /> 🤖 Auto-Agent Scheduler
+        </button>
       </div>
 
       {/* Main Grid Panels / Full Screens */}
-      {activeTab !== "library" && activeTab !== "queue" ? (
+      {activeTab !== "library" && activeTab !== "queue" && activeTab !== "scheduler" ? (
         <div className="dashboard-grid">
           {/* Left Side: Forms */}
           <div className="form-panel">
@@ -2040,6 +2160,24 @@ export default function Home() {
                           ✏️ Edit Storyboard Draft
                         </button>
                       )}
+
+                      <button
+                        onClick={() => handleDeleteGeneration(item.id, item.topic || item.prompt || "")}
+                        className="btn btn-secondary"
+                        style={{
+                          width: "100%",
+                          marginTop: "8px",
+                          borderColor: "rgba(239, 68, 68, 0.2)",
+                          color: "#f87171",
+                          background: "rgba(239, 68, 68, 0.05)",
+                          display: "flex",
+                          alignItems: "center",
+                          justifyContent: "center",
+                          gap: "6px"
+                        }}
+                      >
+                        <Trash2 size={14} /> Delete Video & Assets
+                      </button>
                     </div>
                   ))
                 )}
@@ -2145,6 +2283,455 @@ export default function Home() {
                   })
                 )}
               </div>
+            </div>
+          )}
+
+          {activeTab === "scheduler" && (
+            <div className="glass-card" style={{ padding: "24px" }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", borderBottom: "1px solid rgba(255,255,255,0.08)", paddingBottom: "15px", marginBottom: "20px" }}>
+                <div>
+                  <h2 className="card-title" style={{ margin: 0, display: "flex", alignItems: "center", gap: "8px" }}>
+                    🤖 Daily Auto-Agent Scheduler
+                  </h2>
+                  <p style={{ color: "#94a3b8", fontSize: "13px", marginTop: "4px" }}>
+                    Configure the autonomous scheduler agent to dynamically find trends, compose custom music, render videos, and post on YouTube.
+                  </p>
+                </div>
+                <button onClick={loadSchedulerData} className="btn btn-secondary" style={{ width: "auto", margin: 0, padding: "8px 16px" }}>
+                  <RefreshCw size={14} /> Refresh
+                </button>
+              </div>
+
+              {schedulerConfig ? (
+                <div className="scheduler-layout" style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "24px" }}>
+                  {/* Left Side: Settings */}
+                  <div style={{ display: "flex", flexDirection: "column", gap: "16px", background: "rgba(255,255,255,0.02)", padding: "20px", borderRadius: "12px", border: "1px solid rgba(255,255,255,0.05)" }}>
+                    <h3 style={{ margin: "0 0 10px 0", color: "#f8fafc", fontSize: "16px", display: "flex", alignItems: "center", gap: "8px" }}>
+                      ⚙️ Scheduler Settings
+                    </h3>
+                    
+                    {/* Enable Toggle */}
+                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", background: "rgba(168, 85, 247, 0.05)", border: "1px solid rgba(168, 85, 247, 0.2)", padding: "12px 16px", borderRadius: "8px" }}>
+                      <div>
+                        <div style={{ fontWeight: 600, color: "#e9d5ff", fontSize: "14px" }}>Enable Automatic Posting</div>
+                        <div style={{ fontSize: "12px", color: "#c084fc" }}>Autonomously publish 2 videos daily</div>
+                      </div>
+                      <input 
+                        type="checkbox" 
+                        checked={schedulerConfig.enabled} 
+                        onChange={(e) => {
+                          const updated = { ...schedulerConfig, enabled: e.target.checked };
+                          saveSchedulerConfig(updated);
+                        }}
+                        style={{ width: "20px", height: "20px", cursor: "pointer", accentColor: "#a855f7" }}
+                      />
+                    </div>
+
+                    <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "12px" }}>
+                      {/* Region */}
+                      <div className="form-group">
+                        <label className="form-label">Trending Region</label>
+                        <select 
+                          value={schedulerConfig.region}
+                          onChange={(e) => {
+                            const updated = { ...schedulerConfig, region: e.target.value };
+                            saveSchedulerConfig(updated);
+                          }}
+                          className="form-input"
+                        >
+                          <option value="US">United States (US)</option>
+                          <option value="IN">India (IN)</option>
+                          <option value="GB">United Kingdom (GB)</option>
+                          <option value="CA">Canada (CA)</option>
+                          <option value="AU">Australia (AU)</option>
+                        </select>
+                      </div>
+
+                      {/* YouTube Default Privacy */}
+                      <div className="form-group">
+                        <label className="form-label">YouTube Upload Privacy</label>
+                        <select 
+                          value={schedulerConfig.privacy}
+                          onChange={(e) => {
+                            const updated = { ...schedulerConfig, privacy: e.target.value };
+                            saveSchedulerConfig(updated);
+                          }}
+                          className="form-input"
+                        >
+                          <option value="private">Private (Recommended)</option>
+                          <option value="unlisted">Unlisted</option>
+                          <option value="public">Public (Immediate Post)</option>
+                        </select>
+                      </div>
+                    </div>
+
+                    <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "12px" }}>
+                      {/* Time Slot 1 */}
+                      <div className="form-group">
+                        <label className="form-label">Slot 1 Run Time</label>
+                        <input 
+                          type="time" 
+                          value={schedulerConfig.time1}
+                          onChange={(e) => {
+                            const updated = { ...schedulerConfig, time1: e.target.value };
+                            saveSchedulerConfig(updated);
+                          }}
+                          className="form-input"
+                        />
+                      </div>
+
+                      {/* Time Slot 2 */}
+                      <div className="form-group">
+                        <label className="form-label">Slot 2 Run Time</label>
+                        <input 
+                          type="time" 
+                          value={schedulerConfig.time2}
+                          onChange={(e) => {
+                            const updated = { ...schedulerConfig, time2: e.target.value };
+                            saveSchedulerConfig(updated);
+                          }}
+                          className="form-input"
+                        />
+                      </div>
+                    </div>
+
+                    <div className="form-group">
+                      <label className="form-label">Ollama Model (Script/Topic Evaluation)</label>
+                      <select 
+                        value={schedulerConfig.model}
+                        onChange={(e) => {
+                          const updated = { ...schedulerConfig, model: e.target.value };
+                          saveSchedulerConfig(updated);
+                        }}
+                        className="form-input"
+                      >
+                        {config?.ollama_models.map((m: string) => (
+                          <option key={m} value={m}>{m}</option>
+                        ))}
+                      </select>
+                    </div>
+
+                    <div className="form-group">
+                      <label className="form-label">Leonardo Model (Image Synthesis)</label>
+                      <select 
+                        value={schedulerConfig.leonardo_model}
+                        onChange={(e) => {
+                          const updated = { ...schedulerConfig, leonardo_model: e.target.value };
+                          saveSchedulerConfig(updated);
+                        }}
+                        className="form-input"
+                      >
+                        {config?.leonardo_models.map((m: string) => (
+                          <option key={m} value={m}>{m}</option>
+                        ))}
+                      </select>
+                    </div>
+
+                    <div className="form-group">
+                      <label className="form-label">Default Voice Actor</label>
+                      <select 
+                        value={schedulerConfig.voice}
+                        onChange={(e) => {
+                          const updated = { ...schedulerConfig, voice: e.target.value };
+                          saveSchedulerConfig(updated);
+                        }}
+                        className="form-input"
+                      >
+                        {config?.voices.map((v: string) => (
+                          <option key={v} value={v}>{v}</option>
+                        ))}
+                      </select>
+                    </div>
+
+                    {/* Subtitle Settings */}
+                    <div style={{ borderTop: "1px solid rgba(255,255,255,0.08)", paddingTop: "16px", marginTop: "8px" }}>
+                      <h4 style={{ margin: "0 0 12px 0", color: "#e9d5ff", fontSize: "14px", fontWeight: 600 }}>
+                        📝 Subtitle Customization
+                      </h4>
+                      
+                      <div style={{ display: "flex", flexDirection: "column", gap: "12px" }}>
+                        {/* Enable Subtitles Checkbox */}
+                        <label className="checkbox-container" style={{ margin: 0 }}>
+                          <input 
+                            type="checkbox" 
+                            checked={schedulerConfig.enable_captions}
+                            onChange={(e) => {
+                              const updated = { ...schedulerConfig, enable_captions: e.target.checked };
+                              saveSchedulerConfig(updated);
+                            }}
+                          />
+                          <div className="checkbox-custom"></div>
+                          <span style={{ fontSize: "13px", fontWeight: 600 }}>Burn Centered Subtitles</span>
+                        </label>
+
+                        {/* Font and Style Selector */}
+                        {schedulerConfig.enable_captions && (
+                          <>
+                            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "12px" }}>
+                              <div className="form-group" style={{ margin: 0 }}>
+                                <label className="form-label" style={{ fontSize: "12px" }}>Font Family</label>
+                                <select 
+                                  value={schedulerConfig.caption_font}
+                                  onChange={(e) => {
+                                    const updated = { ...schedulerConfig, caption_font: e.target.value };
+                                    saveSchedulerConfig(updated);
+                                  }}
+                                  className="form-input"
+                                  style={{ padding: "6px 10px", fontSize: "12px" }}
+                                >
+                                  <option value="Arial">Arial</option>
+                                  <option value="Impact">Impact</option>
+                                  <option value="Trebuchet MS">Trebuchet MS</option>
+                                  <option value="Verdana">Verdana</option>
+                                </select>
+                              </div>
+
+                              <div className="form-group" style={{ margin: 0 }}>
+                                <label className="form-label" style={{ fontSize: "12px" }}>Highlight Style</label>
+                                <select 
+                                  value={schedulerConfig.caption_style}
+                                  onChange={(e) => {
+                                    const updated = { ...schedulerConfig, caption_style: e.target.value };
+                                    saveSchedulerConfig(updated);
+                                  }}
+                                  className="form-input"
+                                  style={{ padding: "6px 10px", fontSize: "12px" }}
+                                >
+                                  <option value="Viral Pop">Viral Pop (Pops + Color Highlights)</option>
+                                  <option value="Standard">Standard Bottom Text</option>
+                                </select>
+                              </div>
+                            </div>
+
+                            {/* Size Slider */}
+                            <div className="form-group" style={{ margin: 0 }}>
+                              <label className="form-label" style={{ display: "flex", justifyContent: "space-between", marginBottom: "4px", fontSize: "12px" }}>
+                                <span>Font Size</span>
+                                <span style={{ color: "#c084fc", fontWeight: 600 }}>{schedulerConfig.caption_size}px</span>
+                              </label>
+                              <div className="slider-group" style={{ gap: "8px" }}>
+                                <input 
+                                  type="range" 
+                                  min="24" 
+                                  max="120" 
+                                  value={schedulerConfig.caption_size} 
+                                  onChange={(e) => {
+                                    const updated = { ...schedulerConfig, caption_size: parseInt(e.target.value) };
+                                    saveSchedulerConfig(updated);
+                                  }}
+                                  style={{ flexGrow: 1, padding: 0, height: "4px", background: "rgba(255,255,255,0.1)", borderRadius: "2px", cursor: "pointer" }}
+                                />
+                              </div>
+                            </div>
+
+                            {/* Margin Slider */}
+                            <div className="form-group" style={{ margin: 0 }}>
+                              <label className="form-label" style={{ display: "flex", justifyContent: "space-between", marginBottom: "4px", fontSize: "12px" }}>
+                                <span>Vertical Margin</span>
+                                <span style={{ color: "#c084fc", fontWeight: 600 }}>{schedulerConfig.caption_margin_v}px</span>
+                              </label>
+                              <div className="slider-group" style={{ gap: "8px" }}>
+                                <input 
+                                  type="range" 
+                                  min="50" 
+                                  max="800" 
+                                  value={schedulerConfig.caption_margin_v} 
+                                  onChange={(e) => {
+                                    const updated = { ...schedulerConfig, caption_margin_v: parseInt(e.target.value) };
+                                    saveSchedulerConfig(updated);
+                                  }}
+                                  style={{ flexGrow: 1, padding: 0, height: "4px", background: "rgba(255,255,255,0.1)", borderRadius: "2px", cursor: "pointer" }}
+                                />
+                              </div>
+                            </div>
+
+                            {/* Highlight Color */}
+                            <div className="form-group" style={{ margin: 0 }}>
+                              <label className="form-label" style={{ marginBottom: "6px", fontSize: "12px" }}>Highlight Accent Color</label>
+                              <div style={{ display: "flex", gap: "6px", flexWrap: "wrap" }}>
+                                {COLOR_PRESETS.map((preset) => {
+                                  const isSelected = schedulerConfig.caption_color === preset.ass;
+                                  return (
+                                    <button
+                                      key={preset.name}
+                                      type="button"
+                                      onClick={() => {
+                                        const updated = { ...schedulerConfig, caption_color: preset.ass };
+                                        saveSchedulerConfig(updated);
+                                      }}
+                                      style={{
+                                        display: "flex",
+                                        alignItems: "center",
+                                        gap: "4px",
+                                        background: isSelected ? "rgba(168, 85, 247, 0.25)" : "rgba(255,255,255,0.03)",
+                                        border: `1px solid ${isSelected ? "#a855f7" : "rgba(255,255,255,0.08)"}`,
+                                        borderRadius: "16px",
+                                        padding: "4px 8px",
+                                        cursor: "pointer",
+                                        color: isSelected ? "#f8fafc" : "#94a3b8",
+                                        fontSize: "11px",
+                                        fontWeight: 600,
+                                        transition: "all 0.2s ease"
+                                      }}
+                                    >
+                                      <span style={{
+                                        width: "8px",
+                                        height: "8px",
+                                        borderRadius: "50%",
+                                        backgroundColor: preset.hex,
+                                        display: "inline-block"
+                                      }} />
+                                      {preset.name}
+                                    </button>
+                                  );
+                                })}
+                              </div>
+                            </div>
+                          </>
+                        )}
+                      </div>
+                    </div>
+
+                    <div style={{ marginTop: "10px" }}>
+                      <button
+                        onClick={triggerSchedulerAgent}
+                        disabled={triggerLoading}
+                        className="btn btn-secondary"
+                        style={{
+                          width: "100%",
+                          background: "linear-gradient(135deg, #a855f7 0%, #ec4899 100%)",
+                          border: "none",
+                          color: "white",
+                          fontWeight: 600,
+                          padding: "10px 0"
+                        }}
+                      >
+                        {triggerLoading ? "🚀 Triggering..." : "🔥 Trigger Agent Run Now"}
+                      </button>
+                    </div>
+                  </div>
+
+                  {/* Right Side: Logs & Execution History */}
+                  <div style={{ display: "flex", flexDirection: "column", gap: "16px" }}>
+                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                      <h3 style={{ margin: 0, color: "#f8fafc", fontSize: "16px" }}>
+                        📜 Scheduler Execution Logs
+                      </h3>
+                      {schedulerLogs.length > 0 && (
+                        <button
+                          onClick={handleClearSchedulerLogs}
+                          style={{
+                            background: "rgba(239, 68, 68, 0.1)",
+                            border: "1px solid rgba(239, 68, 68, 0.2)",
+                            color: "#ef4444",
+                            borderRadius: "6px",
+                            padding: "4px 10px",
+                            fontSize: "11px",
+                            fontWeight: 600,
+                            cursor: "pointer",
+                            transition: "all 0.2s"
+                          }}
+                          onMouseEnter={(e) => {
+                            e.currentTarget.style.background = "rgba(239, 68, 68, 0.2)";
+                          }}
+                          onMouseLeave={(e) => {
+                            e.currentTarget.style.background = "rgba(239, 68, 68, 0.1)";
+                          }}
+                        >
+                          🗑️ Clear Logs
+                        </button>
+                      )}
+                    </div>
+                    
+                    <div style={{ 
+                      maxHeight: "530px", 
+                      overflowY: "auto", 
+                      display: "flex", 
+                      flexDirection: "column", 
+                      gap: "12px",
+                      paddingRight: "6px"
+                    }}>
+                      {schedulerLogs.length === 0 ? (
+                        <div style={{ textAlign: "center", padding: "40px", color: "#64748b" }}>
+                          No execution logs found. Trigger a run or wait for the scheduler to execute.
+                        </div>
+                      ) : (
+                        schedulerLogs.map((log: any, lIdx: number) => (
+                          <div key={log.id || lIdx} style={{ 
+                            background: "rgba(255,255,255,0.02)", 
+                            border: `1px solid ${log.status === "success" ? "rgba(16, 185, 129, 0.15)" : log.status === "failed" ? "rgba(239, 68, 68, 0.15)" : "rgba(168, 85, 247, 0.15)"}`, 
+                            borderRadius: "8px", 
+                            padding: "12px" 
+                          }}>
+                            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "8px" }}>
+                              <span style={{ 
+                                fontSize: "11px", 
+                                fontWeight: 700, 
+                                textTransform: "uppercase", 
+                                padding: "2px 6px", 
+                                borderRadius: "4px",
+                                background: log.status === "success" ? "rgba(16, 185, 129, 0.1)" : log.status === "failed" ? "rgba(239, 68, 68, 0.1)" : "rgba(168, 85, 247, 0.1)",
+                                color: log.status === "success" ? "#10b981" : log.status === "failed" ? "#ef4444" : "#a855f7"
+                              }}>
+                                {log.status}
+                              </span>
+                              <span style={{ fontSize: "11px", color: "#64748b" }}>
+                                {new Date(log.timestamp).toLocaleString()}
+                              </span>
+                            </div>
+                            
+                            <div style={{ fontWeight: 600, color: "#f8fafc", fontSize: "13px", marginBottom: "4px" }}>
+                              📌 {log.topic}
+                            </div>
+                            <div style={{ fontSize: "11px", color: "#94a3b8", marginBottom: "8px" }}>
+                              🕒 Slot: {log.slot}
+                            </div>
+                            
+                            {/* Expandable step-by-step logs */}
+                            <details style={{ cursor: "pointer" }}>
+                              <summary style={{ fontSize: "11px", color: "#a855f7", outline: "none", fontWeight: 500 }}>
+                                View Detailed Steps
+                              </summary>
+                              <div style={{ 
+                                background: "#06050e", 
+                                border: "1px solid rgba(255,255,255,0.05)", 
+                                borderRadius: "6px", 
+                                padding: "8px 12px", 
+                                marginTop: "8px",
+                                fontFamily: "monospace",
+                                fontSize: "11px",
+                                color: "#10b981",
+                                overflowX: "auto",
+                                maxHeight: "150px",
+                                whiteSpace: "pre-wrap"
+                              }}>
+                                {log.logs?.join("\n")}
+                              </div>
+                            </details>
+
+                            {log.youtube_id && (
+                              <div style={{ marginTop: "10px", fontSize: "12px" }}>
+                                <a 
+                                  href={`https://youtu.be/${log.youtube_id}`}
+                                  target="_blank" 
+                                  rel="noopener noreferrer" 
+                                  style={{ color: "#ec4899", fontWeight: 600, textDecoration: "none", display: "inline-flex", alignItems: "center", gap: "4px" }}
+                                >
+                                  📺 Watch on YouTube ↗
+                                </a>
+                              </div>
+                            )}
+                          </div>
+                        ))
+                      )}
+                    </div>
+                  </div>
+                </div>
+              ) : (
+                <div style={{ textAlign: "center", padding: "40px", color: "#64748b" }}>
+                  Loading scheduler configuration...
+                </div>
+              )}
             </div>
           )}
         </div>

@@ -359,7 +359,7 @@ def generate_ollama_script(prompt: str, model: str, hook_style: str = "None (Dir
         "You are an expert creative storyteller and copywriter. "
         "Your task is to write a highly engaging, viral 15-second story or script based on the topic. "
         "It must flow naturally as a single narrative and keep the listener hooked from the first second. "
-        "Keep the total length to approximately 35-45 words. "
+        "Keep the total length to approximately 55-65 words to ensure it runs for a full 15 seconds. "
         "Do not include scene numbers, brackets, or speaker names in this text—only write the raw narrative story text."
     )
     
@@ -386,12 +386,12 @@ def generate_ollama_script(prompt: str, model: str, hook_style: str = "None (Dir
         
     # Stage 2: Storyboarder & Scene Segmenter (Strict JSON)
     storyboarder_system = (
-        "You are an expert storyboarder. Take the provided story text and split it into exactly 5 sequential scenes. "
+        "You are an expert storyboarder. Take the provided story text and split it into exactly 7 sequential scenes. "
         "To ensure visual continuity and keep the focus point consistent (so the video does not look like a series of unrelated random images), you MUST define:\n"
         "1. A 'global_visual_style' representing the overall visual medium, art style, camera/lighting style, and color palette (e.g. 'cinematic 3D render, dark mood, neon green accents, highly detailed, 8k').\n"
         "2. A 'global_subject_focus' describing the main character, subject, or object that remains constant across the entire story (e.g. 'a futuristic female astronaut wearing a white helmet with a gold visor').\n"
         "For each scene:\n"
-        "1. Extract the exact segment of narration text from the story (usually 1 short sentence, approx. 7-8 words).\n"
+        "1. Extract the exact segment of narration text from the story (usually 1 short sentence, approx. 8-10 words).\n"
         "2. Assign a speaker name from this list: Sarah, Bella, Nicole, Sky, Alloy, Kore, River, Adam, Michael, Fenrir, Puck, Echo, Liam, Onyx, Emma, Isabella, George, Lewis.\n"
         "3. Write a scene-specific action/setting description for 'visual_prompt'. This should describe ONLY the specific action, movement, or background setting of that scene, designed to be combined with the global style and subject description. Do not include camera frames, phone frames, or device frames in this prompt.\n\n"
         "Respond ONLY with a valid JSON object matching this exact format, with no markdown styling, no conversational filler, and no extra text:\n"
@@ -406,7 +406,7 @@ def generate_ollama_script(prompt: str, model: str, hook_style: str = "None (Dir
         "      \"narration\": \"Exact segment of narration text from the story.\",\n"
         "      \"visual_prompt\": \"Specific action, pose, or background setting representing the scene's narration.\"\n"
         "    },\n"
-        "    ... (exactly 5 scenes)\n"
+        "    ... (exactly 7 scenes)\n"
         "  ],\n"
         "  \"youtube_metadata\": {\n"
         "    \"title\": \"Catchy optimized YouTube Shorts title (max 100 chars)\",\n"
@@ -434,7 +434,7 @@ def generate_ollama_script(prompt: str, model: str, hook_style: str = "None (Dir
             resp_text = response2.json().get("response", "").strip()
             cleaned = clean_json_response(resp_text)
             data = json.loads(cleaned)
-            if "scenes" in data and len(data["scenes"]) == 5:
+            if "scenes" in data and len(data["scenes"]) == 7:
                 return data
     except Exception as e:
         print(f"Ollama JSON storyboard generation failed: {e}")
@@ -447,9 +447,11 @@ def generate_ollama_script(prompt: str, model: str, hook_style: str = "None (Dir
         "global_subject_focus": "a detailed mysterious mechanical box emitting faint golden light",
         "scenes": [
             {"speaker": "Sarah", "narration": f"Here is an incredible fact about {prompt or 'our world'}.", "visual_prompt": "resting on a dust-covered desk inside a dark ancient study room"},
-            {"speaker": "Adam", "narration": "Scientists were completely shocked when they discovered this secret.", "visual_prompt": "slowly unlocking itself as gears slide outward"},
-            {"speaker": "Sarah", "narration": "It changes everything we thought we knew about history.", "visual_prompt": "opening wide, revealing a small floating miniature galaxy inside"},
-            {"speaker": "Adam", "narration": "The implications could reshape our entire future.", "visual_prompt": "projecting bright blue holographic stars onto the study walls"},
+            {"speaker": "Adam", "narration": "Deep beneath the ocean, strange physical anomalies exist.", "visual_prompt": "a glowing hydrothermal vent in the dark ocean depths"},
+            {"speaker": "Sarah", "narration": "Scientists were completely shocked when they discovered this secret.", "visual_prompt": "slowly unlocking itself as gears slide outward"},
+            {"speaker": "Adam", "narration": "It changes everything we thought we knew about physics.", "visual_prompt": "opening wide, revealing a small floating miniature galaxy inside"},
+            {"speaker": "George", "narration": "Strange ancient structures lie silent in the freezing cold.", "visual_prompt": "mysterious ice-covered towers under glowing auroras"},
+            {"speaker": "Adam", "narration": "The implications could reshape our entire technological future.", "visual_prompt": "projecting bright blue holographic stars onto the study walls"},
             {"speaker": "George", "narration": "Follow for more mind-blowing facts every single day!", "visual_prompt": "closing shut, leaving glowing golden sparks in the air"}
         ],
         "youtube_metadata": {
@@ -757,7 +759,7 @@ def get_config():
         "voices": list(KOKORO_VOICES.keys()),
         "leonardo_models": list(LEONARDO_MODELS.keys()),
         "aspect_ratios": list(ASPECT_RATIO_DIMENSIONS.keys()),
-        "music_presets": ["None"] + list(MUSIC_PRESETS.keys()),
+        "music_presets": ["None", "Procedural Ambient"] + list(MUSIC_PRESETS.keys()),
         "satisfying_presets": ["None"] + list(SATISFYING_PRESETS.keys()),
         "viral_hooks": list(VIRAL_HOOKS.keys()),
         "ollama_models": ollama_models
@@ -991,6 +993,20 @@ def run_viral_shorts_pipeline_new(
         os.remove(audio_list_path)
     except Exception:
         pass
+        
+    # Generate procedural music if selected
+    if music_style == "Procedural Ambient":
+        try:
+            print("Generating procedural music in real-time...")
+            info = sf.info(merged_audio)
+            audio_duration = info.duration
+            bg_music_path = os.path.abspath(os.path.join("temp", f"procedural_music_{timestamp}.wav"))
+            from music_generator import write_procedural_music
+            write_procedural_music(audio_duration, bg_music_path)
+            print(f"Procedural music generated: {bg_music_path}")
+        except Exception as e:
+            print(f"Error generating procedural music: {e}")
+            bg_music_path = None
         
     # Mix Audio (Speech + BG Music)
     audio_mixed = os.path.abspath(os.path.join("temp", f"audio_mixed_{timestamp}.wav"))
@@ -1392,11 +1408,67 @@ def upload_scheduler_loop():
             print(f"Error in upload scheduler loop: {e}")
         time.sleep(10)
 
+def viral_agent_scheduler_loop():
+    """Background thread that runs the auto-generation agent at scheduled times."""
+    print("Starting background viral agent scheduler thread...")
+    while True:
+        try:
+            from viral_agent import load_scheduler_config, save_scheduler_config, run_viral_agent_job
+            config = load_scheduler_config()
+            
+            if config.get("enabled"):
+                now = datetime.now()
+                current_time_str = now.strftime("%H:%M")  # "HH:MM" format
+                current_date_str = now.strftime("%Y-%m-%d") # "YYYY-MM-DD" format
+                
+                time1 = config.get("time1", "10:00")
+                time2 = config.get("time2", "18:00")
+                
+                last_run_date = config.get("last_run_date", "")
+                last_run_slots = config.get("last_run_slots", [])
+                
+                # Reset slots if it's a new day
+                if last_run_date != current_date_str:
+                    last_run_date = current_date_str
+                    last_run_slots = []
+                    config["last_run_date"] = last_run_date
+                    config["last_run_slots"] = last_run_slots
+                    save_scheduler_config(config)
+                
+                # Check Slot 1
+                if current_time_str >= time1 and "slot1" not in last_run_slots:
+                    last_run_slots.append("slot1")
+                    config["last_run_slots"] = last_run_slots
+                    save_scheduler_config(config)
+                    
+                    # Trigger in background thread
+                    t = threading.Thread(target=run_viral_agent_job, args=(f"Slot 1 ({time1})", config))
+                    t.daemon = True
+                    t.start()
+                    
+                # Check Slot 2
+                elif current_time_str >= time2 and "slot2" not in last_run_slots:
+                    last_run_slots.append("slot2")
+                    config["last_run_slots"] = last_run_slots
+                    save_scheduler_config(config)
+                    
+                    # Trigger in background thread
+                    t = threading.Thread(target=run_viral_agent_job, args=(f"Slot 2 ({time2})", config))
+                    t.daemon = True
+                    t.start()
+        except Exception as e:
+            print(f"Error in viral agent scheduler loop: {e}")
+        time.sleep(30)  # Check every 30 seconds
+
 @app.on_event("startup")
 def startup_event():
     scheduler_thread = threading.Thread(target=upload_scheduler_loop)
     scheduler_thread.daemon = True
     scheduler_thread.start()
+    
+    agent_thread = threading.Thread(target=viral_agent_scheduler_loop)
+    agent_thread.daemon = True
+    agent_thread.start()
 
 @app.get("/api/history")
 def api_get_history():
@@ -1459,6 +1531,14 @@ def api_generation_status(generation_id: str):
         "youtube_metadata": gen.get("script_data", {}).get("youtube_metadata") if gen.get("script_data") else None,
         "instagram_metadata": gen.get("script_data", {}).get("instagram_metadata") if gen.get("script_data") else None,
     }
+
+@app.delete("/api/generation/{generation_id}")
+def api_delete_generation(generation_id: str):
+    try:
+        db_manager.delete_video_generation(generation_id)
+        return {"success": True}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 # Backward compatibility endpoints for legacy app.js uploads
 class UploadRequest(BaseModel):
@@ -1571,6 +1651,54 @@ def get_trends(geo: str = "IN"):
         return items
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error parsing Google Trends feed: {str(e)}")
+
+
+# Scheduler Config & Logs API
+class SchedulerConfigUpdate(BaseModel):
+    enabled: bool
+    region: str
+    time1: str
+    time2: str
+    model: str
+    leonardo_model: str
+    voice: str
+    privacy: str
+    enable_captions: bool
+    caption_font: str
+    caption_size: int
+    caption_margin_v: int
+    caption_color: str
+    caption_style: str
+
+@app.get("/api/scheduler/config")
+def get_scheduler_config():
+    from viral_agent import load_scheduler_config
+    return load_scheduler_config()
+
+@app.post("/api/scheduler/config")
+def update_scheduler_config(req: SchedulerConfigUpdate):
+    from viral_agent import load_scheduler_config, save_scheduler_config
+    config = load_scheduler_config()
+    config.update(req.dict())
+    save_scheduler_config(config)
+    return {"success": True, "config": config}
+
+@app.get("/api/scheduler/logs")
+def get_scheduler_logs():
+    from viral_agent import load_scheduler_logs
+    return load_scheduler_logs()
+
+@app.delete("/api/scheduler/logs")
+def delete_scheduler_logs():
+    from viral_agent import save_scheduler_logs
+    save_scheduler_logs([])
+    return {"success": True, "message": "Scheduler execution logs cleared."}
+
+@app.post("/api/scheduler/trigger")
+def trigger_scheduler_agent(background_tasks: BackgroundTasks):
+    from viral_agent import run_viral_agent_job
+    background_tasks.add_task(run_viral_agent_job, "Manual Trigger")
+    return {"success": True, "message": "Viral Agent run triggered in background."}
 
 
 if __name__ == "__main__":
