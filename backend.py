@@ -940,8 +940,9 @@ def run_viral_shorts_pipeline_new(
             
         if motion_vid_path:
             ffmpeg_cmd = [
-                "ffmpeg", "-y", "-stream_loop", "-1", "-i", motion_vid_path, "-t", str(sc_duration),
+                "ffmpeg", "-y", "-fflags", "+genpts", "-stream_loop", "-1", "-i", motion_vid_path, "-t", str(sc_duration),
                 "-vf", "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920",
+                "-r", "25",
                 "-c:v", "libx264", "-pix_fmt", "yuv420p", scene_video_path
             ]
         else:
@@ -1125,6 +1126,81 @@ class DbUploadRequest(BaseModel):
     youtube_privacy: Optional[str] = "private"
     instagram_caption: Optional[str] = ""
     scheduled_time: Optional[str] = None
+
+class LongformDraftRequest(BaseModel):
+    prompt: str
+    model: str
+
+class LongformRenderRequest(BaseModel):
+    generation_id: str
+    storyboard: List[dict]
+    pexels_api_key: Optional[str] = None
+    voice: str = "Sarah (Female - US - Soft)"
+    speed: float = 1.0
+    music_style: str = "Cinematic"
+    enable_captions: bool = True
+    caption_font: str = "Arial"
+    caption_size: int = 32
+    caption_margin_v: int = 80
+    caption_color: str = "&H00FFFF&"
+    enable_transition_sfx: bool = True
+
+def run_longform_render_task(generation_id: str, req: LongformRenderRequest, pexels_key: str):
+    try:
+        db_manager.update_video_generation(generation_id, status="rendering")
+        from long_video_pipeline import run_long_video_pipeline
+        final_video, storyboard = run_long_video_pipeline(
+            generation_id=generation_id,
+            storyboard=req.storyboard,
+            pexels_api_key=pexels_key,
+            voice=req.voice,
+            speed=req.speed,
+            music_style=req.music_style,
+            enable_captions=req.enable_captions,
+            caption_font=req.caption_font,
+            caption_size=req.caption_size,
+            caption_margin_v=req.caption_margin_v,
+            caption_color=req.caption_color,
+            enable_transition_sfx=req.enable_transition_sfx
+        )
+        db_manager.update_video_generation(
+            generation_id, storyboard=storyboard, final_video_path=final_video, status="completed"
+        )
+    except Exception as e:
+        print(f"Longform rendering failed: {e}")
+        db_manager.update_video_generation(generation_id, status="failed")
+
+@app.post("/api/longform/draft")
+def api_longform_draft(req: LongformDraftRequest):
+    try:
+        gen_id = str(uuid.uuid4())
+        from long_video_pipeline import generate_longform_script
+        script_data = generate_longform_script(req.prompt, req.model)
+        storyboard = script_data.get("scenes", [])
+        
+        # Save to DB as longform draft
+        db_manager.create_video_generation(
+            gen_id, req.prompt, script_data.get("topic", req.prompt), script_data, storyboard, status="draft"
+        )
+        return {
+            "success": True,
+            "generation_id": gen_id,
+            "topic": script_data.get("topic", req.prompt),
+            "storyboard": storyboard,
+            "youtube_metadata": script_data.get("youtube_metadata"),
+            "instagram_metadata": script_data.get("instagram_metadata")
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/longform/render")
+def api_longform_render(req: LongformRenderRequest, background_tasks: BackgroundTasks):
+    pexels_key = req.pexels_api_key or os.getenv("PEXELS_API_KEY")
+    if not pexels_key or not pexels_key.strip():
+        raise HTTPException(status_code=400, detail="Pexels API Key is required. Please set it in your environment or provide it in the request.")
+        
+    background_tasks.add_task(run_longform_render_task, req.generation_id, req, pexels_key)
+    return {"success": True, "generation_id": req.generation_id}
 
 @app.post("/api/draft-script")
 def api_draft_script(req: DraftRequest):

@@ -1,18 +1,21 @@
 {
   "enabled": true,
-  "region": "IN",
+  "region": "US",
   "time1": "10:00",
   "time2": "22:30",
   "model": "gemma4:31b-cloud",
   "leonardo_model": "Leonardo Phoenix 1.0 (General/Realistic)",
-  "voice": "Sarah (Female - US - Soft)",
+  "voice": "Adam (Male - US - Professional)",
   "privacy": "private",
-  "last_run_date": "2026-06-14",
-  "last_run_slots": [],
+  "last_run_date": "2026-06-15",
+  "last_run_slots": [
+    "slot1",
+    "slot2"
+  ],
   "enable_captions": true,
-  "caption_font": "Arial",
+  "caption_font": "Trebuchet MS",
   "caption_size": 80,
-  "caption_margin_v": 410,
-  "caption_color": "&H00A5FF&",
+  "caption_margin_v": 487,
+  "caption_color": "&HFF00FF&",
   "caption_style": "Viral Pop"
 }

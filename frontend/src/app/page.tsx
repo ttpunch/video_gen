@@ -4,7 +4,7 @@ import React, { useState, useEffect, useRef } from "react";
 import { 
   Tv, Sparkles, Sliders, Play, Settings, AlertCircle, FileText, CheckCircle2, 
   Layers, Volume2, Image as ImageIcon, Music, RefreshCw, Subtitles, HelpCircle,
-  Trash2
+  Trash2, Film
 } from "lucide-react";
 
 interface StoryboardScene {
@@ -36,7 +36,7 @@ const COLOR_PRESETS = [
 ];
 
 export default function Home() {
-  const [activeTab, setActiveTab] = useState<"viral" | "full" | "manual" | "library" | "queue">("viral");
+  const [activeTab, setActiveTab] = useState<"viral" | "full" | "manual" | "library" | "queue" | "scheduler" | "longform">("viral");
   const [config, setConfig] = useState<BackendConfig | null>(null);
   const [backendError, setBackendError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
@@ -152,6 +152,20 @@ export default function Home() {
   const [manualBRollUrl, setManualBRollUrl] = useState("");
   const [manualLayout, setManualLayout] = useState("None (Presenter Only)");
 
+  // Input states: Landscape Studio
+  const [longPrompt, setLongPrompt] = useState("Mariana Trench exploration and the mysterious creatures living at the bottom of the world");
+  const [longOllamaModel, setLongOllamaModel] = useState("");
+  const [longVoice, setLongVoice] = useState("Sarah (Female - US - Soft)");
+  const [longVoiceSpeed, setLongVoiceSpeed] = useState(1.0);
+  const [longMusicStyle, setLongMusicStyle] = useState("Cinematic");
+  const [pexelsApiKey, setPexelsApiKey] = useState("");
+  const [longCaptionSize, setLongCaptionSize] = useState(36);
+  const [longCaptionMarginV, setLongCaptionMarginV] = useState(80);
+  const [longCaptionColor, setLongCaptionColor] = useState("&H00FFFF&");
+  const [longCaptionFont, setLongCaptionFont] = useState("Arial");
+  const [longEnableTransitionSfx, setLongEnableTransitionSfx] = useState(true);
+  const [longEnableCaptions, setLongEnableCaptions] = useState(true);
+
   const consoleEndRef = useRef<HTMLDivElement>(null);
 
   const refreshReadiness = async () => {
@@ -188,6 +202,7 @@ export default function Home() {
       if (data.ollama_models.length > 0) {
         setOllamaModel(data.ollama_models[0]);
         setViralOllamaModel(data.ollama_models[0]);
+        setLongOllamaModel(data.ollama_models[0]);
       }
       
       await refreshReadiness();
@@ -199,6 +214,10 @@ export default function Home() {
   useEffect(() => {
     loadConfig();
     loadSchedulerData();
+    const storedPexelsKey = localStorage.getItem("PEXELS_API_KEY");
+    if (storedPexelsKey) {
+      setPexelsApiKey(storedPexelsKey);
+    }
   }, []);
 
   useEffect(() => {
@@ -251,6 +270,132 @@ export default function Home() {
       copy[idx] = { ...copy[idx], speaker: val };
       return copy;
     });
+  };
+
+  const handlePexelsKeyChange = (val: string) => {
+    setPexelsApiKey(val);
+    localStorage.setItem("PEXELS_API_KEY", val);
+  };
+
+  const handleLongformDraft = async () => {
+    setDrafting(true);
+    setLogs([]);
+    setFinalVideoUrl(null);
+    setStoryboard([]);
+    setGenerationId(null);
+    
+    addLog("📝 Creating 5-Minute Long-Form Script & Storyboard Draft...");
+    addLog(`Topic: "${longPrompt}"`);
+    addLog(`Model: ${longOllamaModel}`);
+    
+    try {
+      const response = await fetch("http://localhost:8000/api/longform/draft", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          prompt: longPrompt,
+          model: longOllamaModel || "minimax-m3:cloud"
+        })
+      });
+      
+      if (!response.ok) {
+        throw new Error(await response.text());
+      }
+      
+      const result = await response.json();
+      setGenerationId(result.generation_id);
+      setStoryboard(result.storyboard);
+      setGeneratedTopic(result.topic);
+      
+      // Pre-fill social upload metadata
+      setUploadTitle(result.youtube_metadata?.title || result.topic || "");
+      setUploadDescription(result.youtube_metadata?.description || "");
+      setUploadTags(result.youtube_metadata?.tags?.join(", ") || "");
+      setUploadCaption(result.instagram_metadata?.caption || "");
+      
+      addLog("✅ Landscape storyboard draft generated! Pexels video clips and scene texts are ready.");
+    } catch (err: any) {
+      addLog(`❌ ERROR drafting long-form script: ${err.message || err}`);
+    } finally {
+      setDrafting(false);
+    }
+  };
+
+  const handleLongformRender = async () => {
+    if (!generationId) return;
+    setRendering(true);
+    setLogs([]);
+    setFinalVideoUrl(null);
+    
+    addLog("🚀 Starting Long-Form Video Render...");
+    addLog(`Narration Voice: ${longVoice}`);
+    addLog(`Background Music: ${longMusicStyle}`);
+    
+    try {
+      const response = await fetch("http://localhost:8000/api/longform/render", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          generation_id: generationId,
+          storyboard: storyboard,
+          pexels_api_key: pexelsApiKey,
+          voice: longVoice,
+          speed: longVoiceSpeed,
+          music_style: longMusicStyle,
+          enable_captions: longEnableCaptions,
+          caption_font: longCaptionFont,
+          caption_size: longCaptionSize,
+          caption_margin_v: longCaptionMarginV,
+          caption_color: longCaptionColor,
+          enable_transition_sfx: longEnableTransitionSfx
+        })
+      });
+      
+      if (!response.ok) {
+        throw new Error(await response.text());
+      }
+      
+      addLog("⏳ Long-form rendering queued in the background. Polling render status...");
+      setStatusText("Rendering...");
+      
+      // Poll rendering status
+      const interval = setInterval(async () => {
+        try {
+          const statusRes = await fetch(`http://localhost:8000/api/generation-status/${generationId}`);
+          if (statusRes.ok) {
+            const data = await statusRes.json();
+            if (data.status === "completed") {
+              setFinalVideoUrl(data.video_url);
+              setStoryboard(data.storyboard);
+              setStatusText("Finished!");
+              addLog("🎉 Success! Render complete. You can download or preview the final landscape video.");
+              clearInterval(interval);
+              setRendering(false);
+              loadHistory(); // refresh library
+            } else if (data.status === "failed") {
+              setStatusText("Failed");
+              addLog("❌ Video rendering failed on the server.");
+              clearInterval(interval);
+              setRendering(false);
+            } else {
+              addLog("Rendering long-form video in progress (downloading assets & editing clips)...");
+            }
+          }
+        } catch (err) {
+          console.error("Error polling render status:", err);
+        }
+      }, 5000);
+      
+      // Auto-clear after 20 minutes
+      setTimeout(() => {
+        clearInterval(interval);
+        setRendering(false);
+      }, 1200000);
+      
+    } catch (err: any) {
+      addLog(`❌ ERROR starting long-form render: ${err.message || err}`);
+      setRendering(false);
+    }
   };
 
   const handleDraftStoryboard = async () => {
@@ -976,6 +1121,12 @@ export default function Home() {
           <Sliders size={18} /> 🎬 Manual Lipsync Studio
         </button>
         <button 
+          onClick={() => setActiveTab("longform")} 
+          className={`tab-btn ${activeTab === "longform" ? "tab-btn-active" : ""}`}
+        >
+          <Tv size={18} /> 🖥️ Landscape Studio
+        </button>
+        <button 
           onClick={() => { setActiveTab("library"); loadHistory(); }} 
           className={`tab-btn ${activeTab === "library" ? "tab-btn-active" : ""}`}
         >
@@ -1666,6 +1817,211 @@ export default function Home() {
                 <Play size={18} /> {loading ? "Lipsynching..." : "Sync Audio with Portrait"}
               </button>
             </div>
+          )}
+
+          {/* TAB 4: LONG-FORM LANDSCAPE STUDIO */}
+          {activeTab === "longform" && (
+            <>
+              <div className="glass-card">
+                <h2 className="card-title"><Sparkles /> Landscape Script Configuration</h2>
+                
+                <div className="form-group">
+                  <label className="form-label">Video Topic or Category Prompt</label>
+                  <textarea 
+                    className="form-textarea" 
+                    rows={2}
+                    value={longPrompt}
+                    onChange={(e) => setLongPrompt(e.target.value)}
+                    placeholder="Describe your video topic... (e.g. quantum physics facts, dark history of ancient cities)"
+                  />
+                </div>
+
+                <div className="form-row">
+                  <div className="form-group">
+                    <label className="form-label">Ollama LLM Model</label>
+                    <select 
+                      className="form-select"
+                      value={longOllamaModel}
+                      onChange={(e) => setLongOllamaModel(e.target.value)}
+                    >
+                      {config?.ollama_models.map(m => (
+                        <option key={m} value={m}>{m}</option>
+                      )) || <option>Loading...</option>}
+                    </select>
+                  </div>
+                  <div className="form-group">
+                    <label className="form-label">Pexels API Key</label>
+                    <input 
+                      type="password" 
+                      className="form-input"
+                      value={pexelsApiKey}
+                      onChange={(e) => handlePexelsKeyChange(e.target.value)}
+                      placeholder="Enter Pexels API Key..."
+                    />
+                    <p className="form-label-info">Saved locally in your browser's localStorage.</p>
+                  </div>
+                </div>
+
+                <button 
+                  onClick={handleLongformDraft}
+                  disabled={drafting || !config} 
+                  className="btn btn-primary"
+                  style={{ marginTop: "15px", background: "linear-gradient(135deg, #a855f7 0%, #7c3aed 100%)" }}
+                >
+                  📝 {drafting ? "Drafting Landscape Storyboard..." : "Draft Landscape Script & Storyboard"}
+                </button>
+              </div>
+
+              <div className="glass-card" style={{ marginTop: "20px" }}>
+                <h2 className="card-title"><Tv /> Video Style & Rendering Settings</h2>
+
+                <div className="form-row">
+                  <div className="form-group">
+                    <label className="form-label">Visual Format Mode</label>
+                    <input 
+                      type="text" 
+                      className="form-input" 
+                      value="Pexels Stock Video (Landscape 16:9)" 
+                      disabled 
+                      style={{ opacity: 0.8 }}
+                    />
+                  </div>
+                  <div className="form-group">
+                    <label className="form-label">Background Music</label>
+                    <select 
+                      className="form-select"
+                      value={longMusicStyle}
+                      onChange={(e) => setLongMusicStyle(e.target.value)}
+                    >
+                      {config?.music_presets.map(m => (
+                        <option key={m} value={m}>{m}</option>
+                      )) || <option>Loading...</option>}
+                    </select>
+                  </div>
+                </div>
+
+                <div className="form-row">
+                  <div className="form-group">
+                    <label className="form-label">Voice Narrator</label>
+                    <select 
+                      className="form-select"
+                      value={longVoice}
+                      onChange={(e) => {
+                        const newVoice = e.target.value;
+                        setLongVoice(newVoice);
+                        if (storyboard && storyboard.length > 0) {
+                          const updated = storyboard.map(scene => ({
+                            ...scene,
+                            speaker: newVoice
+                          }));
+                          setStoryboard(updated);
+                        }
+                      }}
+                    >
+                      {config?.voices.map(v => (
+                        <option key={v} value={v}>{v}</option>
+                      )) || <option>Loading...</option>}
+                    </select>
+                  </div>
+                  <div className="form-group">
+                    <label className="form-label">Voice Speed ({longVoiceSpeed}x)</label>
+                    <input 
+                      type="range" 
+                      min="0.5" 
+                      max="2.0" 
+                      step="0.1"
+                      className="form-input" 
+                      value={longVoiceSpeed}
+                      onChange={(e) => setLongVoiceSpeed(parseFloat(e.target.value))}
+                    />
+                  </div>
+                </div>
+
+                <div className="form-group" style={{ marginTop: "12px", marginBottom: "12px" }}>
+                  <label className="checkbox-container" style={{ margin: 0 }}>
+                    <input 
+                      type="checkbox" 
+                      checked={longEnableTransitionSfx}
+                      onChange={(e) => setLongEnableTransitionSfx(e.target.checked)}
+                    />
+                    <div className="checkbox-custom"></div>
+                    <span style={{ fontSize: "14px", fontWeight: 600 }}>Enable Transition Sound Effects (Whoosh & Pop)</span>
+                  </label>
+                </div>
+
+                <div className="form-group" style={{ borderTop: "1px solid rgba(255, 255, 255, 0.05)", paddingTop: "15px" }}>
+                  <label className="form-label"><Subtitles size={16} style={{ display: "inline", marginRight: "6px" }} /> Auto-Caption & Position Settings</label>
+                  
+                  <div style={{ display: "flex", flexWrap: "wrap", gap: "20px", marginTop: "12px" }}>
+                    <div style={{ flex: "1 1 280px", display: "flex", flexDirection: "column", gap: "16px" }}>
+                      <label className="checkbox-container" style={{ margin: 0 }}>
+                        <input 
+                          type="checkbox" 
+                          checked={longEnableCaptions}
+                          onChange={(e) => setLongEnableCaptions(e.target.checked)}
+                        />
+                        <div className="checkbox-custom"></div>
+                        <span style={{ fontSize: "14px", fontWeight: 600 }}>Burn Centered Word Subtitles</span>
+                      </label>
+
+                      <div className="form-group" style={{ margin: 0 }}>
+                        <label className="form-label" style={{ display: "flex", justifyContent: "space-between", marginBottom: "6px" }}>
+                          <span>Text Size</span>
+                          <span style={{ color: "#c084fc", fontWeight: 600 }}>{longCaptionSize}px</span>
+                        </label>
+                        <div className="slider-group">
+                          <input 
+                            type="range" 
+                            min="18" 
+                            max="72" 
+                            value={longCaptionSize} 
+                            onChange={(e) => setLongCaptionSize(parseInt(e.target.value))}
+                            style={{ flexGrow: 1, padding: 0, height: "6px", background: "rgba(255,255,255,0.1)", borderRadius: "3px", cursor: "pointer" }}
+                            disabled={!longEnableCaptions}
+                          />
+                        </div>
+                      </div>
+
+                      <div className="form-group" style={{ margin: 0 }}>
+                        <label className="form-label" style={{ display: "flex", justifyContent: "space-between", marginBottom: "6px" }}>
+                          <span>Vertical Position (from bottom)</span>
+                          <span style={{ color: "#c084fc", fontWeight: 600 }}>{longCaptionMarginV}px</span>
+                        </label>
+                        <div className="slider-group">
+                          <input 
+                            type="range" 
+                            min="20" 
+                            max="300" 
+                            value={longCaptionMarginV} 
+                            onChange={(e) => setLongCaptionMarginV(parseInt(e.target.value))}
+                            style={{ flexGrow: 1, padding: 0, height: "6px", background: "rgba(255,255,255,0.1)", borderRadius: "3px", cursor: "pointer" }}
+                            disabled={!longEnableCaptions}
+                          />
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+
+                <button 
+                  onClick={handleLongformRender}
+                  disabled={rendering || !config || storyboard.length === 0} 
+                  className="btn btn-primary"
+                  style={{ 
+                    marginTop: "20px",
+                    background: "linear-gradient(135deg, #ec4899 0%, #f43f5e 100%)",
+                    boxShadow: "0 4px 15px rgba(244, 63, 94, 0.2)" 
+                  }}
+                >
+                  🎬 {rendering ? "Rendering Long-form Video..." : "Compile & Render Long-form Video"}
+                </button>
+                {storyboard.length === 0 && (
+                  <p className="form-label-info" style={{ color: "#fca5a5", marginTop: "8px", textAlign: "center" }}>
+                    ⚠️ Please draft a script and storyboard above first to enable video rendering.
+                  </p>
+                )}
+              </div>
+            </>
           )}
 
         </div>
@@ -2738,7 +3094,7 @@ export default function Home() {
       )}
 
       {/* Interactive Storyboard Editor */}
-      {activeTab === "viral" && storyboard.length > 0 && (
+      {(activeTab === "viral" || activeTab === "longform") && storyboard.length > 0 && (
         <div className="glass-card" style={{ marginTop: "24px", padding: "24px" }}>
           <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", borderBottom: "1px solid rgba(255,255,255,0.08)", paddingBottom: "15px", marginBottom: "20px" }}>
             <div>
@@ -2752,7 +3108,7 @@ export default function Home() {
             
             {/* Render Button */}
             <button
-              onClick={handleRenderStoryboard}
+              onClick={activeTab === "longform" ? handleLongformRender : handleRenderStoryboard}
               disabled={rendering || storyboard.length === 0}
               className="btn btn-primary"
               style={{
@@ -2800,31 +3156,48 @@ export default function Home() {
                   
                   <div style={{ display: "grid", gridTemplateColumns: "150px 1fr 250px", gap: "20px" }} className="storyboard-columns-layout">
                     
-                    {/* Left Column: Image Asset */}
+                    {/* Left Column: Visual Asset */}
                     <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: "10px" }}>
-                      {scene.image_url ? (
-                        <img 
-                          src={scene.image_url} 
-                          alt={`Scene ${idx + 1}`} 
-                          style={{ width: "120px", aspectRatio: "9/16", objectFit: "cover", borderRadius: "8px", border: "1px solid rgba(255,255,255,0.1)", boxShadow: "0 4px 12px rgba(0,0,0,0.3)" }} 
-                        />
+                      {activeTab === "longform" ? (
+                        scene.video_url ? (
+                          <video 
+                            src={scene.video_url} 
+                            style={{ width: "120px", aspectRatio: "16/9", objectFit: "cover", borderRadius: "8px", border: "1px solid rgba(255,255,255,0.1)", boxShadow: "0 4px 12px rgba(0,0,0,0.3)" }} 
+                            controls
+                          />
+                        ) : (
+                          <div style={{ width: "120px", aspectRatio: "16/9", background: "#06050e", border: "1px dashed rgba(255,255,255,0.1)", borderRadius: "8px", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", color: "#475569", fontSize: "11px", textAlign: "center", padding: "4px" }}>
+                            <Film size={20} style={{ marginBottom: "4px" }} />
+                            Pexels Video
+                          </div>
+                        )
                       ) : (
-                        <div style={{ width: "120px", aspectRatio: "9/16", background: "#06050e", border: "1px dashed rgba(255,255,255,0.1)", borderRadius: "8px", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", color: "#475569", fontSize: "12px" }}>
-                          <ImageIcon size={24} style={{ marginBottom: "8px" }} />
-                          No Image
-                        </div>
+                        scene.image_url ? (
+                          <img 
+                            src={scene.image_url} 
+                            alt={`Scene ${idx + 1}`} 
+                            style={{ width: "120px", aspectRatio: "9/16", objectFit: "cover", borderRadius: "8px", border: "1px solid rgba(255,255,255,0.1)", boxShadow: "0 4px 12px rgba(0,0,0,0.3)" }} 
+                          />
+                        ) : (
+                          <div style={{ width: "120px", aspectRatio: "9/16", background: "#06050e", border: "1px dashed rgba(255,255,255,0.1)", borderRadius: "8px", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", color: "#475569", fontSize: "12px" }}>
+                            <ImageIcon size={24} style={{ marginBottom: "8px" }} />
+                            No Image
+                          </div>
+                        )
                       )}
                       
-                      <button
-                        className="btn btn-secondary"
-                        onClick={() => handleRegenerateAsset(idx, "image")}
-                        disabled={isRegeneratingImage || rendering}
-                        style={{ width: "100%", padding: "6px 0", fontSize: "12px" }}
-                      >
-                        {isRegeneratingImage ? (
-                          <RefreshCw size={12} style={{ animation: "spin 1s linear infinite", marginRight: "4px" }} />
-                        ) : "🎨"} Regenerate Visual
-                      </button>
+                      {activeTab !== "longform" && (
+                        <button
+                          className="btn btn-secondary"
+                          onClick={() => handleRegenerateAsset(idx, "image")}
+                          disabled={isRegeneratingImage || rendering}
+                          style={{ width: "100%", padding: "6px 0", fontSize: "12px" }}
+                        >
+                          {isRegeneratingImage ? (
+                            <RefreshCw size={12} style={{ animation: "spin 1s linear infinite", marginRight: "4px" }} />
+                          ) : "🎨"} Regenerate Visual
+                        </button>
+                      )}
                     </div>
 
                     {/* Middle Column: Text Fields & Voice */}
