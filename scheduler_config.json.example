@@ -1,17 +1,14 @@
 {
-  "enabled": true,
+  "enabled": false,
   "region": "US",
   "time1": "10:00",
   "time2": "22:30",
   "model": "gemma4:31b-cloud",
   "leonardo_model": "Leonardo Phoenix 1.0 (General/Realistic)",
-  "voice": "Adam (Male - US - Professional)",
+  "voice": "Puck (Male - US - Playful)",
   "privacy": "private",
-  "last_run_date": "2026-06-15",
-  "last_run_slots": [
-    "slot1",
-    "slot2"
-  ],
+  "last_run_date": null,
+  "last_run_slots": [],
   "enable_captions": true,
   "caption_font": "Trebuchet MS",
   "caption_size": 80,

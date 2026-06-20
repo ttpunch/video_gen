@@ -44,3 +44,7 @@ token_youtube.json
 
 # Databases
 *.db
+
+# Scheduler runtime state (tracked via *.example templates)
+scheduler_config.json
+scheduler_logs.json
