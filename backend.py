@@ -2176,49 +2176,69 @@ def get_trends(geo: str = "IN"):
 
 
 @app.get("/api/recommend-topics")
-def recommend_topics(geo: str = "US", count: int = 5, model: str = "minimax-m3:cloud"):
-    """Recommend ready-to-use, revenue-optimized viral topics for a high-RPM market.
+def recommend_topics(geo: str = "US", count: int = 5, model: Optional[str] = None,
+                     focus: str = ""):
+    """Recommend fresh, non-repeating viral topics for a high-RPM market.
 
-    Pulls live trends for ``geo``, then ranks them with the LLM, biasing toward
-    high-CPM niches and avoiding recently-used topics. Returns a JSON array of
-    {title, rationale, niche, rpm_tier, est_rpm, geo}.
+    Subject areas are discovered per call rather than drawn from a fixed list,
+    so any subject the model knows about is reachable -- a constant list would
+    cap the topic space the same way the old 31-entry curiosity library did.
+    Grounded in live Google Trends and Wikipedia signals. Novelty is enforced
+    with a hard keyword filter against previously-generated topics, not a
+    prompt instruction: the prompt-only approach let five reworded variants of
+    the same ocean fact into the library.
+
+    ``focus`` optionally constrains every suggestion to one interest (e.g.
+    "cricket", "cooking") for creators working a specific niche.
+
+    Returns {title, rationale, niche, rpm_tier, est_rpm, geo, source}.
     """
     # Lazy import: viral_agent imports from backend at module load (circular).
-    from viral_agent import fetch_google_trends, recommend_viral_topics, ALLOWED_RPM_GEOS
+    from viral_agent import ALLOWED_RPM_GEOS
+    import trend_analyser
 
     geo = (geo or "US").upper()
     if geo not in ALLOWED_RPM_GEOS:
         geo = "US"
     count = max(1, min(count, 8))
+    # Default to whatever the scheduler is configured to use, so the UI and the
+    # auto-agent stay on the same model instead of this silently pinning a
+    # cloud model that may be out of quota.
+    if not model:
+        try:
+            from viral_agent import load_scheduler_config
+            model = load_scheduler_config().get("model")
+        except Exception:
+            model = None
+        model = model or "qwen2.5:7b-instruct"
+
+    performance_hint = ""
+    exclude_topics = []
+    try:
+        import analytics
+        performance_hint = analytics.get_performance_hint()
+    except Exception as e:
+        print(f"recommend_topics: performance hint unavailable: {e}")
+    try:
+        exclude_topics = db_manager.get_recent_topics(40)
+    except Exception as e:
+        print(f"recommend_topics: recent topics unavailable: {e}")
 
     try:
-        trends = fetch_google_trends(geo)
-        if not trends:
-            raise HTTPException(status_code=502, detail=f"No trends available for {geo} right now. Try again shortly.")
-
-        performance_hint = ""
-        exclude_topics = None
-        try:
-            import analytics
-            performance_hint = analytics.get_performance_hint()
-        except Exception as e:
-            print(f"recommend_topics: performance hint unavailable: {e}")
-        try:
-            exclude_topics = db_manager.get_recent_topics(40)
-        except Exception as e:
-            print(f"recommend_topics: recent topics unavailable: {e}")
-
-        recs = recommend_viral_topics(
-            trends, model, count=count,
+        return trend_analyser.analyse(
+            geo=geo, model=model, count=count,
+            used_topics=exclude_topics,
             performance_hint=performance_hint,
-            exclude_topics=exclude_topics,
-            high_cpm_bias=True, geo=geo,
+            focus=(focus or "").strip(),
         )
-        return recs
-    except HTTPException:
-        raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error recommending topics: {str(e)}")
+        # Surfaced, not swallowed. The old code fell back to raw Google Trends
+        # headlines on any failure, so the UI presented "lindsay clancy trial
+        # live" as a curated recommendation with no sign that ranking had died.
+        raise HTTPException(
+            status_code=502,
+            detail=f"Topic analysis failed ({e}). Check that Ollama is running and "
+                   f"the model '{model}' is available.")
 
 
 # Scheduler Config & Logs API
