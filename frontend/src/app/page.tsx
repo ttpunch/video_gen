@@ -156,6 +156,7 @@ export default function Home() {
 
   // Revenue-optimized topic recommender state
   const [recommendations, setRecommendations] = useState<any[]>([]);
+  const [recsFocus, setRecsFocus] = useState("");
   const [recsGeo, setRecsGeo] = useState("US");
   const [discoverMode, setDiscoverMode] = useState<"trends" | "ideas">("trends");
   const [isFetchingRecs, setIsFetchingRecs] = useState(false);
@@ -413,7 +414,10 @@ export default function Home() {
     setIsFetchingRecs(true);
     setRecsError("");
     try {
-      const res = await fetch(`http://localhost:8000/api/recommend-topics?geo=${recsGeo}&count=5`);
+      const res = await fetch(
+        `http://localhost:8000/api/recommend-topics?geo=${recsGeo}&count=5` +
+        (recsFocus.trim() ? `&focus=${encodeURIComponent(recsFocus.trim())}` : "")
+      );
       if (res.ok) {
         const data = await res.json();
         setRecommendations(data);
@@ -1287,7 +1291,10 @@ export default function Home() {
 
                 {discoverMode === "ideas" && (<>
                 <p className="card-subtitle" style={{ color: "var(--text-secondary)", fontSize: "0.9rem", marginBottom: "15px" }}>
-                  Trends from high-paying markets (USA pays the most), ranked toward high-CPM niches like finance, tech &amp; business. Pick one and make a video.
+                  Fresh topics from any subject &mdash; the subject areas are invented per request,
+                  not picked from a fixed list, and grounded in live Google Trends and Wikipedia activity.
+                  Every suggestion is checked against your history, so you never get a reworded version
+                  of a video you already made. Leave Focus blank to roam anywhere.
                 </p>
 
                 <div className="form-row" style={{ alignItems: "flex-end", marginBottom: "20px" }}>
@@ -1304,13 +1311,22 @@ export default function Home() {
                       <option value="GB">🇬🇧 United Kingdom — High RPM</option>
                     </select>
                   </div>
+                  <div className="form-group" style={{ flex: 1 }}>
+                    <label className="form-label">Focus (optional)</label>
+                    <input
+                      className="form-input"
+                      value={recsFocus}
+                      onChange={(e) => setRecsFocus(e.target.value)}
+                      placeholder="anything — cricket, cooking, history…"
+                    />
+                  </div>
                   <button
                     className="btn btn-primary"
                     onClick={handleFetchRecommendations}
                     disabled={isFetchingRecs}
                     style={{ height: "42px", minWidth: "190px", background: "linear-gradient(135deg, var(--ok) 0%, var(--ok) 100%)" }}
                   >
-                    {isFetchingRecs ? "Thinking..." : "Get High-RPM Topic Ideas"}
+                    {isFetchingRecs ? "Thinking..." : "Get Topic Ideas"}
                   </button>
                 </div>
 
