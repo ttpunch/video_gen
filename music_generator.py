@@ -1,146 +1,157 @@
+"""Procedural background music for shorts.
+
+Deliberately simple and unobtrusive: a warm pad with a sparse pluck melody. The
+job is to fill silence under narration without drawing attention, so "boring but
+consonant" beats "interesting but clashing" every time.
+
+Three musical bugs made the earlier version sound awkward, all fixed here:
+
+  * **The melody ignored the chord.** Notes were drawn at random from the whole
+    scale while a chord sustained underneath, so roughly half of them landed a
+    second or a tritone away from a chord tone. Melody notes are now chosen from
+    the tones of whichever chord is currently sounding.
+  * **Phrygian was in the random mode pool.** Its flattened second is the
+    interval that makes music sound unsettled -- fine for horror, wrong for a
+    facts video, and worse for being random between renders.
+  * **The pad was low-passed at 300 Hz** while its roots sat at 73-110 Hz, so
+    nothing survived but rumble. The filter now leaves the harmonics that make
+    a pad read as warm rather than muddy.
+"""
 import os
+
 import numpy as np
 import soundfile as sf
 from scipy.signal import butter, lfilter
 
+#: Root notes (Hz). Low enough to sit under speech without masking it.
+ROOTS = (73.42, 82.41, 87.31, 98.0, 110.0)   # D2, E2, F2, G2, A2
+
+#: Only modes that read as calm//neutral. Phrygian is excluded on purpose --
+#: its b2 sounds unsettled, and picking it at random made some videos feel wrong
+#: for no reason the user could point at.
+SCALES = {
+    "natural_minor": (0, 2, 3, 5, 7, 8, 10),
+    "dorian": (0, 2, 3, 5, 7, 9, 10),
+}
+
+#: Chord progression as scale degrees (0-indexed): i - VII - III - iv.
+#: A restful minor loop that resolves back to the root.
+#:
+#: Degrees 1 and 5 are deliberately absent: each builds a DIMINISHED triad in
+#: one of the two modes above (ii in natural minor, vi in dorian). A diminished
+#: chord contains a tritone, which is the single most unsettling interval to
+#: leave droning under a voiceover -- and because the mode is picked at random
+#: per render, including them made only *some* videos sound wrong.
+PROGRESSION = (0, 6, 2, 3)
+
+
 def butter_lowpass(cutoff, fs, order=3):
     nyq = 0.5 * fs
-    normal_cutoff = cutoff / nyq
-    b, a = butter(order, normal_cutoff, btype='low', analog=False)
-    return b, a
+    return butter(order, cutoff / nyq, btype="low", analog=False)
+
 
 def lowpass_filter(data, cutoff, fs, order=3):
     b, a = butter_lowpass(cutoff, fs, order=order)
     return lfilter(b, a, data)
 
-def generate_procedural_music(duration_sec, fs=24000):
-    """Generates a warm, ambient, unique background music track procedurally."""
-    # 1. Define scales and keys (Minor, Major, Dorian, Phrygian modes)
-    # We choose a root note frequency and generate a scale dynamically.
-    # Standard roots (Hz): D2=73.42, E2=82.41, F2=87.31, G2=98.0, A2=110.0
-    roots = [73.42, 82.41, 87.31, 98.0, 110.0]
-    root_freq = np.random.choice(roots)
-    
-    # Scale intervals in semitones (0 is root)
-    scale_types = {
-        "Natural_Minor": [0, 2, 3, 5, 7, 8, 10, 12, 14, 15, 17, 19, 20, 22, 24],
-        "Dorian": [0, 2, 3, 5, 7, 9, 10, 12, 14, 15, 17, 19, 21, 22, 24],
-        "Phrygian": [0, 1, 3, 5, 7, 8, 10, 12, 13, 15, 17, 19, 20, 22, 24],
-        "Major_Pentatonic": [0, 2, 4, 7, 9, 12, 14, 16, 19, 21, 24, 26, 28, 31, 33]
-    }
-    
-    scale_name = np.random.choice(list(scale_types.keys()))
-    intervals = scale_types[scale_name]
-    
-    # Compute the actual frequencies for the chosen scale
-    # f = f0 * 2^(n/12)
-    scale_notes = [root_freq * (2 ** (n / 12.0)) for n in intervals]
-    
-    total_samples = int(fs * duration_sec)
-    mix = np.zeros(total_samples)
-    
-    # 2. Generate Ambient Pad Chords (Warm pad progression)
-    # We choose 4 chords based on scale indices
-    # Progression: i - IV - v - VI (or standard variants depending on scale)
-    chord_duration = duration_sec / 4.0
-    chord_samples = int(fs * chord_duration)
-    
-    # Generate 4 distinct chord frequency sets based on the scale
-    progressions = []
-    # Root chord (1, 3, 5, 8)
-    progressions.append([scale_notes[0], scale_notes[2], scale_notes[4], scale_notes[7]])
-    # 4th chord (3, 5, 7, 10)
-    progressions.append([scale_notes[3], scale_notes[5], scale_notes[7], scale_notes[10]])
-    # 5th chord or 6th chord (5, 7, 9, 12)
-    progressions.append([scale_notes[4], scale_notes[6], scale_notes[8], scale_notes[11]])
-    # Subdominant / Relative chord (6, 8, 10, 13)
-    progressions.append([scale_notes[5], scale_notes[7], scale_notes[9], scale_notes[12]])
-    
-    pad_signal = np.zeros(total_samples)
-    for i in range(4):
-        start_sample = i * chord_samples
-        end_sample = min(start_sample + chord_samples, total_samples)
-        seg_len = end_sample - start_sample
-        if seg_len <= 0:
-            break
-            
-        t = np.linspace(0, seg_len / fs, seg_len, endpoint=False)
-        chord_wave = np.zeros(seg_len)
-        chord_freqs = progressions[i % len(progressions)]
-        
-        # Add fundamental + octave + soft harmonics
-        for freq in chord_freqs:
-            chord_wave += np.sin(2 * np.pi * freq * t)
-            chord_wave += 0.25 * np.sin(2 * np.pi * (freq * 2) * t)
-            chord_wave += 0.1 * np.sin(2 * np.pi * (freq * 3) * t)
-            
-        # Apply slow attack/release envelope
-        envelope = np.ones(seg_len)
-        fade_samples = int(fs * 1.5)  # 1.5s crossfade
-        if fade_samples > seg_len // 2:
-            fade_samples = seg_len // 2
-            
-        envelope[:fade_samples] = np.linspace(0, 1, fade_samples)
-        envelope[-fade_samples:] = np.linspace(1, 0, fade_samples)
-        
-        pad_signal[start_sample:end_sample] += chord_wave * envelope
-        
-    # Low-pass filter the pad to make it extremely warm and soft
-    pad_signal = lowpass_filter(pad_signal, 300.0, fs, order=3)
-    mix += pad_signal * 0.12  # Soft pad volume
-    
-    # 3. Generate a Soft Pluck Melody
-    melody_signal = np.zeros(total_samples)
-    
-    # Random tempo (BPM)
-    tempo_bpm = np.random.randint(70, 90)
-    beat_dur = 60.0 / tempo_bpm
-    beat_samples = int(fs * beat_dur)
-    
-    # Generate plucks on random beats
-    current_sample = int(fs * 1.5)  # Let pad fade in first
-    melody_notes = [n for n in scale_notes if n >= 220.0]  # Higher register notes only
-    
-    while current_sample < total_samples - int(fs * 2.0):
-        # Choose a random note
-        note_freq = np.random.choice(melody_notes)
-        
-        pluck_len = int(fs * 1.0)
-        if current_sample + pluck_len > total_samples:
-            pluck_len = total_samples - current_sample
-            
-        t = np.linspace(0, pluck_len / fs, pluck_len, endpoint=False)
-        # Exponential decay envelope
-        decay = np.exp(-t * 8.0)
-        pluck_wave = np.sin(2 * np.pi * note_freq * t) * decay
-        
-        # Delay effect (plucks feed into a simple delay loop)
-        delay_samples = int(fs * 0.3)
-        if pluck_len > delay_samples:
-            pluck_wave[delay_samples:] += pluck_wave[:-delay_samples] * 0.45
-            
-        melody_signal[current_sample:current_sample+pluck_len] += pluck_wave
-        
-        # Step forward by 1, 2, or 4 beats
-        step = np.random.choice([1, 2, 4])
-        current_sample += step * beat_samples
-        
-    # Low-pass filter the melody so it sounds like warm rhodes/bells
-    melody_signal = lowpass_filter(melody_signal, 1000.0, fs, order=2)
-    mix += melody_signal * 0.055  # Pluck volume
-    
-    # 4. Final normalization to optimal background level
-    max_val = np.max(np.abs(mix))
-    if max_val > 0:
-        # Normalize to target background level (avoid clipping narration)
-        mix = mix / max_val * 0.14
-        
-    return mix
 
-def write_procedural_music(duration_sec, output_path, fs=24000):
-    """Generates procedural music and writes it directly to disk as a WAV file."""
-    music_data = generate_procedural_music(duration_sec, fs)
-    # Ensure parent directory exists
-    os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
-    sf.write(output_path, music_data, fs)
+def _scale_freq(root, intervals, degree):
+    """Frequency of a scale degree, wrapping into higher octaves as needed."""
+    octave, index = divmod(degree, len(intervals))
+    return root * (2 ** ((intervals[index] + 12 * octave) / 12.0))
+
+
+def _triad(root, intervals, degree):
+    """A chord built by stacking thirds -- degrees d, d+2, d+4, plus the octave.
+
+    Stacking scale degrees two apart is what makes a triad; the earlier code
+    stacked arbitrary indices, which produced clusters containing tritones.
+    """
+    return [_scale_freq(root, intervals, degree + step) for step in (0, 2, 4, 7)]
+
+
+def generate_procedural_music(duration_sec, fs=24000, seed=None):
+    """Return a mono float array of ambient backing music."""
+    rng = np.random.default_rng(seed)
+    root = float(rng.choice(ROOTS))
+    intervals = SCALES[str(rng.choice(list(SCALES)))]
+
+    total = int(fs * duration_sec)
+    if total <= 0:
+        return np.zeros(0, dtype=np.float32)
+
+    chords = [_triad(root, intervals, d) for d in PROGRESSION]
+    # Aim for ~6s per chord so a short cycles the progression once or twice,
+    # rather than the whole loop being squeezed into one pass.
+    chord_len = max(int(fs * 3.0), total // max(1, round(duration_sec / 6.0)))
+
+    pad = np.zeros(total)
+    melody = np.zeros(total)
+    fade = int(fs * 1.2)
+
+    chord_index = 0
+    pos = 0
+    while pos < total:
+        seg = min(chord_len, total - pos)
+        if seg <= 0:
+            break
+        chord = chords[chord_index % len(chords)]
+        t = np.arange(seg) / fs
+
+        # --- pad -------------------------------------------------------
+        wave = np.zeros(seg)
+        for freq in chord:
+            wave += np.sin(2 * np.pi * freq * t)
+            wave += 0.25 * np.sin(2 * np.pi * freq * 2 * t)
+            wave += 0.08 * np.sin(2 * np.pi * freq * 3 * t)
+
+        env = np.ones(seg)
+        f = min(fade, seg // 2)
+        if f > 0:
+            env[:f] = np.linspace(0, 1, f)
+            env[-f:] = np.linspace(1, 0, f)
+        pad[pos:pos + seg] += wave * env
+
+        # --- melody, locked to the chord that is actually sounding ------
+        # Two octaves up so the plucks sit above the narration's fundamental
+        # range instead of fighting it.
+        options = [f * 4 for f in chord]
+        beat = int(fs * 60.0 / 76.0)          # steady 76 BPM
+        note_pos = int(fs * 0.5)
+        while note_pos < seg - beat:
+            freq = float(rng.choice(options))
+            length = min(int(fs * 1.4), seg - note_pos)
+            nt = np.arange(length) / fs
+            pluck = np.sin(2 * np.pi * freq * nt) * np.exp(-nt * 5.0)
+            # Simple feedback delay for space.
+            d = int(fs * 0.3)
+            if length > d:
+                pluck[d:] += pluck[:-d] * 0.4
+            melody[pos + note_pos:pos + note_pos + length] += pluck
+            # Sparse but regular: every 2 or 4 beats, never syncopated randomly.
+            note_pos += int(rng.choice([2, 4])) * beat
+
+        pos += seg
+        chord_index += 1
+
+    # 800 Hz keeps the pad warm while still letting its harmonics through; the
+    # old 300 Hz cut everything above the fundamentals and left only rumble.
+    pad = lowpass_filter(pad, 800.0, fs, order=3)
+    melody = lowpass_filter(melody, 2500.0, fs, order=2)
+
+    mix = pad * 0.30 + melody * 0.10
+    peak = float(np.max(np.abs(mix))) if mix.size else 0.0
+    if peak > 0:
+        # Quiet by design. The render also sidechain-ducks this under speech.
+        mix = mix / peak * 0.18
+    return mix.astype(np.float32)
+
+
+def write_procedural_music(duration_sec, output_path, fs=24000, seed=None):
+    """Generate music and write it to ``output_path`` as a WAV."""
+    data = generate_procedural_music(duration_sec, fs, seed=seed)
+    parent = os.path.dirname(os.path.abspath(output_path))
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    sf.write(output_path, data, fs)
     return output_path

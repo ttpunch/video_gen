@@ -5,6 +5,7 @@ import time
 import json
 import uuid
 import re
+import random
 import requests
 import xml.etree.ElementTree as ET
 from datetime import datetime
@@ -17,12 +18,49 @@ load_dotenv()
 sys.path.append(os.path.abspath(os.path.dirname(__file__)))
 
 import db_manager
-from backend import run_viral_shorts_pipeline_new, generate_ollama_script
-from search_helper import get_web_grounding_context
+from backend import run_viral_shorts_pipeline_new, generate_validated_script
+from search_helper import get_web_grounding_context, clean_json_response
 from uploader_youtube import upload_video_to_youtube, is_youtube_authenticated
+from notifier import notify
+from script_utils import filter_fresh_trends
+from curiosity_topics import select_curiosity_topic
+
+OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
 
 CONFIG_FILE = os.path.abspath("scheduler_config.json")
 LOGS_FILE = os.path.abspath("scheduler_logs.json")
+
+# --- Revenue (RPM) reference data --------------------------------------------
+# RPM (revenue per mille / per 1000 monetized views) varies hugely by viewer
+# geography and by content niche. These are curated approximate USD ranges used
+# only to GUIDE topic choice toward higher-earning markets/niches — they are not
+# exact earnings. Live per-niche RPM is not available via any public API.
+RPM_BY_GEO = {
+    "US": (4.0, 14.0),   # Highest RPM market
+    "AU": (3.0, 10.0),
+    "CA": (2.8, 9.0),
+    "GB": (2.5, 8.5),
+    "_default": (0.3, 2.0),
+}
+
+# Multiplier applied on top of the geo range, by broad niche.
+RPM_BY_NICHE = {
+    "finance": 2.2, "investing": 2.2, "business": 1.9, "money": 2.0,
+    "tech": 1.7, "ai": 1.7, "software": 1.7, "crypto": 1.8,
+    "science": 1.2, "education": 1.2, "psychology": 1.2,
+    "entertainment": 0.8, "sports": 0.9, "culture": 0.9, "general": 1.0,
+}
+
+# High-CPM markets the recommender is allowed to target.
+ALLOWED_RPM_GEOS = ["US", "GB", "CA", "AU"]
+
+
+def estimate_rpm(geo, niche):
+    """Return a human-readable estimated RPM range string like '$6–$21' for a
+    given viewer geography and content niche."""
+    low, high = RPM_BY_GEO.get((geo or "US").upper(), RPM_BY_GEO["_default"])
+    mult = RPM_BY_NICHE.get((niche or "general").strip().lower(), 1.0)
+    return f"${low * mult:.0f}–${high * mult:.0f}"
 
 def load_scheduler_config():
     """Load configuration from scheduler_config.json or create defaults."""
@@ -35,6 +73,16 @@ def load_scheduler_config():
         "leonardo_model": "Leonardo Phoenix 1.0 (General/Realistic)",
         "voice": "Sarah (Female - US - Soft)",
         "privacy": "private",
+        "require_approval": False,
+        "image_provider": "local",
+        "videos_per_run": 1,
+        # Topic source: "trends" (live Google Trends), "curiosity" (curated
+        # evergreen library), or "mixed" (randomly alternate between the two).
+        "topic_source": "trends",
+        "curiosity_category": "All",
+        "subscribe_overlay": True,
+        "channel_handle": "",
+        "youtube_channel_url": "",
         "last_run_date": "",
         "last_run_slots": []
     }
@@ -117,8 +165,14 @@ def fetch_google_trends(geo="US"):
         print(f"Error fetching Google Trends RSS: {e}")
         return []
 
-def select_viral_topic(trends_list, ollama_model):
-    """Use Ollama LLM to select a safe, educational, high-engagement topic from the trends list."""
+def select_viral_topic(trends_list, ollama_model, performance_hint="", exclude_topics=None):
+    """Use Ollama LLM to select a safe, educational, high-engagement topic from the trends list.
+
+    ``performance_hint`` (from the analytics feedback loop) is appended to the
+    prompt so the model can favor themes that performed well historically.
+    ``exclude_topics`` is a list of recently-used topics to avoid (prevents the
+    scheduler from making the same video repeatedly).
+    """
     if not trends_list:
         return None, "No trends available."
         
@@ -126,18 +180,24 @@ def select_viral_topic(trends_list, ollama_model):
     
     # Strictly enforce safety filtering in LLM instructions to avoid strikes/violations
     system_prompt = (
-        "You are an expert viral content strategist. "
-        "Your task is to select the single best topic from the provided Google Trends list "
-        "that would make an extremely interesting, educational, or highly engaging 15-second vertical video short/reel.\n\n"
-        "STRICT SAFETY FILTERING RULES:\n"
-        "1. Reject and skip any topics related to: violence, accidents, death, natural disasters, crime, political controversies, scandals, wars, or adult themes.\n"
-        "2. Reject and skip any medical or health advice/claims (to avoid YouTube medical misinformation strikes).\n"
-        "3. Prefer niches like: space discoveries, fascinating historical events, amazing science facts, technology innovations, or nature wonders.\n"
-        "4. Avoid transient celebrity gossip or sports scores unless they have an educational science/history angle.\n\n"
-        "Respond ONLY with a valid JSON object matching this exact format, with no markdown code fences, no conversational filler, and no extra text:\n"
+        "You are an elite viral content strategist for YouTube Shorts, Instagram Reels and TikTok. "
+        "From the provided Google Trends list, choose the SINGLE topic with the highest viral potential "
+        "for a 15-second vertical video.\n\n"
+        "CHOOSE THE TOPIC WITH THE STRONGEST:\n"
+        "- Curiosity gap or surprise (the 'wait, what?!' factor)\n"
+        "- Emotional pull (awe, shock, inspiration, nostalgia, or satisfying payoff)\n"
+        "- Broad relatability and 'did you know' shareability\n"
+        "- A clear, punchy story that genuinely fits in 15 seconds\n\n"
+        "STRICT SAFETY FILTERING (reject and skip):\n"
+        "1. Violence, accidents, death, disasters, crime, war, political controversy, scandals, or adult themes.\n"
+        "2. Medical or health advice/claims (avoids misinformation strikes).\n"
+        "3. Prefer angles in science, space, history, technology, nature, psychology, or sports/culture "
+        "with an educational or human-interest hook.\n\n"
+        "Then rewrite the chosen trend as a SHORT, curiosity-driven video title (hook-style, not a plain news headline).\n"
+        "Respond ONLY with a valid JSON object, with no markdown code fences, no conversational filler, and no extra text:\n"
         "{\n"
-        "  \"topic\": \"The exact chosen topic name, refined for vertical short title\",\n"
-        "  \"rationale\": \"A short 1-sentence explanation of why this is a safe, high-engagement topic\"\n"
+        "  \"topic\": \"A short, curiosity-driven video title based on the chosen trend\",\n"
+        "  \"rationale\": \"One sentence on why this is safe AND has high viral potential\"\n"
         "}"
     )
     
@@ -145,6 +205,16 @@ def select_viral_topic(trends_list, ollama_model):
     for idx, item in enumerate(trends_list[:12]):
         trends_text += f"{idx+1}. Topic: {item['title']}, Traffic: {item['traffic']}, News: {item['summary']}\n"
         
+    if performance_hint:
+        system_prompt += "\n\n" + performance_hint
+
+    if exclude_topics:
+        avoid = "; ".join(str(t) for t in exclude_topics[:25])
+        system_prompt += (
+            "\n\nDO NOT pick any topic that is the same as or similar to these already-used topics "
+            f"(choose a clearly DIFFERENT subject): {avoid}"
+        )
+
     full_prompt = f"System: {system_prompt}\nTrends List:\n{trends_text}"
     
     payload = {
@@ -184,62 +254,153 @@ def select_viral_topic(trends_list, ollama_model):
             
     return None, "No safe trends found."
 
-def run_viral_agent_job(slot_name, config=None):
-    """Executes the complete autonomous viral generation & publishing loop."""
-    if not config:
-        config = load_scheduler_config()
-        
+def recommend_viral_topics(trends_list, ollama_model, count=5, performance_hint="",
+                           exclude_topics=None, high_cpm_bias=True, geo="US"):
+    """Rank the trends into the top ``count`` ready-to-use viral video topics,
+    optimized for revenue (RPM).
+
+    Returns a list of dicts: {title, rationale, niche, rpm_tier, est_rpm, geo}.
+    Generalizes ``select_viral_topic`` (which returns a single pick) — that
+    function is left intact for the scheduler.
+    """
+    geo = (geo or "US").upper()
+    if not trends_list:
+        return []
+
+    revenue_directive = ""
+    if high_cpm_bias:
+        revenue_directive = (
+            "\nREVENUE OPTIMIZATION (important):\n"
+            "These videos must EARN. Strongly prefer topics in high-CPM niches that pay "
+            "advertisers the most: personal finance, investing, money/side-hustles, business, "
+            "technology, AI, software, and crypto. A genuinely viral high-CPM angle beats a "
+            "viral low-CPM entertainment angle. Still REQUIRE real viral pull — never pick a "
+            "boring topic just because the niche pays well.\n"
+            "Classify each pick's niche as one of: finance, investing, business, money, tech, "
+            "ai, software, crypto, science, education, psychology, sports, culture, "
+            "entertainment, general.\n"
+        )
+
+    system_prompt = (
+        "You are an elite viral content strategist for YouTube Shorts. "
+        f"The audience is in {geo} (a high-RPM market). From the provided Google Trends list, "
+        f"choose the TOP {count} topics with the highest viral potential for 15-second vertical videos.\n\n"
+        "RANK BY:\n"
+        "- Curiosity gap or surprise (the 'wait, what?!' factor)\n"
+        "- Emotional pull (awe, shock, inspiration, satisfying payoff)\n"
+        "- Broad relatability and 'did you know' shareability\n"
+        "- A clear, punchy story that genuinely fits in 15 seconds\n"
+        + revenue_directive +
+        "\nSTRICT SAFETY FILTERING (reject and skip):\n"
+        "1. Violence, accidents, death, disasters, crime, war, political controversy, scandals, or adult themes.\n"
+        "2. Medical or health advice/claims.\n\n"
+        "Rewrite each chosen trend as a SHORT, curiosity-driven video title (hook-style, not a plain news headline).\n"
+        "Assign each a rpm_tier of \"High\", \"Medium\", or \"Low\" reflecting how much that niche typically earns.\n"
+        "Respond ONLY with a valid JSON object, no markdown fences, no extra text:\n"
+        "{\n"
+        "  \"topics\": [\n"
+        "    {\"title\": \"short curiosity-driven title\", \"rationale\": \"one sentence: why it is safe AND viral AND earns\", \"niche\": \"finance|tech|science|...\", \"rpm_tier\": \"High|Medium|Low\"}\n"
+        "  ]\n"
+        "}"
+    )
+
+    trends_text = ""
+    for idx, item in enumerate(trends_list[:12]):
+        trends_text += f"{idx+1}. Topic: {item['title']}, Traffic: {item['traffic']}, News: {item['summary']}\n"
+
+    if performance_hint:
+        system_prompt += "\n\n" + performance_hint
+
+    if exclude_topics:
+        avoid = "; ".join(str(t) for t in exclude_topics[:25])
+        system_prompt += (
+            "\n\nDO NOT pick any topic that is the same as or similar to these already-used topics "
+            f"(choose clearly DIFFERENT subjects): {avoid}"
+        )
+
+    full_prompt = f"System: {system_prompt}\nTrends List:\n{trends_text}"
+    payload = {"model": ollama_model, "prompt": full_prompt, "stream": False, "format": "json"}
+
+    recs = []
+    try:
+        response = requests.post(f"{OLLAMA_HOST}/api/generate", json=payload, timeout=60)
+        if response.status_code == 200:
+            resp_text = clean_json_response(response.json().get("response", "").strip())
+            data = json.loads(resp_text)
+            for t in data.get("topics", [])[:count]:
+                title = (t.get("title") or "").strip()
+                if not title:
+                    continue
+                niche = (t.get("niche") or "general").strip().lower()
+                recs.append({
+                    "title": title,
+                    "rationale": t.get("rationale", ""),
+                    "niche": niche,
+                    "rpm_tier": t.get("rpm_tier", "Medium"),
+                    "est_rpm": estimate_rpm(geo, niche),
+                    "geo": geo,
+                })
+    except Exception as e:
+        print(f"Ollama topic recommendation failed: {e}")
+
+    if recs:
+        return recs
+
+    # Fallback: safety-filtered raw trends so the UI still populates if the LLM is down.
+    unsafe_words = ["kill", "die", "dead", "shoot", "murder", "accident", "crash",
+                    "war", "scandal", "arrest", "polic", "assault"]
+    for trend in trends_list:
+        if any(w in trend["title"].lower() for w in unsafe_words):
+            continue
+        recs.append({
+            "title": trend["title"],
+            "rationale": "Trending now (AI ranking unavailable — raw trend).",
+            "niche": "general",
+            "rpm_tier": "Medium",
+            "est_rpm": estimate_rpm(geo, "general"),
+            "geo": geo,
+        })
+        if len(recs) >= count:
+            break
+    return recs
+
+def _run_single_video(topic, rationale, slot_name, config, ollama_model, all_logs, context=""):
+    """Generate, render and publish ONE video for the given topic.
+
+    ``context`` is an optional curiosity angle/hook that is woven into the
+    script-drafting prompt so the video leans into the intended angle (used by
+    the curiosity topic source). ``topic`` stays clean for logs, the DB record
+    and the eventual YouTube title.
+
+    Appends its own log entry to ``all_logs`` and returns it.
+    """
     job_id = str(uuid.uuid4())
     execution_logs = []
-    
+
     def log_step(msg):
         timestamp = datetime.now().strftime("%H:%M:%S")
         entry = f"[{timestamp}] {msg}"
         print(entry)
         execution_logs.append(entry)
-        
-    log_step(f"Starting Viral Agent Run for slot: {slot_name}")
-    
-    # Setup log entry structure
+
     log_entry = {
         "id": job_id,
         "timestamp": datetime.now().isoformat() + "Z",
         "slot": slot_name,
-        "topic": "Pending Selection",
+        "topic": topic,
         "status": "running",
         "video_path": None,
         "youtube_id": None,
         "logs": execution_logs
     }
-    
-    # Save log immediately as running
-    all_logs = load_scheduler_logs()
     all_logs.insert(0, log_entry)
     save_scheduler_logs(all_logs)
-    
+
     try:
-        # 1. Fetch trends
-        region = config.get("region", "US")
-        log_step(f"Fetching Google Trends for region: {region}...")
-        trends = fetch_google_trends(region)
-        if not trends:
-            raise Exception("No trending search topics retrieved from Google Trends.")
-            
-        log_step(f"Retrieved {len(trends)} trends. Selecting best safe topic...")
-        
-        # 2. Select topic
-        ollama_model = config.get("model", "deepseek-v4-pro:cloud")
-        topic, rationale = select_viral_topic(trends, ollama_model)
-        if not topic:
-            raise Exception("Ollama failed to select a safe trending topic.")
-            
         log_step(f"Selected Topic: '{topic}'")
         log_step(f"Rationale: {rationale}")
-        
-        # Update log entry topic
-        log_entry["topic"] = topic
         save_scheduler_logs(all_logs)
-        
+
         # 3. Web search grounding
         log_step("Performing real-time Web Search Grounding for factual verification...")
         grounding_data = get_web_grounding_context(topic, ollama_model)
@@ -249,9 +410,13 @@ def run_viral_agent_job(slot_name, config=None):
         else:
             log_step("No web grounding context retrieved. Proceeding with LLM knowledge base.")
             
-        # 4. Draft script & storyboard
+        # 4. Draft script & storyboard (validated against the viral checklist + photorealism)
         log_step("Drafting script and segmenting storyboard scenes...")
-        script_data = generate_ollama_script(topic, ollama_model, hook_style="Did You Know? (Fact Hook)", enable_search=bool(web_context))
+        script_prompt = topic
+        if context:
+            log_step(f"Applying curiosity angle as script context: {context}")
+            script_prompt = f"{topic}. Curiosity angle to emphasize: {context}"
+        script_data = generate_validated_script(script_prompt, ollama_model, hook_style="Did You Know? (Fact Hook)", enable_search=bool(web_context), log=log_step)
         scenes = script_data.get("scenes")
         if not scenes or len(scenes) != 7:
             raise Exception("Failed to generate a valid 7-scene script and storyboard.")
@@ -291,7 +456,13 @@ def run_viral_agent_job(slot_name, config=None):
             caption_style=config.get("caption_style", "Viral Pop"),
             enable_transition_sfx=False,
             custom_storyboard=scenes,
-            custom_script_data=script_data
+            custom_script_data=script_data,
+            log_callback=log_step,
+            on_scene_complete=lambda sb: db_manager.update_video_generation(gen_id, storyboard=sb),
+            generation_id=gen_id,
+            image_provider=config.get("image_provider", "local"),
+            subscribe_overlay=config.get("subscribe_overlay", True),
+            channel_handle=config.get("channel_handle", "")
         )
         
         log_step(f"Video rendering completed successfully! Final Path: {final_video}")
@@ -304,17 +475,56 @@ def run_viral_agent_job(slot_name, config=None):
         log_entry["video_path"] = final_video
         save_scheduler_logs(all_logs)
         
-        # 7. Upload to YouTube (if credentials exist)
+        # 7. Approval gate: when enabled, hold for human review instead of auto-publishing.
+        if config.get("require_approval"):
+            yt_meta = script_data.get("youtube_metadata") or {}
+            yt_title = yt_meta.get("title", f"{topic} #shorts #viral")
+            if "#shorts" not in yt_title.lower():
+                yt_title = f"{yt_title[:80]} #shorts"
+            _ch = config.get("youtube_channel_url", "")
+            _sub = f"\n\n🔔 SUBSCRIBE for daily videos{': ' + _ch if _ch else '!'}"
+            yt_desc = yt_meta.get("description", "Daily educational shorts.") + _sub + "\n\n#shorts #trending #facts"
+            yt_tags = yt_meta.get("tags") or ["shorts", "facts", "viral"]
+            privacy_status = config.get("privacy", "private")
+
+            approval_job_id = str(uuid.uuid4())
+            db_manager.create_upload_job(
+                approval_job_id, gen_id, ["youtube"],
+                youtube_metadata={"title": yt_title, "description": yt_desc, "tags": yt_tags, "privacy": privacy_status},
+                instagram_metadata=None,
+                status="pending_approval",
+                scheduled_time=datetime.now().isoformat() + "Z"
+            )
+            db_manager.update_upload_job(approval_job_id, logs=execution_logs)
+            log_step(f"Video generated and held for approval (job {approval_job_id}). Approve it in the Publisher panel to publish.")
+            notify(
+                "Video awaiting approval",
+                f"'{topic}' was generated and is awaiting manual approval before publishing.",
+                level="info",
+                context={"topic": topic, "job_id": approval_job_id, "generation_id": gen_id}
+            )
+            log_step("Daily Auto-Agent run completed successfully (pending approval)!")
+            log_entry["status"] = "success"
+            save_scheduler_logs(all_logs)
+            return log_entry
+
+        # 7b. Upload to YouTube (if credentials exist)
         log_step("Checking YouTube OAuth authorization...")
-        if is_youtube_authenticated():
+        if db_manager.is_platform_uploaded(gen_id, "youtube"):
+            prev = db_manager.get_platform_upload(gen_id, "youtube")
+            log_step(f"YouTube: this generation was already published (video id {prev['external_id']}); skipping upload.")
+            log_entry["youtube_id"] = prev["external_id"]
+        elif is_youtube_authenticated():
             log_step("YouTube credentials authenticated. Starting video upload...")
-            
+
             yt_meta = script_data.get("youtube_metadata") or {}
             yt_title = yt_meta.get("title", f"{topic} #shorts #viral")
             if "#shorts" not in yt_title.lower():
                 yt_title = f"{yt_title[:80]} #shorts"
                 
-            yt_desc = yt_meta.get("description", "Daily educational shorts.") + "\n\n#shorts #trending #facts"
+            _ch = config.get("youtube_channel_url", "")
+            _sub = f"\n\n🔔 SUBSCRIBE for daily videos{': ' + _ch if _ch else '!'}"
+            yt_desc = yt_meta.get("description", "Daily educational shorts.") + _sub + "\n\n#shorts #trending #facts"
             yt_tags = yt_meta.get("tags") or ["shorts", "facts", "viral"]
             privacy_status = config.get("privacy", "private")
             
@@ -332,7 +542,10 @@ def run_viral_agent_job(slot_name, config=None):
             
             log_step(f"YouTube Upload Successful! Video ID: {yt_video_id}")
             log_entry["youtube_id"] = yt_video_id
-            
+
+            # Record in dedup ledger so a re-run never double-publishes this generation.
+            db_manager.record_platform_upload(gen_id, "youtube", yt_video_id)
+
             # Record upload job in database for transparency
             upload_job_id = str(uuid.uuid4())
             db_manager.create_upload_job(
@@ -346,15 +559,105 @@ def run_viral_agent_job(slot_name, config=None):
         else:
             log_step("⚠️ WARNING: YouTube is NOT authenticated. Skipping upload. Please authorize YouTube in the Publisher panel.")
             
-        log_step("Daily Auto-Agent run completed successfully!")
+        log_step("Auto-Agent video completed successfully!")
         log_entry["status"] = "success"
-        
+
     except Exception as e:
-        log_step(f"❌ ERROR: Daily Auto-Agent run failed: {str(e)}")
+        log_step(f"❌ ERROR: Auto-Agent video failed: {str(e)}")
         log_entry["status"] = "failed"
-        
+        notify(
+            "Viral agent video failed",
+            f"Autonomous viral agent ({slot_name}) failed for topic '{topic}': {e}",
+            context={"slot": slot_name, "topic": topic}
+        )
+
     save_scheduler_logs(all_logs)
     return log_entry
+
+
+def run_viral_agent_job(slot_name, config=None):
+    """Run the autonomous agent, producing ``config['videos_per_run']`` videos,
+    each on a DIFFERENT topic (avoiding recently-used and within-run repeats)."""
+    if not config:
+        config = load_scheduler_config()
+
+    count = max(1, int(config.get("videos_per_run", 1) or 1))
+    region = config.get("region", "US")
+    ollama_model = config.get("model", "deepseek-v4-pro:cloud")
+    topic_source = str(config.get("topic_source", "trends") or "trends").lower()
+    curiosity_category = config.get("curiosity_category", "All") or "All"
+    all_logs = load_scheduler_logs()
+
+    # Live trends are only needed for the "trends" and "mixed" sources.
+    trends = []
+    if topic_source in ("trends", "mixed"):
+        print(f"[agent] Run '{slot_name}': generating {count} video(s). Fetching trends ({region})...")
+        trends = fetch_google_trends(region)
+        if not trends:
+            if topic_source == "trends":
+                ts = datetime.now().strftime("%H:%M:%S")
+                entry = {
+                    "id": str(uuid.uuid4()), "timestamp": datetime.now().isoformat() + "Z",
+                    "slot": slot_name, "topic": "N/A", "status": "failed", "video_path": None,
+                    "youtube_id": None,
+                    "logs": [f"[{ts}] No trending topics retrieved from Google Trends."],
+                }
+                all_logs.insert(0, entry)
+                save_scheduler_logs(all_logs)
+                notify("Viral agent run failed", "No trends retrieved from Google Trends.", context={"slot": slot_name})
+                return entry
+            # Mixed run with no trends available -> fall back to curiosity only.
+            print("[agent] No trends retrieved; mixed run will use curated curiosity topics only.")
+    else:
+        print(f"[agent] Run '{slot_name}': generating {count} video(s) from curated curiosity topics ({curiosity_category}).")
+
+    # Avoid topics already produced recently (across days) and within this run.
+    try:
+        used_topics = list(db_manager.get_recent_topics(40))
+    except Exception:
+        used_topics = []
+
+    performance_hint = ""
+    try:
+        from analytics import get_performance_hint
+        performance_hint = get_performance_hint()
+    except Exception:
+        pass
+
+    results = []
+    for i in range(count):
+        label = slot_name if count == 1 else f"{slot_name} - video {i + 1}/{count}"
+
+        # Decide this video's topic source.
+        if topic_source == "curiosity" or (topic_source == "mixed" and not trends):
+            use_curiosity = True
+        elif topic_source == "mixed":
+            use_curiosity = random.random() < 0.5
+        else:
+            use_curiosity = False
+
+        context = ""
+        if use_curiosity:
+            pick = select_curiosity_topic(exclude_topics=used_topics, category=curiosity_category)
+            if not pick:
+                print(f"[agent] No fresh curiosity topic found for video {i + 1}; stopping early.")
+                break
+            topic = pick["title"]
+            rationale = f"Curated curiosity topic — {pick['category']}."
+            context = pick.get("hook", "")
+        else:
+            pool = filter_fresh_trends(trends, used_topics) or trends
+            topic, rationale = select_viral_topic(
+                pool, ollama_model, performance_hint=performance_hint, exclude_topics=used_topics
+            )
+            if not topic:
+                print(f"[agent] No fresh topic found for video {i + 1}; stopping early.")
+                break
+
+        used_topics.insert(0, topic)  # so the next video avoids it
+        results.append(_run_single_video(topic, rationale, label, config, ollama_model, all_logs, context=context))
+
+    return results[0] if results else None
 
 if __name__ == "__main__":
     import argparse
