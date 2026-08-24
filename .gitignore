@@ -48,3 +48,4 @@ token_youtube.json
 # Scheduler runtime state (tracked via *.example templates)
 scheduler_config.json
 scheduler_logs.json
+.claude/settings.local.json

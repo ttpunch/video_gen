@@ -5,6 +5,7 @@ import json
 import uuid
 import requests
 import configparser
+import hashlib
 import subprocess
 import soundfile as sf
 import shutil
@@ -22,6 +23,16 @@ load_dotenv()
 
 # Custom imports for search and uploads
 import db_manager
+import cost_tracker
+import image_providers
+import video_quality as vq
+from hailuo import generate_hailuo_video
+from reliability import retry_call, RetryError
+from notifier import notify
+import script_utils
+import stock_footage
+from script_utils import build_storyboard_from_story, normalize_scene_count
+from script_validator import validate_script, autofix, ART_STYLE_PRESETS
 from search_helper import get_web_grounding_context, clean_json_response
 from uploader_youtube import upload_video_to_youtube, is_youtube_authenticated, trigger_youtube_auth_flow_url
 from uploader_instagram import upload_reel_to_instagram, is_instagram_configured
@@ -114,37 +125,6 @@ VIRAL_HOOKS = {
 }
 
 # Helpers
-def get_video_dimensions(path):
-    try:
-        cmd = [
-            "ffprobe", "-v", "error", 
-            "-select_streams", "v:0", 
-            "-show_entries", "stream=width,height", 
-            "-of", "csv=s=x:p=0", 
-            path
-        ]
-        res = subprocess.run(cmd, capture_output=True, text=True, check=True)
-        parts = res.stdout.strip().split('x')
-        if len(parts) == 2:
-            return int(parts[0]), int(parts[1])
-    except Exception as e:
-        print(f"Error checking video dimensions: {e}")
-    return 576, 1024
-
-def has_audio_stream(path):
-    try:
-        cmd = [
-            "ffprobe", "-v", "error", 
-            "-select_streams", "a:0", 
-            "-show_entries", "stream=index", 
-            "-of", "csv=p=0", 
-            path
-        ]
-        res = subprocess.run(cmd, capture_output=True, text=True, check=True)
-        return len(res.stdout.strip()) > 0
-    except Exception:
-        return False
-
 def download_file(url, folder, prefix):
     if not url or not url.strip().startswith(("http://", "https://")):
         return None
@@ -216,19 +196,29 @@ def mix_transition_sfx(main_audio_path, output_audio_path, transition_times):
     ffmpeg_cmd = ["ffmpeg", "-y", "-i", main_audio_path]
     for _ in transition_times:
         ffmpeg_cmd += ["-i", whoosh_path]
-        
+
     inputs = ["[0:a]"]
     filter_parts = []
-    
+
     for idx, t_sec in enumerate(transition_times):
         t_ms = int(t_sec * 1000)
         sfx_label = f"[whoosh{idx}]"
         filter_parts.append(f"[{idx+1}:a]adelay={t_ms}|{t_ms}[whoosh_del{idx}]; [whoosh_del{idx}]volume=0.20{sfx_label}")
         inputs.append(sfx_label)
-        
+
     amix_in = "".join(inputs)
-    filter_parts.append(f"{amix_in}amix=inputs={len(inputs)}:duration=first[aout]")
-    
+    # normalize=0 is essential. amix's default normalization divides every input
+    # by the input count, so adding N whooshes silently attenuated the entire
+    # narration by a factor of N+1 -- measured at -13 dB with 4 transitions.
+    #
+    # dropout_transition=0 matters just as much: by default amix ramps the gain
+    # back up over 2 seconds each time an input ENDS, and each whoosh ends at a
+    # different moment. That produced a staircase of gain rises across the
+    # video, which is exactly the "volume increases after the middle" effect.
+    filter_parts.append(
+        f"{amix_in}amix=inputs={len(inputs)}:duration=first:normalize=0"
+        f":dropout_transition=0[aout]")
+
     ffmpeg_cmd += [
         "-filter_complex", "; ".join(filter_parts),
         "-map", "[aout]", "-c:a", "pcm_s16le", output_audio_path
@@ -338,7 +328,7 @@ def generate_ass_subtitles(storyboard, output_path, font_name="Arial", font_size
     return True
 
 # Core Pipeline Functions
-def generate_ollama_script(prompt: str, model: str, hook_style: str = "None (Direct Prompt)", enable_search: bool = False):
+def generate_ollama_script(prompt: str, model: str, hook_style: str = "None (Direct Prompt)", enable_search: bool = False, art_style: str = "Photorealistic"):
     url = f"{OLLAMA_HOST}/api/generate"
     
     hook_instruction = VIRAL_HOOKS.get(hook_style, "")
@@ -356,44 +346,85 @@ def generate_ollama_script(prompt: str, model: str, hook_style: str = "None (Dir
             
     # Stage 1: Creative Story / Script Writer (Free-form text)
     storyteller_system = (
-        "You are an expert creative storyteller and copywriter. "
-        "Your task is to write a highly engaging, viral 15-second story or script based on the topic. "
-        "It must flow naturally as a single narrative and keep the listener hooked from the first second. "
-        "Keep the total length to approximately 55-65 words to ensure it runs for a full 15 seconds. "
-        "Do not include scene numbers, brackets, or speaker names in this text—only write the raw narrative story text."
+        "You are a world-class short-form video scriptwriter for YouTube Shorts, Instagram Reels "
+        "and TikTok whose videos routinely go viral. Write a punchy ~15-second voiceover script "
+        "about the given topic.\n"
+        "VIRAL RULES (follow all):\n"
+        "- HOOK FIRST: The opening sentence (first ~3 seconds) must stop the scroll. Use a bold claim, "
+        "a shocking/surprising fact, or a curiosity gap. Never open with 'In this video', 'Today', or a slow intro.\n"
+        "- OPEN LOOP: Tease something the viewer only fully understands at the end, so they keep watching.\n"
+        "- PACING: Short, punchy, spoken-style sentences (each about 6-12 words) that read cleanly as "
+        "on-screen captions. One idea per sentence.\n"
+        "- ESCALATE: Each sentence should raise curiosity, tension, or stakes more than the last.\n"
+        "- PAYOFF + CTA: Land a satisfying payoff, then end with a punchy call to action that tells the "
+        "viewer to SUBSCRIBE for more (e.g. 'Subscribe so you never miss one').\n"
+        "- Be specific and accurate about the topic; no vague filler or repetition.\n"
+        "- Do NOT repeat any sentence or phrase; every line must add new information.\n"
+        "Total length about 65-85 words (about 15-20 seconds spoken). "
+        "Output ONLY the raw narration text - no scene numbers, brackets, speaker names, emojis, or stage directions."
     )
     
     storyteller_prompt = f"System: {storyteller_system}\n{grounding_info}\nUser: Write a 15-second viral story about: {prompt}."
     if hook_instruction:
         storyteller_prompt += f" Hook Instruction: {hook_instruction}"
         
-    story_text = ""
+    payload1 = {
+        "model": model,
+        "prompt": storyteller_prompt,
+        "stream": False
+    }
+
+    def _attempt_story():
+        # Generous timeout for cloud models; they are slow but usually succeed on retry.
+        r = requests.post(url, json=payload1, timeout=90)
+        if r.status_code != 200:
+            raise RuntimeError(f"Ollama HTTP {r.status_code}: {r.text[:150]}")
+        t = (r.json().get("response", "") or "").strip()
+        # A real ~15-20s script is ~55-80 words. Reject short/empty output so we
+        # NEVER fall back to narrating the bare topic title (which caused the
+        # 7-second, fragmented, repeating-caption video).
+        if len(t.split()) < 30:
+            raise RuntimeError(f"story too short ({len(t.split())} words)")
+        return t
+
     try:
-        payload1 = {
-            "model": model,
-            "prompt": storyteller_prompt,
-            "stream": False
-        }
-        response1 = requests.post(url, json=payload1, timeout=45)
-        if response1.status_code == 200:
-            story_text = response1.json().get("response", "").strip()
-            print(f"--- Generated Cohesive Story ---\n{story_text}\n---------------------------------")
+        story_text = retry_call(_attempt_story, attempts=3, base_delay=2.0,
+                                label="story text", logger=print)
+        print(f"--- Generated Cohesive Story ---\n{story_text}\n---------------------------------")
     except Exception as e:
-        print(f"Ollama story text generation failed: {e}")
-        
-    if not story_text:
-        story_text = prompt
+        raise RuntimeError(
+            f"Script generation failed for '{prompt}': the model did not return a usable story ({e}). "
+            f"Ensure Ollama and model '{model}' are reachable and responsive."
+        )
         
     # Stage 2: Storyboarder & Scene Segmenter (Strict JSON)
     storyboarder_system = (
-        "You are an expert storyboarder. Take the provided story text and split it into exactly 7 sequential scenes. "
-        "To ensure visual continuity and keep the focus point consistent (so the video does not look like a series of unrelated random images), you MUST define:\n"
-        "1. A 'global_visual_style' representing the overall visual medium, art style, camera/lighting style, and color palette (e.g. 'cinematic 3D render, dark mood, neon green accents, highly detailed, 8k').\n"
-        "2. A 'global_subject_focus' describing the main character, subject, or object that remains constant across the entire story (e.g. 'a futuristic female astronaut wearing a white helmet with a gold visor').\n"
+        "You are an expert viral short-form video editor and storyboarder. Split the provided story "
+        "into exactly 7 sequential scenes that will be rendered as a fast-paced vertical 9:16 reel "
+        "with word-by-word captions, subtle zoom (Ken Burns) motion, and whoosh transitions between scenes.\n"
+        "To keep the video visually consistent (not a set of unrelated random images), you MUST define:\n"
+        "1. 'global_visual_style': the overall medium, art style, camera/lighting and color palette "
+        "(e.g. 'cinematic photoreal, dramatic lighting, shallow depth of field, rich color grade, high detail').\n"
+        "2. 'global_subject_focus': the main character/subject/object that stays CONSTANT across every scene, "
+        "described concretely and tied to the topic (e.g. for a goalkeeper: 'an athletic goalkeeper in a red and "
+        "black kit with padded gloves'). Never use a generic placeholder unrelated to the topic.\n"
+        "3. 'background_music_style': choose ONE of Cinematic, Upbeat, Mysterious, Ambient that best fits the mood.\n"
         "For each scene:\n"
-        "1. Extract the exact segment of narration text from the story (usually 1 short sentence, approx. 8-10 words).\n"
-        "2. Assign a speaker name from this list: Sarah, Bella, Nicole, Sky, Alloy, Kore, River, Adam, Michael, Fenrir, Puck, Echo, Liam, Onyx, Emma, Isabella, George, Lewis.\n"
-        "3. Write a scene-specific action/setting description for 'visual_prompt'. This should describe ONLY the specific action, movement, or background setting of that scene, designed to be combined with the global style and subject description. Do not include camera frames, phone frames, or device frames in this prompt.\n\n"
+        "1. 'narration': extract a short, caption-friendly segment of the story (about 6-12 words). Keep the story's exact wording and order; do not invent new facts.\n"
+        "2. 'speaker': pick one consistent name from: Sarah, Bella, Nicole, Sky, Alloy, Kore, River, Adam, Michael, Fenrir, Puck, Echo, Liam, Onyx, Emma, Isabella, George, Lewis (use the SAME speaker for the whole video unless the story has distinct characters).\n"
+        "3. 'visual_prompt': a vivid, specific scene description - the action, emotion, pose, or setting for THIS line, "
+        "with a clear focal subject and sense of motion/energy so the zoom and cut land well. It is combined with the "
+        "global style and subject, so describe only what changes this scene. Scene 1 should be the most striking, "
+        "scroll-stopping visual. No on-screen text, watermarks, camera frames, phone frames, or device frames.\n"
+        "4. 'visual_source': 'stock' if this shot could be FILMED in the real world (people, animals, "
+        "cities, nature, weather, hands, food, labs, machinery, sports), or 'generate' if it could not "
+        "possibly be filmed (inside a black hole, the year 3000, a stick figure, an abstract concept, "
+        "a microscopic or cosmic view no camera could capture). Prefer 'stock' whenever it is plausible - "
+        "real footage always looks more believable than an AI image.\n"
+        "5. 'stock_query': ONLY when visual_source is 'stock'. Two to four PLAIN search keywords for a "
+        "stock video library - concrete nouns only, no adjectives, no camera or lighting words. "
+        "Good: 'stormy ocean waves', 'scientist microscope lab'. Bad: 'a lone figure silhouetted "
+        "against dramatic cinematic light'.\n\n"
         "Respond ONLY with a valid JSON object matching this exact format, with no markdown styling, no conversational filler, and no extra text:\n"
         "{\n"
         "  \"topic\": \"Engaging vertical title of the video\",\n"
@@ -404,7 +435,9 @@ def generate_ollama_script(prompt: str, model: str, hook_style: str = "None (Dir
         "    {\n"
         "      \"speaker\": \"Speaker Name (e.g. Sarah)\",\n"
         "      \"narration\": \"Exact segment of narration text from the story.\",\n"
-        "      \"visual_prompt\": \"Specific action, pose, or background setting representing the scene's narration.\"\n"
+        "      \"visual_prompt\": \"Specific action, pose, or background setting representing the scene's narration.\",\n"
+        "      \"visual_source\": \"stock\",\n"
+        "      \"stock_query\": \"two to four plain search keywords\"\n"
         "    },\n"
         "    ... (exactly 7 scenes)\n"
         "  ],\n"
@@ -419,50 +452,92 @@ def generate_ollama_script(prompt: str, model: str, hook_style: str = "None (Dir
         "}"
     )
     
-    storyboarder_prompt = f"System: {storyboarder_system}\nStory to segment:\n{story_text}"
-    
+    # Steer the storyboard's visual anchors toward the chosen art style. For
+    # non-photoreal styles (e.g. stickman) this stops the LLM from defaulting to
+    # a "cinematic photoreal" global_visual_style that the validator would then
+    # have to fight.
+    style_directive = ""
+    if art_style == "Stickman Animation":
+        style_directive = (
+            "\n\nIMPORTANT RENDER STYLE: This video is a simple black-and-white STICKMAN animation "
+            "(classic stick figures, like 'Animator vs Animation'). Make 'global_subject_focus' a single "
+            "consistent stick figure described simply (round circle head, straight thin line limbs, no "
+            "detailed features). Make 'global_visual_style' stickman line art (black stick figures, bold "
+            "clean lines, plain white background, 2D flat). Each 'visual_prompt' should describe the stick "
+            "figure's pose/action for that scene. Do NOT describe anything as photoreal, detailed, or cinematic."
+        )
+
+    storyboarder_prompt = f"System: {storyboarder_system}{style_directive}\nStory to segment:\n{story_text}"
+
     payload2 = {
         "model": model,
         "prompt": storyboarder_prompt,
         "stream": False,
         "format": "json"
     }
-    
+
+    # Stage 2 is the flaky step (cloud models time out / return slightly-off JSON).
+    # Retry it, accept a reasonable scene count, and normalize to exactly 7.
+    def _attempt_storyboard():
+        # Generous timeout: cloud models are slow at large JSON generations.
+        r = requests.post(url, json=payload2, timeout=120)
+        if r.status_code != 200:
+            raise RuntimeError(f"Ollama HTTP {r.status_code}: {r.text[:150]}")
+        data = json.loads(clean_json_response(r.json().get("response", "").strip()))
+        scenes = data.get("scenes")
+        if not isinstance(scenes, list) or len(scenes) < 4:
+            raise RuntimeError(f"invalid storyboard (got {len(scenes) if isinstance(scenes, list) else 'no'} scenes)")
+        return data
+
     try:
-        response2 = requests.post(url, json=payload2, timeout=45)
-        if response2.status_code == 200:
-            resp_text = response2.json().get("response", "").strip()
-            cleaned = clean_json_response(resp_text)
-            data = json.loads(cleaned)
-            if "scenes" in data and len(data["scenes"]) == 7:
-                return data
+        data = retry_call(_attempt_storyboard, attempts=2, base_delay=2.0,
+                          label="storyboard JSON", logger=print)
+        data["scenes"] = normalize_scene_count(data["scenes"], story_text, 7)
+        # Make sure the global anchors exist and are tied to the actual topic.
+        if not data.get("global_subject_focus"):
+            data["global_subject_focus"] = data.get("topic") or prompt
+        default_style = ("realistic vertical 9:16, cinematic lighting, dramatic mood, high detail"
+                         if art_style == "Photorealistic"
+                         else "vertical 9:16")
+        data.setdefault("global_visual_style", default_style)
+        data.setdefault("topic", prompt)
+        return data
     except Exception as e:
-        print(f"Ollama JSON storyboard generation failed: {e}")
-        
-    # Fallback script with metadata and speakers
-    return {
-        "topic": prompt if prompt else "Incredible Facts",
-        "background_music_style": "Cinematic",
-        "global_visual_style": "realistic vertical 9:16 portrait, cinematic lighting, dramatic mood, high-detail",
-        "global_subject_focus": "a detailed mysterious mechanical box emitting faint golden light",
-        "scenes": [
-            {"speaker": "Sarah", "narration": f"Here is an incredible fact about {prompt or 'our world'}.", "visual_prompt": "resting on a dust-covered desk inside a dark ancient study room"},
-            {"speaker": "Adam", "narration": "Deep beneath the ocean, strange physical anomalies exist.", "visual_prompt": "a glowing hydrothermal vent in the dark ocean depths"},
-            {"speaker": "Sarah", "narration": "Scientists were completely shocked when they discovered this secret.", "visual_prompt": "slowly unlocking itself as gears slide outward"},
-            {"speaker": "Adam", "narration": "It changes everything we thought we knew about physics.", "visual_prompt": "opening wide, revealing a small floating miniature galaxy inside"},
-            {"speaker": "George", "narration": "Strange ancient structures lie silent in the freezing cold.", "visual_prompt": "mysterious ice-covered towers under glowing auroras"},
-            {"speaker": "Adam", "narration": "The implications could reshape our entire technological future.", "visual_prompt": "projecting bright blue holographic stars onto the study walls"},
-            {"speaker": "George", "narration": "Follow for more mind-blowing facts every single day!", "visual_prompt": "closing shut, leaving glowing golden sparks in the air"}
-        ],
-        "youtube_metadata": {
-            "title": f"The Truth About {prompt or 'This Topic'}!",
-            "description": f"Amazing facts and details about {prompt or 'this topic'}. #shorts #facts #viral",
-            "tags": ["shorts", "facts", "viral", "interesting"]
-        },
-        "instagram_metadata": {
-            "caption": f"Mind-blowing facts about {prompt or 'this concept'}! 🤯✨ #reels #explore #viral #facts"
-        }
-    }
+        # On failure, build the storyboard from the ACTUAL story so it stays on-topic
+        # (the old behavior returned canned, topic-irrelevant filler).
+        print(f"Storyboard JSON failed after retries ({e}); building topic-relevant fallback from the story.")
+        return build_storyboard_from_story(story_text, prompt)
+
+
+def generate_validated_script(prompt, model, hook_style="None (Direct Prompt)",
+                              enable_search=False, attempts=2, log=print,
+                              art_style="Photorealistic"):
+    """Generate a script and run it through the deterministic viral checker.
+
+    Regenerates on HARD failures (off-topic, repeats, wrong length, fallback...),
+    auto-fixes SOFT issues (missing CTA, non-realistic style), and raises if it
+    still cannot produce a valid script - so a broken video never reaches render.
+    """
+    last_hard = ["unknown error"]
+    for attempt in range(1, attempts + 1):
+        try:
+            data = generate_ollama_script(prompt, model, hook_style, enable_search=enable_search, art_style=art_style)
+        except Exception as e:
+            last_hard = [f"generation error: {e}"]
+            log(f"[validator] attempt {attempt}/{attempts}: {last_hard[0]}")
+            continue
+
+        hard, soft = validate_script(data, prompt, art_style=art_style)
+        if not hard:
+            if soft:
+                log(f"[validator] auto-fixing soft issues: {soft}")
+            return autofix(data, art_style=art_style)  # enforce style + ensure CTA
+        last_hard = hard
+        log(f"[validator] attempt {attempt}/{attempts} rejected (regenerating): {hard}")
+
+    raise RuntimeError(
+        f"Script failed viral validation after {attempts} attempts for '{prompt}': {last_hard}"
+    )
 
 
 def trim_audio_silence(input_path: str) -> str:
@@ -531,11 +606,14 @@ def generate_speech_audio(text: str, voice_key: str, speed: float = 1.0, effect:
         return None, f"Error: {e}"
 
 def generate_leonardo_image(prompt: str, model_key: str, aspect_ratio: str):
+    """Generate one image via Leonardo. Raises RuntimeError with the real API
+    error (e.g. 'not enough api tokens') so failures are diagnosable instead of
+    being silently swallowed."""
     if not LEONARDO_API_KEY:
-        return None
+        raise RuntimeError("LEONARDO_API_KEY is not set in the environment.")
     model_id = LEONARDO_MODELS.get(model_key, "de7d3faf-762f-48e0-b3b7-9d0ac3a3fcf3")
     width, height = ASPECT_RATIO_DIMENSIONS.get(aspect_ratio, (576, 1024))
-    
+
     url = "https://cloud.leonardo.ai/api/rest/v1/generations"
     headers = {
         "accept": "application/json",
@@ -549,33 +627,41 @@ def generate_leonardo_image(prompt: str, model_key: str, aspect_ratio: str):
         "height": height,
         "modelId": model_id
     }
-    
-    try:
-        response = requests.post(url, json=payload, headers=headers, timeout=20)
-        if response.status_code == 200:
-            generation_id = response.json().get("sdGenerationJob", {}).get("generationId")
-            poll_url = f"https://cloud.leonardo.ai/api/rest/v1/generations/{generation_id}"
-            
-            for _ in range(30):
-                time.sleep(2)
-                poll_resp = requests.get(poll_url, headers=headers, timeout=10)
-                if poll_resp.status_code == 200:
-                    gen_data = poll_resp.json().get("generations_by_pk", {})
-                    if gen_data.get("status") == "COMPLETE":
-                        images = gen_data.get("generated_images", [])
-                        if images:
-                            image_url = images[0].get("url")
-                            image_id = images[0].get("id")
-                            img_data = requests.get(image_url).content
-                            out_path = os.path.abspath(os.path.join("temp", f"scene_{int(time.time())}_{image_id[:8]}.png"))
-                            with open(out_path, "wb") as f:
-                                f.write(img_data)
-                            return out_path, image_id
-                    elif gen_data.get("status") == "FAILED":
-                        break
-    except Exception as e:
-        print(f"Leonardo error: {e}")
-    return None, None
+
+    response = requests.post(url, json=payload, headers=headers, timeout=20)
+    if response.status_code != 200:
+        # Surface the actual reason: bad key (401), no API credits (400
+        # 'not enough api tokens'), rate limit (429), etc.
+        raise RuntimeError(f"Leonardo image API HTTP {response.status_code}: {response.text[:300]}")
+
+    generation_id = response.json().get("sdGenerationJob", {}).get("generationId")
+    if not generation_id:
+        raise RuntimeError(f"Leonardo image API returned no generationId: {response.text[:300]}")
+
+    poll_url = f"https://cloud.leonardo.ai/api/rest/v1/generations/{generation_id}"
+    for _ in range(30):
+        time.sleep(2)
+        poll_resp = requests.get(poll_url, headers=headers, timeout=10)
+        if poll_resp.status_code == 200:
+            gen_data = poll_resp.json().get("generations_by_pk", {})
+            status = gen_data.get("status")
+            if status == "COMPLETE":
+                images = gen_data.get("generated_images", [])
+                if images:
+                    image_url = images[0].get("url")
+                    image_id = images[0].get("id")
+                    img_data = requests.get(image_url).content
+                    out_path = os.path.abspath(os.path.join("temp", f"scene_{int(time.time())}_{image_id[:8]}.png"))
+                    with open(out_path, "wb") as f:
+                        f.write(img_data)
+                    # Leonardo also tops out below the delivery frame, so it gets
+                    # the same controlled upscale as the other providers.
+                    image_providers.upscale_to_delivery(out_path)
+                    return out_path, image_id
+                raise RuntimeError("Leonardo generation completed but returned no images.")
+            elif status == "FAILED":
+                raise RuntimeError("Leonardo generation reported status FAILED.")
+    raise RuntimeError("Leonardo image generation timed out while polling for completion.")
 
 def generate_leonardo_motion(image_id: str, prompt: str):
     if not LEONARDO_API_KEY or not image_id:
@@ -593,83 +679,33 @@ def generate_leonardo_motion(image_id: str, prompt: str):
         "model": "MOTION2",
         "isPublic": False
     }
-    try:
-        response = requests.post(url, json=payload, headers=headers, timeout=20)
-        if response.status_code == 200:
-            generation_id = response.json().get("motionGenerationJob", {}).get("generationId")
-            poll_url = f"https://cloud.leonardo.ai/api/rest/v1/generations/{generation_id}"
-            for _ in range(45):
-                time.sleep(4)
-                poll_resp = requests.get(poll_url, headers=headers, timeout=10)
-                if poll_resp.status_code == 200:
-                    gen_data = poll_resp.json().get("generations_by_pk", {})
-                    if gen_data.get("status") == "COMPLETE":
-                        videos = gen_data.get("generated_images", [])
-                        if videos:
-                            video_url = videos[0].get("url")
-                            vid_data = requests.get(video_url).content
-                            out_path = os.path.abspath(os.path.join("temp", f"motion_{int(time.time())}.mp4"))
-                            with open(out_path, "wb") as f:
-                                f.write(vid_data)
-                            return out_path
-                    elif gen_data.get("status") == "FAILED":
-                        break
-    except Exception as e:
-        print(f"Motion error: {e}")
-    return None
+    response = requests.post(url, json=payload, headers=headers, timeout=20)
+    if response.status_code != 200:
+        raise RuntimeError(f"Leonardo motion API HTTP {response.status_code}: {response.text[:300]}")
+    generation_id = response.json().get("motionGenerationJob", {}).get("generationId")
+    if not generation_id:
+        raise RuntimeError(f"Leonardo motion API returned no generationId: {response.text[:300]}")
+    poll_url = f"https://cloud.leonardo.ai/api/rest/v1/generations/{generation_id}"
+    for _ in range(45):
+        time.sleep(4)
+        poll_resp = requests.get(poll_url, headers=headers, timeout=10)
+        if poll_resp.status_code == 200:
+            gen_data = poll_resp.json().get("generations_by_pk", {})
+            status = gen_data.get("status")
+            if status == "COMPLETE":
+                videos = gen_data.get("generated_images", [])
+                if videos:
+                    video_url = videos[0].get("url")
+                    vid_data = requests.get(video_url).content
+                    out_path = os.path.abspath(os.path.join("temp", f"motion_{int(time.time())}.mp4"))
+                    with open(out_path, "wb") as f:
+                        f.write(vid_data)
+                    return out_path
+                raise RuntimeError("Leonardo motion completed but returned no video.")
+            elif status == "FAILED":
+                raise RuntimeError("Leonardo motion reported status FAILED.")
+    raise RuntimeError("Leonardo motion generation timed out while polling.")
 
-def composite_videos(b_roll_path, presenter_path, layout, output_path):
-    if not os.path.exists(presenter_path):
-        return False, "Presenter video not found."
-    if not b_roll_path or not os.path.exists(b_roll_path):
-        return False, "B-Roll video not found."
-
-    w, h = get_video_dimensions(presenter_path)
-    half_h = h // 2
-    pip_w = w // 3
-    if pip_w % 2 != 0:
-        pip_w += 1
-    pip_h = int(h * (pip_w / w))
-    if pip_h % 2 != 0:
-        pip_h += 1
-
-    if layout == "Split-Screen (Top B-Roll, Bottom Presenter)":
-        filter_complex = (
-            f"[0:v]scale={w}:{half_h}:force_original_aspect_ratio=increase,crop={w}:{half_h}[top]; "
-            f"[1:v]scale={w}:{half_h}:force_original_aspect_ratio=increase,crop={w}:{half_h}[bottom]; "
-            f"[top][bottom]vstack=inputs=2[v]"
-        )
-    elif layout == "Picture-in-Picture (Presenter Bottom Right)":
-        filter_complex = (
-            f"[0:v]scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h}[bg]; "
-            f"[1:v]scale={pip_w}:{pip_h}:force_original_aspect_ratio=increase,crop={pip_w}:{pip_h}[fg]; "
-            f"[bg][fg]overlay=main_w-overlay_w-20:main_h-overlay_h-20[v]"
-        )
-    elif layout == "Green Screen (Chroma Key Presenter on B-Roll)":
-        filter_complex = (
-            f"[0:v]scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h}[bg]; "
-            f"[1:v]chromakey=0x00FF00:0.15:0.2[fg_keyed]; "
-            f"[bg][fg_keyed]overlay=x=0:y=0[v]"
-        )
-    else:
-        ffmpeg_cmd = ["ffmpeg", "-y", "-i", presenter_path, "-c:v", "copy", "-c:a", "copy", output_path]
-        res = subprocess.run(ffmpeg_cmd, capture_output=True, text=True)
-        return (res.returncode == 0), "Copy presenter only"
-
-    audio_map = ["-map", "1:a"] if has_audio_stream(presenter_path) else []
-    ffmpeg_cmd = [
-        "ffmpeg", "-y", "-stream_loop", "-1", "-i", b_roll_path, "-i", presenter_path,
-        "-filter_complex", filter_complex, "-map", "[v]"
-    ] + audio_map + [
-        "-shortest", "-c:v", "libx264", "-pix_fmt", "yuv420p", output_path
-    ]
-    try:
-        res = subprocess.run(ffmpeg_cmd, capture_output=True, text=True)
-        return (res.returncode == 0), res.stderr or res.stdout
-    except Exception as e:
-        return False, str(e)
-
-# REST API Types
 class ScriptRequest(BaseModel):
     prompt: str
     model: str
@@ -682,29 +718,38 @@ class SpeechRequest(BaseModel):
     speed: float = 1.0
     effect: str = "Normal"
 
-class PresenterRequest(BaseModel):
-    prompt: str
-    model: str
-    aspect_ratio: str = "9:16"
 
-class LipsyncRequest(BaseModel):
-    image_path: str
-    audio_path: str
-    quality: str = "Enhanced"
-    wav2lip_version: str = "Wav2Lip_GAN"
-    nosmooth: bool = True
-    padding_u: int = 0
-    padding_d: int = 10
-    padding_l: int = 0
-    padding_r: int = 0
-    b_roll_url: Optional[str] = None
-    layout: str = "None (Presenter Only)"
+class QualityOptions(BaseModel):
+    """Render-quality and retention knobs shared by every render endpoint.
 
-class ShortRequest(BaseModel):
+    Kept in one place so the one-shot pipeline and the storyboard re-render
+    cannot drift apart and produce visibly different files from the same
+    storyboard.
+    """
+    quality: str = vq.DEFAULT_QUALITY
+    motion_style: str = "Dynamic"      # Dynamic | Subtle | Off
+    progress_bar: bool = True
+    normalize_audio: bool = True
+    duck_music: bool = True
+    enable_thumbnail: bool = True
+    visual_source_mode: str = "Smart Mix"   # Smart Mix | Real Footage Only | AI Only
+    subscribe_overlay: bool = True
+    channel_handle: str = ""
+
+
+def quality_kwargs(req: BaseModel) -> dict:
+    """Extract the QualityOptions fields from a request for the pipeline call."""
+    return {name: getattr(req, name)
+            for name in QualityOptions.model_fields
+            if hasattr(req, name)}
+
+
+class ShortRequest(QualityOptions):
     prompt: str
     model: str
     hook_style: str = "None (Direct Prompt)"
-    visual_mode: str = "Cinematic Slideshow"  # Cinematic Slideshow or Leonardo Motion Video
+    visual_mode: str = "Cinematic Slideshow"  # Cinematic Slideshow, Leonardo Motion Video, or Hailuo Animated Video
+    art_style: str = "Photorealistic"  # Photorealistic or Stickman Animation
     leonardo_model: str = "Lucid Realism (High Quality Face)"
     voice: str = "Sarah (Female - US - Soft)"
     speed: float = 1.0
@@ -716,7 +761,7 @@ class ShortRequest(BaseModel):
     caption_margin_v: int = 150
     caption_color: str = "&H00FFFF&"
     enable_search: bool = False
-    enable_transition_sfx: bool = True
+    enable_transition_sfx: bool = False   # off by default: the stock whoosh reads as noise, not a transition
 
 class UploadRequest(BaseModel):
     video_path: str
@@ -762,7 +807,19 @@ def get_config():
         "music_presets": ["None", "Procedural Ambient"] + list(MUSIC_PRESETS.keys()),
         "satisfying_presets": ["None"] + list(SATISFYING_PRESETS.keys()),
         "viral_hooks": list(VIRAL_HOOKS.keys()),
-        "ollama_models": ollama_models
+        "ollama_models": ollama_models,
+        "art_styles": list(ART_STYLE_PRESETS.keys()),
+        "visual_modes": ["Cinematic Slideshow", "Leonardo Motion Video", "Hailuo Animated Video"],
+        "quality_presets": list(vq.QUALITY_PRESETS.keys()),
+        "default_quality": vq.DEFAULT_QUALITY,
+        "motion_styles": ["Dynamic", "Subtle", "Off"],
+        "visual_source_modes": list(VISUAL_SOURCE_MODES),
+        "stock_available": bool(stock_footage.get_api_key()),
+        "delivery": {
+            "fps": vq.FPS,
+            "resolution": f"{vq.SHORT_W}x{vq.SHORT_H}",
+            "target_lufs": vq.TARGET_LUFS,
+        },
     }
 
 @app.post("/api/generate-script")
@@ -779,74 +836,31 @@ def api_generate_speech(req: SpeechRequest):
     rel_path = os.path.relpath(path, os.path.abspath(os.path.curdir))
     return {"path": path, "url": f"http://localhost:8000/{rel_path.replace(os.path.sep, '/')}"}
 
-@app.post("/api/generate-presenter")
-def api_generate_presenter(req: PresenterRequest):
-    path, image_id = generate_leonardo_image(req.prompt, req.model, req.aspect_ratio)
-    if not path:
-        raise HTTPException(status_code=500, detail="Image generation failed.")
-    
-    rel_path = os.path.relpath(path, os.path.abspath(os.path.curdir))
-    return {"path": path, "url": f"http://localhost:8000/{rel_path.replace(os.path.sep, '/')}", "image_id": image_id}
+#: How each scene's visuals are sourced.
+VISUAL_SOURCE_MODES = ("Smart Mix", "Real Footage Only", "AI Only")
 
-@app.post("/api/run-lipsync")
-def api_run_lipsync(req: LipsyncRequest):
-    if not req.image_path or not os.path.exists(req.image_path):
-        raise HTTPException(status_code=400, detail="Presenter image path not found.")
-    if not req.audio_path or not os.path.exists(req.audio_path):
-        raise HTTPException(status_code=400, detail="Audio file path not found.")
-        
-    try:
-        b_roll_path = None
-        if req.b_roll_url:
-            b_roll_path = download_file(req.b_roll_url, "temp", "broll")
 
-        info = sf.info(req.audio_path)
-        duration = info.duration
-        
-        temp_video = os.path.abspath(os.path.join("temp", f"looped_input_{int(time.time())}.mp4"))
-        ffmpeg_cmd = [
-            "ffmpeg", "-y", "-loop", "1", "-i", req.image_path, "-t", str(duration), "-r", "25",
-            "-c:v", "libx264", "-pix_fmt", "yuv420p", "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2", temp_video
-        ]
-        subprocess.run(ffmpeg_cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        
-        # Write config for Easy-Wav2Lip
-        config = configparser.ConfigParser()
-        config['OPTIONS'] = {
-            'video_file': temp_video,
-            'vocal_file': req.audio_path,
-            'quality': req.quality,
-            'output_height': 'full resolution',
-            'wav2lip_version': req.wav2lip_version,
-            'use_previous_tracking_data': 'True',
-            'nosmooth': str(req.nosmooth),
-            'preview_window': 'Full'
-        }
-        config['PADDING'] = {'u': str(req.padding_u), 'd': str(req.padding_d), 'l': str(req.padding_l), 'r': str(req.padding_r)}
-        config['MASK'] = {'size': '2.5', 'feathering': '2', 'mouth_tracking': 'False', 'debug_mask': 'False'}
-        config['OTHER'] = {'batch_process': 'False', 'output_suffix': '_Easy-Wav2Lip', 'include_settings_in_suffix': 'False', 'preview_settings': 'False', 'frame_to_preview': '100'}
-        
-        with open(os.path.join("Easy-Wav2Lip", "config.ini"), 'w') as f:
-            config.write(f)
-            
-        final_video_path = os.path.abspath(os.path.join("temp", f"output_{int(time.time())}.mp4"))
-        wav2lip_cmd = [sys.executable, "run.py", "-video_file", temp_video, "-vocal_file", req.audio_path, "-output_file", final_video_path]
-        
-        result = subprocess.run(wav2lip_cmd, cwd="Easy-Wav2Lip", capture_output=True, text=True)
-        if result.returncode != 0:
-            raise HTTPException(status_code=500, detail=f"Lipsync failed: {result.stderr or result.stdout}")
-            
-        out_path = final_video_path
-        if req.layout != "None (Presenter Only)" and b_roll_path:
-            composite_path = os.path.abspath(os.path.join("temp", f"composite_{int(time.time())}.mp4"))
-            success, msg = composite_videos(b_roll_path, final_video_path, req.layout, composite_path)
-            if success:
-                out_path = composite_path
-                
-        rel_path = os.path.relpath(out_path, os.path.abspath(os.path.curdir))
-        return {"path": out_path, "url": f"http://localhost:8000/{rel_path.replace(os.path.sep, '/')}"}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+def use_stock_for_scene(scene: dict, mode: str) -> bool:
+    """Decide whether this scene should be filled with real stock footage.
+
+    ``Smart Mix`` honours the ``visual_source`` tag the storyboarder writes per
+    scene: real footage for anything filmable, generation for shots that cannot
+    exist (inside a black hole, a stick figure, the year 3000). Scenes from
+    older storyboards carry no tag, so they default to stock only when they have
+    an explicit ``stock_query`` -- otherwise nothing about existing saved
+    storyboards changes behaviour.
+    """
+    if mode == "AI Only":
+        return False
+    if mode == "Real Footage Only":
+        return True
+    tag = (scene.get("visual_source") or "").strip().lower()
+    if tag in ("stock", "footage", "real"):
+        return True
+    if tag in ("generate", "generated", "ai"):
+        return False
+    return bool(scene.get("stock_query"))
+
 
 def run_viral_shorts_pipeline_new(
     prompt: str,
@@ -865,14 +879,40 @@ def run_viral_shorts_pipeline_new(
     caption_color: str = "&H00FFFF&",
     enable_search: bool = False,
     caption_style: str = "Viral Pop",
-    enable_transition_sfx: bool = True,
+    enable_transition_sfx: bool = False,
     custom_storyboard: Optional[List[dict]] = None,
-    custom_script_data: Optional[dict] = None
+    custom_script_data: Optional[dict] = None,
+    on_scene_complete=None,
+    log_callback=None,
+    generation_id: Optional[str] = None,
+    caption_sync: bool = True,
+    image_provider: Optional[str] = None,
+    subscribe_overlay: bool = True,
+    channel_handle: str = "",
+    art_style: str = "Photorealistic",
+    quality: str = vq.DEFAULT_QUALITY,
+    motion_style: str = "Dynamic",
+    progress_bar: bool = True,
+    normalize_audio: bool = True,
+    duck_music: bool = True,
+    enable_thumbnail: bool = True,
+    visual_source_mode: str = "Smart Mix"
 ):
     """
     Core automated multi-scene viral shorts pipeline.
     Supports rendering directly from custom storyboards and multi-voice configuration.
+
+    Reliability:
+      * Per-scene asset generation (image, motion, speech) is retried with
+        exponential backoff before the whole render is abandoned.
+      * Scenes that already carry an existing ``image_path`` / ``audio_path`` are
+        reused, so re-running a partially-failed render resumes instead of
+        regenerating everything.
+      * ``on_scene_complete(storyboard)`` is invoked after each scene so callers
+        can persist partial progress (enabling resume on the next attempt).
+      * ``log_callback(msg)`` receives human-readable progress lines.
     """
+    _log = log_callback or print
     # 1. Script
     if custom_script_data:
         script_data = custom_script_data
@@ -881,15 +921,40 @@ def run_viral_shorts_pipeline_new(
         scenes = custom_storyboard
         script_data = {"scenes": scenes}
     else:
-        script_data = generate_ollama_script(prompt, model, hook_style, enable_search=enable_search)
+        script_data = generate_validated_script(prompt, model, hook_style, enable_search=enable_search, log=_log, art_style=art_style)
         scenes = script_data.get("scenes", [])
     
     bg_music_path = download_music_preset(music_style) if music_style != "None" else None
-    
+
+    # Budget guard: refuse the render up-front if it would blow today's ceiling.
+    # Only scenes still needing a fresh image (i.e. not resumed) incur new cost.
+    scenes_needing_image = sum(
+        1 for s in scenes
+        if not (s.get("image_path") and os.path.exists(s.get("image_path", "")))
+    )
+    est_cost = cost_tracker.estimate_render_cost(scenes_needing_image, visual_mode)
+    cost_tracker.assert_within_budget(est_cost)
+
     scene_videos = []
     scene_audios = []
     storyboard = []
-    
+
+    # Shared across every scene in THIS video so the same stock clip is never
+    # shown twice -- overlapping queries ("deep ocean" / "underwater") and the
+    # generic backdrop fallback (which always resolved to one identical clip)
+    # both used to produce repeated footage inside a single short.
+    used_clip_ids = set()
+    # Stable per-generation, so a re-render of the same video reproduces its
+    # footage, while a *different* video on the same topic picks differently
+    # instead of recycling identical clips.
+    # hashlib, not hash(): Python randomises string hashing per process
+    # (PYTHONHASHSEED), so hash() would pick different footage on every restart
+    # and the "same generation reproduces its footage" property would be a lie.
+    variety_seed = (
+        int(hashlib.sha256(generation_id.encode()).hexdigest()[:8], 16)
+        if generation_id else None
+    )
+
     for idx, scene in enumerate(scenes):
         sc_text = scene["narration"]
         sc_visual_prompt = scene["visual_prompt"]
@@ -897,13 +962,8 @@ def run_viral_shorts_pipeline_new(
         # Combine scene prompt with global visual style and subject if present
         global_style = script_data.get("global_visual_style", "") if script_data else ""
         global_subject = script_data.get("global_subject_focus", "") if script_data else ""
-        combined_prompt_parts = []
-        if global_subject:
-            combined_prompt_parts.append(global_subject)
-        combined_prompt_parts.append(sc_visual_prompt)
-        if global_style:
-            combined_prompt_parts.append(global_style)
-        final_visual_prompt = ", ".join(combined_prompt_parts)
+        final_visual_prompt = script_utils.compose_image_prompt(
+            subject=global_subject, scene=sc_visual_prompt, style=global_style)
         
         # Pick speaker voice
         if not custom_storyboard and not custom_script_data:
@@ -912,65 +972,179 @@ def run_viral_shorts_pipeline_new(
             sc_speaker = scene.get("speaker", voice)
             sc_voice_key = map_speaker_to_voice_key(sc_speaker) if isinstance(sc_speaker, str) else voice
         
-        # Synthesize voice if audio doesn't exist
+        # Synthesize voice if audio doesn't exist (resume: reuse existing audio)
         sc_audio = scene.get("audio_path")
         if not sc_audio or not os.path.exists(sc_audio):
-            sc_audio, err = generate_speech_audio(sc_text, sc_voice_key, speed, "Normal")
-            if not sc_audio:
-                raise Exception(f"Voice synthesis failed at scene {idx+1}: {err}")
-            
+            def _gen_speech():
+                a, err = generate_speech_audio(sc_text, sc_voice_key, speed, "Normal")
+                if not a:
+                    raise RuntimeError(f"voice synthesis returned nothing: {err}")
+                return a
+            sc_audio = retry_call(
+                _gen_speech, attempts=3, base_delay=2.0,
+                label=f"speech scene {idx+1}", logger=_log
+            )
+        else:
+            _log(f"Scene {idx+1}: reusing existing audio (resume).")
+
         info = sf.info(sc_audio)
         sc_duration = info.duration
         scene_audios.append(sc_audio)
-        
-        # Generate Image if not exists
+
+        # Real footage first. A filmed person has no anatomy for a model to get
+        # wrong, and Pexels serves vertical clips at or above delivery size, so
+        # this path also skips the upscale that softens generated stills.
+        sc_clip = scene.get("clip_path")
+        if sc_clip and os.path.exists(sc_clip):
+            _log(f"Scene {idx+1}: reusing existing stock clip (resume).")
+        elif use_stock_for_scene(scene, visual_source_mode):
+            query = scene.get("stock_query") or sc_visual_prompt
+            dest = os.path.abspath(
+                os.path.join("temp", f"scene_stock_{int(time.time() * 1000)}_{idx}.mp4"))
+            sc_clip = stock_footage.fetch_clip(
+                query, dest,
+                global_focus=script_data.get("global_subject_focus", "") if script_data else "",
+                orientation=stock_footage.PORTRAIT,
+                min_height=vq.SHORT_H,
+                used_ids=used_clip_ids,
+                variety_seed=variety_seed,
+                log=_log,
+            )
+            if sc_clip:
+                scene["clip_path"] = sc_clip
+                _log(f"Scene {idx+1}: using real footage for '{query}'.")
+            else:
+                # Every stock fallback missed. Generating is still better than
+                # failing the render.
+                _log(f"Scene {idx+1}: no stock match for '{query}'; generating instead.")
+        else:
+            sc_clip = None
+
+        # Generate Image if not exists (resume: reuse existing image)
         sc_img = scene.get("image_path")
         image_id = scene.get("image_id")
-        if not sc_img or not os.path.exists(sc_img):
-            sc_img, image_id = generate_leonardo_image(final_visual_prompt, leonardo_model, "9:16")
-            if not sc_img:
-                raise Exception(f"Image generation failed at scene {idx+1}")
-            
+        if sc_clip:
+            pass  # Real footage won; no image needed for this scene.
+        elif not sc_img or not os.path.exists(sc_img):
+            # Dispatch to the configured image provider. Each backend raises a
+            # descriptive error on failure, so the real reason reaches the logs.
+            def _dispatch_image(p):
+                prov = image_providers.resolve_provider(image_provider)
+                if prov == "leonardo":
+                    return generate_leonardo_image(p, leonardo_model, "9:16")
+                # Ask for the delivery frame size. Each provider generates at
+                # whatever it can actually do well and upscales from there, so
+                # the Ken Burns stage never has to blow up a tiny frame.
+                return image_providers.generate_image(
+                    prov, p, image_providers.DELIVERY_W, image_providers.DELIVERY_H)
+
+            img_res = retry_call(
+                lambda: _dispatch_image(final_visual_prompt),
+                attempts=3, base_delay=3.0,
+                label=f"image scene {idx+1}", logger=_log
+            )
+            sc_img, image_id = img_res
+            if image_providers.resolve_provider(image_provider) == "leonardo":
+                cost_tracker.record(generation_id, "image")
+        else:
+            _log(f"Scene {idx+1}: reusing existing image (resume).")
+
         scene_video_path = os.path.abspath(os.path.join("temp", f"scene_vid_{int(time.time())}_{idx}.mp4"))
-        
+
         # Make video segment (slideshow with zoompan or motion video)
         motion_vid_path = None
         if visual_mode == "Leonardo Motion Video" and image_id:
-            motion_vid_path = generate_leonardo_motion(image_id, final_visual_prompt)
-            
-        if motion_vid_path:
+            # Motion is best-effort: retry, but fall back to slideshow if it never succeeds.
+            try:
+                motion_vid_path = retry_call(
+                    lambda: generate_leonardo_motion(image_id, final_visual_prompt),
+                    attempts=2, base_delay=4.0,
+                    label=f"motion scene {idx+1}", logger=_log
+                )
+                if motion_vid_path:
+                    cost_tracker.record(generation_id, "motion")
+            except RetryError:
+                _log(f"Scene {idx+1}: motion generation failed; falling back to slideshow.")
+                motion_vid_path = None
+        elif visual_mode == "Hailuo Animated Video":
+            # Animate the scene image (e.g. a stickman frame) into a short clip.
+            # Best-effort: retry, then fall back to slideshow if it never succeeds.
+            try:
+                motion_vid_path = retry_call(
+                    lambda: generate_hailuo_video(final_visual_prompt, first_frame_path=sc_img),
+                    attempts=2, base_delay=5.0,
+                    label=f"hailuo scene {idx+1}", logger=_log
+                )
+                if motion_vid_path:
+                    cost_tracker.record(generation_id, "motion")
+            except RetryError:
+                _log(f"Scene {idx+1}: Hailuo generation failed; falling back to slideshow.")
+                motion_vid_path = None
+
+        source_clip = sc_clip or motion_vid_path
+        if source_clip:
+            # -stream_loop -1 with -t handles both cases: a clip shorter than the
+            # narration loops, a longer one is trimmed. Stock gets the same grade
+            # as generated scenes so a mixed reel reads as one video rather than
+            # two sources stitched together.
+            grade = vq.stock_grade() if sc_clip else ""
             ffmpeg_cmd = [
-                "ffmpeg", "-y", "-fflags", "+genpts", "-stream_loop", "-1", "-i", motion_vid_path, "-t", str(sc_duration),
-                "-vf", "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920",
-                "-r", "25",
-                "-c:v", "libx264", "-pix_fmt", "yuv420p", scene_video_path
-            ]
+                "ffmpeg", "-y", "-fflags", "+genpts", "-stream_loop", "-1",
+                "-i", source_clip, "-t", str(sc_duration),
+                "-vf", (f"scale={vq.SHORT_W}:{vq.SHORT_H}:force_original_aspect_ratio=increase,"
+                        f"crop={vq.SHORT_W}:{vq.SHORT_H},fps={vq.FPS}{grade},setsar=1"),
+            ] + vq.intermediate_encode_args() + [scene_video_path]
         else:
-            # Cinematic Slideshow (Ken Burns zoompan)
+            # Cinematic slideshow. Scene 1 is flagged as the hook so it gets the
+            # harder, faster push that has to earn the first second.
             ffmpeg_cmd = [
-                "ffmpeg", "-y", "-loop", "1", "-i", sc_img, "-t", str(sc_duration), "-r", "25",
-                "-vf", f"scale=1920:3412,zoompan=z='min(zoom+0.001,1.3)':d={int(sc_duration*25)}:x='iw/2-(iw/zoom)/2':y='ih/2-(ih/zoom)/2':s=1080x1920",
-                "-c:v", "libx264", "-pix_fmt", "yuv420p", scene_video_path
-            ]
-            
-        subprocess.run(ffmpeg_cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                "ffmpeg", "-y", "-loop", "1", "-i", sc_img, "-t", str(sc_duration),
+                "-vf", vq.ken_burns_vf(idx, sc_duration, is_hook=(idx == 0),
+                                       motion_style=motion_style),
+            ] + vq.intermediate_encode_args() + [scene_video_path]
+
+        vq.run_ffmpeg(ffmpeg_cmd, label=f"scene {idx+1} video")
         scene_videos.append(scene_video_path)
         
-        img_rel = os.path.relpath(sc_img, os.path.abspath(os.path.curdir))
         aud_rel = os.path.relpath(sc_audio, os.path.abspath(os.path.curdir))
-        storyboard.append({
+        scene_entry = {
             "scene": idx + 1,
             "speaker": sc_speaker,
             "narration": sc_text,
             "visual_prompt": final_visual_prompt,
-            "image_url": f"http://localhost:8000/{img_rel.replace(os.path.sep, '/')}",
-            "image_path": sc_img,
             "image_id": image_id,
             "audio_url": f"http://localhost:8000/{aud_rel.replace(os.path.sep, '/')}",
             "audio_path": sc_audio,
-            "duration": sc_duration
-        })
-        
+            "duration": sc_duration,
+            "visual_source": "stock" if sc_clip else "generated",
+        }
+        # A stock scene has a clip and no still; the editor previews whichever
+        # one exists, so only the populated key is emitted.
+        if sc_clip:
+            clip_rel = os.path.relpath(sc_clip, os.path.abspath(os.path.curdir))
+            scene_entry["clip_path"] = sc_clip
+            scene_entry["clip_url"] = f"http://localhost:8000/{clip_rel.replace(os.path.sep, '/')}"
+        if sc_img:
+            img_rel = os.path.relpath(sc_img, os.path.abspath(os.path.curdir))
+            scene_entry["image_path"] = sc_img
+            scene_entry["image_url"] = f"http://localhost:8000/{img_rel.replace(os.path.sep, '/')}"
+        storyboard.append(scene_entry)
+
+        # Write asset paths back into the source scene so a re-run resumes.
+        if sc_img:
+            scene["image_path"] = sc_img
+        if sc_clip:
+            scene["clip_path"] = sc_clip
+        scene["image_id"] = image_id
+        scene["audio_path"] = sc_audio
+
+        # Persist partial progress so a failed render can resume from here.
+        if on_scene_complete:
+            try:
+                on_scene_complete(list(storyboard))
+            except Exception as cb_err:  # noqa: BLE001 - progress persistence is best-effort
+                _log(f"Scene {idx+1}: progress persistence failed: {cb_err}")
+
     # Concatenate segments
     timestamp = int(time.time())
     merged_video = os.path.abspath(os.path.join("temp", f"merged_video_{timestamp}.mp4"))
@@ -1009,31 +1183,42 @@ def run_viral_shorts_pipeline_new(
             print(f"Error generating procedural music: {e}")
             bg_music_path = None
         
-    # Mix Audio (Speech + BG Music)
+    # Mix Audio (Speech + BG Music). The music is sidechain-ducked under the
+    # narration rather than parked at a fixed level, so it fills the gaps
+    # without ever competing with the voice.
     audio_mixed = os.path.abspath(os.path.join("temp", f"audio_mixed_{timestamp}.wav"))
     if bg_music_path and os.path.exists(bg_music_path):
         ffmpeg_cmd = [
             "ffmpeg", "-y", "-i", merged_audio, "-stream_loop", "-1", "-i", bg_music_path,
-            "-filter_complex", "[1:a]volume=0.15[bgm]; [0:a][bgm]amix=inputs=2:duration=first[a]",
-            "-map", "[a]", "-c:a", "pcm_s16le", audio_mixed
+            "-filter_complex", vq.music_mix_filter(duck=duck_music),
+            "-map", "[aout]", "-c:a", "pcm_s16le", audio_mixed
         ]
-        subprocess.run(ffmpeg_cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        vq.run_ffmpeg(ffmpeg_cmd, label="music mix")
     else:
         shutil.copy(merged_audio, audio_mixed)
-        
+
     # Mix transition SFX into audio_mixed
     transition_times = []
     curr_t = 0.0
     for sc in storyboard[:-1]:
         curr_t += sc["duration"]
         transition_times.append(curr_t)
-        
-    audio_final_mixed = os.path.abspath(os.path.join("temp", f"audio_final_mixed_{timestamp}.wav"))
+
+    audio_sfx_mixed = os.path.abspath(os.path.join("temp", f"audio_sfx_mixed_{timestamp}.wav"))
     if enable_transition_sfx:
-        mix_transition_sfx(audio_mixed, audio_final_mixed, transition_times)
+        mix_transition_sfx(audio_mixed, audio_sfx_mixed, transition_times)
     else:
-        shutil.copy(audio_mixed, audio_final_mixed)
-        
+        shutil.copy(audio_mixed, audio_sfx_mixed)
+
+    # Normalize last, once every element is in the mix. Delivering at -14 LUFS
+    # means YouTube's own normalizer leaves the track alone instead of pushing a
+    # quiet mix up and dragging its noise floor along with it.
+    audio_final_mixed = os.path.abspath(os.path.join("temp", f"audio_final_mixed_{timestamp}.wav"))
+    if normalize_audio:
+        vq.normalize_loudness(audio_sfx_mixed, audio_final_mixed, log=_log)
+    else:
+        shutil.copy(audio_sfx_mixed, audio_final_mixed)
+
     # Composite Video with Satisfying Split-screen (if selected)
     satisfying_path = None
     if satisfying_background != "None":
@@ -1049,37 +1234,88 @@ def run_viral_shorts_pipeline_new(
         ffmpeg_cmd = [
             "ffmpeg", "-y", "-i", merged_video, "-stream_loop", "-1", "-i", satisfying_path,
             "-i", audio_final_mixed, "-filter_complex", filter_complex, "-map", "[v]", "-map", "2:a",
-            "-shortest", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", processed_video
-        ]
-        subprocess.run(ffmpeg_cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            "-shortest",
+        ] + vq.intermediate_encode_args() + vq.audio_encode_args() + [processed_video]
+        vq.run_ffmpeg(ffmpeg_cmd, label="split-screen composite")
     else:
         ffmpeg_cmd = [
             "ffmpeg", "-y", "-i", merged_video, "-i", audio_final_mixed, "-map", "0:v", "-map", "1:a",
-            "-c:v", "copy", "-c:a", "aac", processed_video
-        ]
-        subprocess.run(ffmpeg_cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        
-    # Burn Subtitles
+            "-c:v", "copy",
+        ] + vq.audio_encode_args() + [processed_video]
+        vq.run_ffmpeg(ffmpeg_cmd, label="mux audio")
+
+    # Burn-in pass. Subtitles, the retention progress bar and the SUBSCRIBE CTA
+    # all go on in ONE encode: each used to be its own ffmpeg run, so a finished
+    # video had been through three generations of lossy re-encoding before it
+    # was ever uploaded.
     final_rendered_video = os.path.abspath(os.path.join("outputs", f"viral_reel_{timestamp}.mp4"))
+    total_dur = sum(float(sc.get("duration", 0) or 0) for sc in storyboard)
+    ass_path = None
     if enable_captions:
         ass_path = os.path.abspath(os.path.join("temp", f"subtitles_{timestamp}.ass"))
         align = 2
-        generate_ass_subtitles(
-            storyboard, ass_path, caption_font, caption_size,
-            margin_v=caption_margin_v, alignment=align, highlight_color=caption_color,
-            style_mode=caption_style
-        )
-        
-        # Compile with subtitles
-        sub_filter = f"subtitles='temp/subtitles_{timestamp}.ass'"
+
+        # Prefer Whisper word-level timing (synced to the actual voice); the legacy
+        # length-proportional estimate is the fallback if Whisper is unavailable.
+        captions_written = False
+        if caption_sync:
+            try:
+                from transcribe import transcribe_words
+                import captions as captions_mod
+                words = transcribe_words(merged_audio)
+                if words:
+                    captions_mod.write_ass_from_words(
+                        words, ass_path, font_name=caption_font, font_size=caption_size,
+                        margin_v=caption_margin_v, alignment=align,
+                        highlight_color=caption_color, style_mode=caption_style
+                    )
+                    captions_written = True
+                    _log(f"Captions synced to audio via Whisper ({len(words)} words).")
+            except Exception as cap_err:  # noqa: BLE001 - degrade gracefully
+                _log(f"Whisper caption sync unavailable ({cap_err}); using estimated timing.")
+
+        if not captions_written:
+            generate_ass_subtitles(
+                storyboard, ass_path, caption_font, caption_size,
+                margin_v=caption_margin_v, alignment=align, highlight_color=caption_color,
+                style_mode=caption_style
+            )
+
+    finish_filter = vq.build_finish_filter(
+        subtitles_path=ass_path,
+        total_duration=total_dur,
+        subscribe=subscribe_overlay,
+        channel_handle=channel_handle,
+        progress_bar=progress_bar,
+    )
+
+    if finish_filter:
         ffmpeg_cmd = [
-            "ffmpeg", "-y", "-i", processed_video, "-vf", sub_filter,
-            "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "copy", final_rendered_video
-        ]
-        subprocess.run(ffmpeg_cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            "ffmpeg", "-y", "-i", processed_video, "-vf", finish_filter,
+        ] + vq.video_encode_args(quality) + ["-c:a", "copy", final_rendered_video]
+        vq.run_ffmpeg(ffmpeg_cmd, label="final burn-in")
+        _log(f"Burned in captions/overlays in a single {quality} pass.")
     else:
-        shutil.copy(processed_video, final_rendered_video)
-        
+        # Nothing to draw, but the file still needs the delivery encode
+        # (faststart in particular) rather than a straight copy.
+        ffmpeg_cmd = [
+            "ffmpeg", "-y", "-i", processed_video,
+        ] + vq.video_encode_args(quality) + ["-c:a", "copy", final_rendered_video]
+        vq.run_ffmpeg(ffmpeg_cmd, label="final encode")
+
+    thumbnail_path = None
+    if enable_thumbnail:
+        title = (script_data.get("youtube_metadata", {}) or {}).get("title") \
+            or script_data.get("topic") or prompt
+        thumbnail_path = vq.generate_thumbnail(
+            final_rendered_video, title,
+            os.path.abspath(os.path.join("outputs", f"viral_reel_{timestamp}_thumb.jpg")),
+            log=_log,
+        )
+        if thumbnail_path:
+            _log("Generated a title thumbnail for search and suggested feeds.")
+
+    script_data["thumbnail_path"] = thumbnail_path
     return final_rendered_video, storyboard, script_data.get("topic", prompt), script_data
 
 
@@ -1090,11 +1326,13 @@ class DraftRequest(BaseModel):
     hook_style: str = "None (Direct Prompt)"
     enable_search: bool = False
     voice: Optional[str] = "Sarah (Female - US - Soft)"
+    art_style: str = "Photorealistic"
 
-class RenderRequest(BaseModel):
+class RenderRequest(QualityOptions):
     generation_id: str
     storyboard: List[dict]
     visual_mode: str = "Cinematic Slideshow"
+    image_provider: Optional[str] = None  # 'local' | 'pollinations' | 'leonardo'; None -> env default
     leonardo_model: str = "Lucid Realism (High Quality Face)"
     voice: str = "Sarah (Female - US - Soft)"
     speed: float = 1.0
@@ -1106,7 +1344,7 @@ class RenderRequest(BaseModel):
     caption_margin_v: int = 150
     caption_color: str = "&H00FFFF&"
     caption_style: str = "Viral Pop"  # 'Viral Pop' or 'Standard'
-    enable_transition_sfx: bool = True
+    enable_transition_sfx: bool = False   # off by default: the stock whoosh reads as noise, not a transition
 
 class SingleAssetRegenRequest(BaseModel):
     generation_id: str
@@ -1127,92 +1365,25 @@ class DbUploadRequest(BaseModel):
     instagram_caption: Optional[str] = ""
     scheduled_time: Optional[str] = None
 
-class LongformDraftRequest(BaseModel):
-    prompt: str
-    model: str
-
-class LongformRenderRequest(BaseModel):
-    generation_id: str
-    storyboard: List[dict]
-    pexels_api_key: Optional[str] = None
-    voice: str = "Sarah (Female - US - Soft)"
-    speed: float = 1.0
-    music_style: str = "Cinematic"
-    enable_captions: bool = True
-    caption_font: str = "Arial"
-    caption_size: int = 32
-    caption_margin_v: int = 80
-    caption_color: str = "&H00FFFF&"
-    enable_transition_sfx: bool = True
-
-def run_longform_render_task(generation_id: str, req: LongformRenderRequest, pexels_key: str):
-    try:
-        db_manager.update_video_generation(generation_id, status="rendering")
-        from long_video_pipeline import run_long_video_pipeline
-        final_video, storyboard = run_long_video_pipeline(
-            generation_id=generation_id,
-            storyboard=req.storyboard,
-            pexels_api_key=pexels_key,
-            voice=req.voice,
-            speed=req.speed,
-            music_style=req.music_style,
-            enable_captions=req.enable_captions,
-            caption_font=req.caption_font,
-            caption_size=req.caption_size,
-            caption_margin_v=req.caption_margin_v,
-            caption_color=req.caption_color,
-            enable_transition_sfx=req.enable_transition_sfx
-        )
-        db_manager.update_video_generation(
-            generation_id, storyboard=storyboard, final_video_path=final_video, status="completed"
-        )
-    except Exception as e:
-        print(f"Longform rendering failed: {e}")
-        db_manager.update_video_generation(generation_id, status="failed")
-
-@app.post("/api/longform/draft")
-def api_longform_draft(req: LongformDraftRequest):
-    try:
-        gen_id = str(uuid.uuid4())
-        from long_video_pipeline import generate_longform_script
-        script_data = generate_longform_script(req.prompt, req.model)
-        storyboard = script_data.get("scenes", [])
-        
-        # Save to DB as longform draft
-        db_manager.create_video_generation(
-            gen_id, req.prompt, script_data.get("topic", req.prompt), script_data, storyboard, status="draft"
-        )
-        return {
-            "success": True,
-            "generation_id": gen_id,
-            "topic": script_data.get("topic", req.prompt),
-            "storyboard": storyboard,
-            "youtube_metadata": script_data.get("youtube_metadata"),
-            "instagram_metadata": script_data.get("instagram_metadata")
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.post("/api/longform/render")
-def api_longform_render(req: LongformRenderRequest, background_tasks: BackgroundTasks):
-    pexels_key = req.pexels_api_key or os.getenv("PEXELS_API_KEY")
-    if not pexels_key or not pexels_key.strip():
-        raise HTTPException(status_code=400, detail="Pexels API Key is required. Please set it in your environment or provide it in the request.")
-        
-    background_tasks.add_task(run_longform_render_task, req.generation_id, req, pexels_key)
-    return {"success": True, "generation_id": req.generation_id}
-
 @app.post("/api/draft-script")
 def api_draft_script(req: DraftRequest):
     try:
         gen_id = str(uuid.uuid4())
-        script_data = generate_ollama_script(req.prompt, req.model, req.hook_style, enable_search=req.enable_search)
+        script_data = generate_validated_script(req.prompt, req.model, req.hook_style, enable_search=req.enable_search, art_style=req.art_style)
         scenes = script_data.get("scenes", [])
-        
-        # Build initial storyboard structure
+
+        # Build initial storyboard structure.
+        #
+        # This copies the LLM's scene fields forward rather than listing them:
+        # the previous version hand-picked only narration and visual_prompt, so
+        # `visual_source` and `stock_query` were silently dropped here. The
+        # render then found no stock tags and generated every scene with the
+        # image provider -- which is why drafting through the UI produced
+        # AI-looking video while a hand-tagged storyboard produced real footage.
         storyboard = []
         for idx, scene in enumerate(scenes):
-            storyboard.append({
+            entry = dict(scene)
+            entry.update({
                 "scene": idx + 1,
                 "speaker": req.voice if req.voice else scene.get("speaker", "Sarah"),
                 "narration": scene.get("narration", ""),
@@ -1223,6 +1394,7 @@ def api_draft_script(req: DraftRequest):
                 "audio_path": "",
                 "duration": 0.0
             })
+            storyboard.append(entry)
             
         db_manager.create_video_generation(
             gen_id, req.prompt, script_data.get("topic", req.prompt), script_data, storyboard, status="draft"
@@ -1292,13 +1464,37 @@ def api_regenerate_scene_asset(req: SingleAssetRegenRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 def run_render_task(generation_id: str, req: RenderRequest):
+    # Resume: prefer the storyboard persisted in the DB (it may already carry
+    # asset paths from a previous partial run) over the request payload.
+    storyboard_in = req.storyboard
+    existing = db_manager.get_video_generation(generation_id)
+    if existing and existing.get("storyboard"):
+        persisted = {s.get("scene"): s for s in existing["storyboard"]}
+        for sc in storyboard_in:
+            prev = persisted.get(sc.get("scene"))
+            if prev and not sc.get("image_path"):
+                sc["image_path"] = prev.get("image_path")
+                sc["image_id"] = prev.get("image_id")
+                sc["audio_path"] = prev.get("audio_path")
+
+    # Preserve the global visual anchors (style + recurring subject) saved at
+    # draft time so the chosen art style (e.g. stickman) survives to render.
+    # Rendering from a bare storyboard would otherwise drop global_visual_style.
+    persisted_script = (existing or {}).get("script_data") or {}
+    render_script_data = dict(persisted_script)
+    render_script_data["scenes"] = storyboard_in
+
+    def _persist_progress(sb):
+        db_manager.update_video_generation(generation_id, storyboard=sb)
+
     try:
         db_manager.update_video_generation(generation_id, status="rendering")
-        
+
         final_video, storyboard, topic, script_data = run_viral_shorts_pipeline_new(
             prompt="",
             model="",
             visual_mode=req.visual_mode,
+            image_provider=req.image_provider,
             leonardo_model=req.leonardo_model,
             voice=req.voice,
             speed=req.speed,
@@ -1311,15 +1507,23 @@ def run_render_task(generation_id: str, req: RenderRequest):
             caption_color=req.caption_color,
             caption_style=req.caption_style,
             enable_transition_sfx=req.enable_transition_sfx,
-            custom_storyboard=req.storyboard
+            custom_script_data=render_script_data,
+            on_scene_complete=_persist_progress,
+            generation_id=generation_id,
+            **quality_kwargs(req)
         )
-        
+
         db_manager.update_video_generation(
             generation_id, storyboard=storyboard, final_video_path=final_video, status="completed"
         )
     except Exception as e:
         print(f"Rendering failed: {e}")
         db_manager.update_video_generation(generation_id, status="failed")
+        notify(
+            "Storyboard render failed",
+            f"Render task for generation {generation_id} failed: {e}",
+            context={"generation_id": generation_id, "topic": (existing or {}).get("topic")}
+        )
 
 @app.post("/api/render-storyboard")
 def api_render_storyboard(req: RenderRequest, background_tasks: BackgroundTasks):
@@ -1341,6 +1545,7 @@ def api_generate_short(req: ShortRequest):
             model=req.model,
             hook_style=req.hook_style,
             visual_mode=req.visual_mode,
+            art_style=req.art_style,
             leonardo_model=req.leonardo_model,
             voice=req.voice,
             speed=req.speed,
@@ -1353,7 +1558,9 @@ def api_generate_short(req: ShortRequest):
             caption_color=req.caption_color,
             enable_search=req.enable_search,
             caption_style="Viral Pop",
-            enable_transition_sfx=req.enable_transition_sfx
+            enable_transition_sfx=req.enable_transition_sfx,
+            generation_id=gen_id,
+            **quality_kwargs(req)
         )
         rel_out = os.path.relpath(final_video, os.path.abspath(os.path.curdir))
         
@@ -1364,6 +1571,7 @@ def api_generate_short(req: ShortRequest):
         return {
             "success": True,
             "video_url": f"http://localhost:8000/{rel_out.replace(os.path.sep, '/')}",
+            "thumbnail_url": static_url(script_data.get("thumbnail_path")),
             "storyboard": storyboard,
             "topic": topic,
             "youtube_metadata": script_data.get("youtube_metadata"),
@@ -1388,6 +1596,98 @@ def init_youtube_auth():
 @app.get("/api/instagram/auth-status")
 def get_instagram_auth_status():
     return {"configured": is_instagram_configured()}
+
+@app.get("/api/image-provider/status")
+def get_image_provider_status(provider: Optional[str] = None):
+    """Report readiness for an image provider (the given one, or the env default
+    when omitted). For 'local' it pings the SD server; for 'leonardo' it checks
+    the API key; 'pollinations' is keyless and always available."""
+    provider = image_providers.resolve_provider(provider)
+    max_w, max_h = image_providers.PROVIDER_MAX.get(provider, (0, 0))
+    result = {
+        "provider": provider,
+        "available": True,
+        # What the provider can actually generate, versus the frame we deliver.
+        # Anything below delivery size has to be upscaled, and upscaling cannot
+        # add detail back -- this is the number that decides image sharpness.
+        "max_resolution": f"{max_w}x{max_h}" if max_w else None,
+        "delivery_resolution": f"{image_providers.DELIVERY_W}x{image_providers.DELIVERY_H}",
+        "upscale_factor": round(image_providers.DELIVERY_W / max_w, 2) if max_w else None,
+    }
+    if provider == "local":
+        base = os.getenv("SD_SERVER_URL", "http://localhost:8001").rstrip("/")
+        try:
+            r = requests.get(f"{base}/health", timeout=3)
+            if r.status_code == 200:
+                data = r.json()
+                native = data.get("native") or 1024
+                result.update({"available": True, "model": data.get("model"),
+                               "device": data.get("device"), "loaded": data.get("loaded"),
+                               "native": native})
+                bucket_w, bucket_h = local_sd_bucket(native)
+                result["max_resolution"] = f"{bucket_w}x{bucket_h}"
+                result["upscale_factor"] = round(image_providers.DELIVERY_W / bucket_w, 2)
+            else:
+                result["available"] = False
+        except Exception:
+            result["available"] = False
+    elif provider == "leonardo":
+        result["available"] = bool(LEONARDO_API_KEY)
+    return result
+
+
+def local_sd_bucket(native: int = 1024):
+    """Vertical bucket the local SD server will actually render at."""
+    try:
+        import local_sd
+        return local_sd.best_bucket(image_providers.DELIVERY_W,
+                                    image_providers.DELIVERY_H, native)
+    except Exception:  # noqa: BLE001 - diffusers may not be installed
+        return (768, 1344) if native >= 1024 else (384, 672)
+
+
+@app.get("/api/image-provider/models")
+def get_local_sd_models():
+    """Catalog of free local models, with the tradeoff each one carries.
+
+    Proxied from the SD server when it is up, so the reported "current" model is
+    the one that would actually render, not this process's stale env var.
+    """
+    base = os.getenv("SD_SERVER_URL", "http://localhost:8001").rstrip("/")
+    try:
+        r = requests.get(f"{base}/models", timeout=3)
+        if r.status_code == 200:
+            return r.json()
+    except Exception:  # noqa: BLE001 - fall back to the local catalog
+        pass
+    try:
+        import local_sd
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=503, detail=f"diffusers not installed: {e}")
+    return {
+        "catalog": [{"name": name, **entry} for name, entry in local_sd.MODEL_CATALOG.items()],
+        "current": local_sd.resolve_model(),
+        "server_offline": True,
+    }
+
+
+class SelectImageModelRequest(BaseModel):
+    model: str
+
+
+@app.post("/api/image-provider/models/select")
+def select_local_sd_model(req: SelectImageModelRequest):
+    """Point the local SD server at a different model."""
+    base = os.getenv("SD_SERVER_URL", "http://localhost:8001").rstrip("/")
+    try:
+        r = requests.post(f"{base}/models/select", json={"model": req.model}, timeout=10)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(
+            status_code=503,
+            detail=f"Local SD server unreachable at {base} ({e}). Start it with: python sd_server.py")
+    if r.status_code != 200:
+        raise HTTPException(status_code=r.status_code, detail=r.text[:300])
+    return r.json()
 
 def process_upload_job(job_id: str):
     """Executes upload processes for direct API uploads (persisted in DB)."""
@@ -1424,46 +1724,63 @@ def process_upload_job(job_id: str):
         if not os.path.exists(video_file):
             raise FileNotFoundError(f"Video file not found locally at: {video_file}")
             
+        gen_id = job["video_generation_id"]
+
         if "youtube" in job["platforms"]:
-            log_message("YouTube upload starting...")
-            yt_meta = job.get("youtube_metadata") or {}
-            
-            def yt_progress(pct):
-                if logs and logs[-1].startswith("YouTube upload progress:"):
-                    logs[-1] = f"YouTube upload progress: {pct}%"
-                else:
-                    logs.append(f"YouTube upload progress: {pct}%")
-                db_manager.update_upload_job(job_id, logs=logs)
-                
-            vid_id = upload_video_to_youtube(
-                video_file,
-                yt_meta.get("title", "AI Generated Short"),
-                yt_meta.get("description", ""),
-                yt_meta.get("tags", []),
-                yt_meta.get("privacy", "private"),
-                progress_callback=yt_progress
-            )
-            log_message(f"YouTube upload successful! Video URL: https://youtu.be/{vid_id}")
-            
+            if db_manager.is_platform_uploaded(gen_id, "youtube"):
+                prev = db_manager.get_platform_upload(gen_id, "youtube")
+                log_message(f"YouTube: already published (video id {prev['external_id']}); skipping to avoid duplicate.")
+            else:
+                log_message("YouTube upload starting...")
+                yt_meta = job.get("youtube_metadata") or {}
+
+                def yt_progress(pct):
+                    if logs and logs[-1].startswith("YouTube upload progress:"):
+                        logs[-1] = f"YouTube upload progress: {pct}%"
+                    else:
+                        logs.append(f"YouTube upload progress: {pct}%")
+                    db_manager.update_upload_job(job_id, logs=logs)
+
+                vid_id = upload_video_to_youtube(
+                    video_file,
+                    yt_meta.get("title", "AI Generated Short"),
+                    yt_meta.get("description", ""),
+                    yt_meta.get("tags", []),
+                    yt_meta.get("privacy", "private"),
+                    progress_callback=yt_progress
+                )
+                db_manager.record_platform_upload(gen_id, "youtube", vid_id)
+                log_message(f"YouTube upload successful! Video URL: https://youtu.be/{vid_id}")
+
         if "instagram" in job["platforms"]:
-            log_message("Instagram Reels upload starting...")
-            ig_meta = job.get("instagram_metadata") or {}
-            
-            def ig_progress(msg):
-                log_message(msg)
-                
-            media_id = upload_reel_to_instagram(
-                video_file,
-                ig_meta.get("caption", ""),
-                progress_callback=ig_progress
-            )
-            log_message(f"Instagram upload successful! Media ID: {media_id}")
-            
+            if db_manager.is_platform_uploaded(gen_id, "instagram"):
+                prev = db_manager.get_platform_upload(gen_id, "instagram")
+                log_message(f"Instagram: already published (media id {prev['external_id']}); skipping to avoid duplicate.")
+            else:
+                log_message("Instagram Reels upload starting...")
+                ig_meta = job.get("instagram_metadata") or {}
+
+                def ig_progress(msg):
+                    log_message(msg)
+
+                media_id = upload_reel_to_instagram(
+                    video_file,
+                    ig_meta.get("caption", ""),
+                    progress_callback=ig_progress
+                )
+                db_manager.record_platform_upload(gen_id, "instagram", media_id)
+                log_message(f"Instagram upload successful! Media ID: {media_id}")
+
         log_message("Upload process complete!")
         db_manager.update_upload_job(job_id, status="completed", logs=logs)
     except Exception as e:
         log_message(f"Upload failed: {str(e)}")
         db_manager.update_upload_job(job_id, status="failed", logs=logs)
+        notify(
+            "Upload job failed",
+            f"Upload job {job_id} failed: {e}",
+            context={"job_id": job_id, "platforms": job.get("platforms")}
+        )
 
 def upload_scheduler_loop():
     """Background polling thread for scheduled uploads."""
@@ -1561,6 +1878,118 @@ def api_get_history():
 def api_get_upload_queue():
     return db_manager.list_upload_jobs()
 
+# --- Approval gate ---
+@app.get("/api/uploads/pending")
+def api_get_pending_approvals():
+    """Generations held for human review before publishing."""
+    return db_manager.get_upload_jobs_by_status("pending_approval")
+
+@app.post("/api/uploads/{job_id}/approve")
+def api_approve_upload(job_id: str):
+    job = db_manager.get_upload_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Upload job not found")
+    if job["status"] != "pending_approval":
+        raise HTTPException(status_code=400, detail=f"Job is not pending approval (status: {job['status']})")
+    # Flip to 'scheduled' with a past time so the upload loop picks it up promptly.
+    db_manager.update_upload_job(
+        job_id, status="scheduled",
+        logs=job.get("logs", []) + ["Approved by user; queued for publishing."]
+    )
+    return {"success": True, "job_id": job_id, "status": "scheduled"}
+
+@app.post("/api/uploads/{job_id}/reject")
+def api_reject_upload(job_id: str):
+    job = db_manager.get_upload_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Upload job not found")
+    db_manager.update_upload_job(
+        job_id, status="rejected",
+        logs=job.get("logs", []) + ["Rejected by user; will not be published."]
+    )
+    return {"success": True, "job_id": job_id, "status": "rejected"}
+
+# --- Analytics feedback loop ---
+@app.post("/api/analytics/refresh-youtube")
+def api_refresh_youtube_analytics():
+    from analytics import refresh_youtube_stats, refresh_youtube_analytics
+
+    def _is_scope_error(msg):
+        return "insufficient" in msg.lower() or "scope" in msg.lower() or "not authorized" in msg.lower()
+
+    # Each path needs read scopes the original upload-only token lacks; guard both
+    # independently so a missing grant returns a clear re-auth hint, not a 500.
+    stats_updated, retention_updated = 0, 0
+    errors = {}
+    try:
+        stats_updated = refresh_youtube_stats().get("updated", 0)
+    except Exception as e:
+        errors["stats_error"] = str(e)
+    try:
+        retention_updated = refresh_youtube_analytics().get("updated", 0)
+    except Exception as e:
+        errors["retention_error"] = str(e)
+
+    needs_reauth = any(_is_scope_error(m) for m in errors.values())
+    return {
+        "success": not errors,
+        "stats_updated": stats_updated,
+        "retention_updated": retention_updated,
+        **errors,
+        "needs_reauth": needs_reauth,
+        "hint": ("Re-authenticate YouTube to grant read access (youtube.readonly + "
+                 "yt-analytics.readonly), then retry.") if needs_reauth else None,
+    }
+
+@app.get("/api/analytics/top")
+def api_get_top_performing(limit: int = 5):
+    return db_manager.get_top_performing(limit=limit)
+
+@app.get("/api/analytics/retention-leaders")
+def api_get_retention_leaders(limit: int = 5):
+    return db_manager.get_engagement_leaders(limit=limit)
+
+@app.get("/api/competitor-signals")
+def api_competitor_signals(query: str, max_results: int = 10, refresh: bool = True):
+    """Mine YouTube for what's hot in a niche *right now*, ranked by view velocity.
+
+    Returns the hottest videos plus an LLM-ready hint about winning patterns.
+    Needs the youtube.readonly scope (same re-auth as the analytics loop).
+    """
+    if not query or not query.strip():
+        raise HTTPException(status_code=400, detail="query is required")
+    query = query.strip()
+
+    import competitor_research
+    error = None
+    if refresh:
+        try:
+            competitor_research.store_competitor_videos(query, max_results=max_results)
+        except Exception as e:
+            error = str(e)
+
+    videos = db_manager.get_top_velocity(query, limit=max_results)
+    needs_reauth = bool(error) and ("insufficient" in error.lower() or "scope" in error.lower() or "not authorized" in error.lower())
+    return {
+        "query": query,
+        "videos": videos,
+        "hint": competitor_research.get_competitor_hint(query, limit=max_results),
+        "error": error,
+        "needs_reauth": needs_reauth,
+    }
+
+# --- Cost tracking ---
+@app.get("/api/costs/today")
+def api_get_costs_today():
+    budget = cost_tracker.get_daily_budget()
+    spent = db_manager.get_spend_today("leonardo")
+    return {
+        "service": "leonardo",
+        "spent_today": spent,
+        "daily_budget": budget,
+        "remaining": (budget - spent) if budget is not None else None,
+    }
+
 @app.post("/api/schedule-upload")
 def api_schedule_upload(req: DbUploadRequest):
     job_id = str(uuid.uuid4())
@@ -1590,19 +2019,36 @@ def api_schedule_upload(req: DbUploadRequest):
         
     return {"success": True, "job_id": job_id}
 
+def static_url(path: Optional[str]) -> str:
+    """Turn an on-disk render artifact into a URL the frontend can load."""
+    if not path or not os.path.exists(path):
+        return ""
+    rel = os.path.relpath(path, os.path.abspath(os.path.curdir))
+    return f"http://localhost:8000/{rel.replace(os.path.sep, '/')}"
+
+
+def thumbnail_url_for(video_path: Optional[str]) -> str:
+    """URL of the thumbnail both pipelines write beside the finished video.
+
+    Deriving it from the video path keeps the thumbnail available for older
+    generations too, without a database migration to store the extra column.
+    """
+    if not video_path:
+        return ""
+    return static_url(f"{os.path.splitext(video_path)[0]}_thumb.jpg")
+
+
 @app.get("/api/generation-status/{generation_id}")
 def api_generation_status(generation_id: str):
     gen = db_manager.get_video_generation(generation_id)
     if not gen:
         raise HTTPException(status_code=404, detail="Generation not found")
-        
-    rel_path = ""
-    if gen.get("final_video_path"):
-        rel_path = os.path.relpath(gen["final_video_path"], os.path.abspath(os.path.curdir))
-        
+
+    video_path = gen.get("final_video_path")
     return {
         "status": gen["status"],
-        "video_url": f"http://localhost:8000/{rel_path.replace(os.path.sep, '/')}" if rel_path else "",
+        "video_url": static_url(video_path),
+        "thumbnail_url": thumbnail_url_for(video_path),
         "storyboard": gen["storyboard"],
         "youtube_metadata": gen.get("script_data", {}).get("youtube_metadata") if gen.get("script_data") else None,
         "instagram_metadata": gen.get("script_data", {}).get("instagram_metadata") if gen.get("script_data") else None,
@@ -1729,6 +2175,52 @@ def get_trends(geo: str = "IN"):
         raise HTTPException(status_code=500, detail=f"Error parsing Google Trends feed: {str(e)}")
 
 
+@app.get("/api/recommend-topics")
+def recommend_topics(geo: str = "US", count: int = 5, model: str = "minimax-m3:cloud"):
+    """Recommend ready-to-use, revenue-optimized viral topics for a high-RPM market.
+
+    Pulls live trends for ``geo``, then ranks them with the LLM, biasing toward
+    high-CPM niches and avoiding recently-used topics. Returns a JSON array of
+    {title, rationale, niche, rpm_tier, est_rpm, geo}.
+    """
+    # Lazy import: viral_agent imports from backend at module load (circular).
+    from viral_agent import fetch_google_trends, recommend_viral_topics, ALLOWED_RPM_GEOS
+
+    geo = (geo or "US").upper()
+    if geo not in ALLOWED_RPM_GEOS:
+        geo = "US"
+    count = max(1, min(count, 8))
+
+    try:
+        trends = fetch_google_trends(geo)
+        if not trends:
+            raise HTTPException(status_code=502, detail=f"No trends available for {geo} right now. Try again shortly.")
+
+        performance_hint = ""
+        exclude_topics = None
+        try:
+            import analytics
+            performance_hint = analytics.get_performance_hint()
+        except Exception as e:
+            print(f"recommend_topics: performance hint unavailable: {e}")
+        try:
+            exclude_topics = db_manager.get_recent_topics(40)
+        except Exception as e:
+            print(f"recommend_topics: recent topics unavailable: {e}")
+
+        recs = recommend_viral_topics(
+            trends, model, count=count,
+            performance_hint=performance_hint,
+            exclude_topics=exclude_topics,
+            high_cpm_bias=True, geo=geo,
+        )
+        return recs
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error recommending topics: {str(e)}")
+
+
 # Scheduler Config & Logs API
 class SchedulerConfigUpdate(BaseModel):
     enabled: bool
@@ -1745,6 +2237,15 @@ class SchedulerConfigUpdate(BaseModel):
     caption_margin_v: int
     caption_color: str
     caption_style: str
+    topic_source: str = "trends"
+    curiosity_category: str = "All"
+
+@app.get("/api/curiosity-topics")
+def get_curiosity_topics():
+    """Serve the curated curiosity-topic library (single source of truth shared
+    with the auto-agent scheduler) plus the list of categories."""
+    from curiosity_topics import CURIOSITY_TOPICS, get_categories
+    return {"topics": CURIOSITY_TOPICS, "categories": get_categories()}
 
 @app.get("/api/scheduler/config")
 def get_scheduler_config():

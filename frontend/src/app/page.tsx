@@ -2,9 +2,9 @@
 
 import React, { useState, useEffect, useRef } from "react";
 import { 
-  Tv, Sparkles, Sliders, Play, Settings, AlertCircle, FileText, CheckCircle2, 
+  Tv, Sparkles, Sliders, Play, Settings, AlertCircle, FileText, CheckCircle2,
   Layers, Volume2, Image as ImageIcon, Music, RefreshCw, Subtitles, HelpCircle,
-  Trash2, Film
+  Trash2, Film, DollarSign, Lightbulb, Shuffle, ArrowRight, Gauge, Download
 } from "lucide-react";
 
 interface StoryboardScene {
@@ -23,6 +23,18 @@ interface BackendConfig {
   satisfying_presets: string[];
   viral_hooks: string[];
   ollama_models: string[];
+  art_styles?: string[];
+  visual_modes?: string[];
+  quality_presets?: string[];
+  visual_source_modes?: string[];
+  stock_available?: boolean;
+  default_quality?: string;
+  motion_styles?: string[];
+  delivery?: {
+    fps: number;
+    resolution: string;
+    target_lufs: number;
+  };
 }
 
 const COLOR_PRESETS = [
@@ -35,8 +47,69 @@ const COLOR_PRESETS = [
   { name: "White", ass: "&HFFFFFF&", hex: "#FFFFFF" },
 ];
 
+// Evergreen "curiosity-gap" topics — the kind that reliably trend on YouTube
+// Shorts. Each opens a loop the viewer feels compelled to close. One click
+// loads it into the script drafter below.
+interface CuriosityTopic {
+  category: string;
+  emoji: string;
+  title: string;
+  hook: string;
+}
+
+const CURIOSITY_TOPICS: CuriosityTopic[] = [
+  // Space & Cosmos
+  { category: "Space", emoji: "🌌", title: "What's really inside a black hole", hook: "Nothing that falls in ever comes back — and time itself breaks down." },
+  { category: "Space", emoji: "🌌", title: "The hidden ocean beneath Jupiter's moon Europa", hook: "More water than all of Earth's oceans, sealed under miles of ice." },
+  { category: "Space", emoji: "🌌", title: "What you'd see at the edge of the universe", hook: "Spoiler: there may be no edge at all." },
+  { category: "Space", emoji: "🌌", title: "The star so big it makes the Sun look invisible", hook: "UY Scuti could swallow billions of Suns whole." },
+  { category: "Space", emoji: "🌌", title: "Why the Moon is slowly escaping Earth", hook: "It drifts 3.8 cm farther away every single year." },
+
+  // Deep Ocean
+  { category: "Deep Ocean", emoji: "🌊", title: "The creatures at the bottom of the Mariana Trench", hook: "Life thrives seven miles down, where sunlight has never reached." },
+  { category: "Deep Ocean", emoji: "🌊", title: "What's hiding in the ocean's midnight zone", hook: "95% of the ocean has never been seen by human eyes." },
+  { category: "Deep Ocean", emoji: "🌊", title: "The underwater waterfall you can actually see", hook: "Mauritius hides an optical illusion of an ocean falling off a cliff." },
+  { category: "Deep Ocean", emoji: "🌊", title: "Why we've mapped Mars better than our own seafloor", hook: "We know the red planet's surface in sharper detail than Earth's." },
+
+  // Unsolved Mysteries
+  { category: "Mysteries", emoji: "🕵️", title: "The ships that vanished in the Bermuda Triangle", hook: "Decades of disappearances — and not a single wreck ever found." },
+  { category: "Mysteries", emoji: "🕵️", title: "The radio signal from space we still can't explain", hook: "The 'Wow!' signal lasted 72 seconds and never repeated." },
+  { category: "Mysteries", emoji: "🕵️", title: "The ancient computer 2,000 years ahead of its time", hook: "The Antikythera mechanism predicted eclipses before clocks existed." },
+  { category: "Mysteries", emoji: "🕵️", title: "The lost city that might actually be Atlantis", hook: "Real ruins keep dragging the legend back to life." },
+
+  // Human Body & Mind
+  { category: "Body & Mind", emoji: "🧠", title: "What happens in the seconds after you die", hook: "The brain may stay active far longer than anyone believed." },
+  { category: "Body & Mind", emoji: "🧠", title: "Why you forget your dreams within minutes", hook: "Your brain is wired to erase them on purpose." },
+  { category: "Body & Mind", emoji: "🧠", title: "The organ scientists only just discovered inside you", hook: "Hiding in plain sight for centuries until 2018." },
+  { category: "Body & Mind", emoji: "🧠", title: "Why you can't tickle yourself", hook: "Your brain cancels the sensation before it even happens." },
+
+  // Ancient World
+  { category: "Ancient World", emoji: "🏛️", title: "How the pyramids were really built", hook: "New evidence overturns almost everything you were taught." },
+  { category: "Ancient World", emoji: "🏛️", title: "The Roman concrete that heals its own cracks", hook: "Stronger after 2,000 years than the cement we pour today." },
+  { category: "Ancient World", emoji: "🏛️", title: "The 12,000-year-old temple that rewrites history", hook: "Göbekli Tepe was built before farming was even invented." },
+  { category: "Ancient World", emoji: "🏛️", title: "The library that held all of humanity's knowledge", hook: "And the fire that erased it from history forever." },
+
+  // What If
+  { category: "What If", emoji: "⚡", title: "What if the Earth stopped spinning for 5 seconds", hook: "The consequences would be catastrophic and instant." },
+  { category: "What If", emoji: "⚡", title: "What if you fell into a hole through the Earth", hook: "Physics gives a far stranger answer than you'd expect." },
+  { category: "What If", emoji: "⚡", title: "What if the Sun disappeared right now", hook: "You wouldn't even notice for eight whole minutes." },
+  { category: "What If", emoji: "⚡", title: "What if every human jumped at the exact same time", hook: "The Earth barely flinches — here's the math." },
+
+  // Hidden Micro World
+  { category: "Micro World", emoji: "🔬", title: "The animal that can survive in outer space", hook: "Tardigrades are basically impossible to kill." },
+  { category: "Micro World", emoji: "🔬", title: "How many bacteria are living on your phone", hook: "More than you'd find on a public toilet seat." },
+  { category: "Micro World", emoji: "🔬", title: "What a single drop of pond water really contains", hook: "An entire alien-looking universe you can't see." },
+
+  // Future & Tech
+  { category: "Future & Tech", emoji: "🤖", title: "The AI that taught itself to do the impossible", hook: "And the researchers still can't fully explain how." },
+  { category: "Future & Tech", emoji: "🤖", title: "Why scientists want to bring back the woolly mammoth", hook: "De-extinction is far closer than you think." },
+  { category: "Future & Tech", emoji: "🤖", title: "The material thinner than paper, stronger than steel", hook: "Graphene could quietly rebuild the entire world." },
+];
+
+const CURIOSITY_CATEGORIES = ["All", ...Array.from(new Set(CURIOSITY_TOPICS.map((t) => t.category)))];
+
 export default function Home() {
-  const [activeTab, setActiveTab] = useState<"viral" | "full" | "manual" | "library" | "queue" | "scheduler" | "longform">("viral");
+  const [activeTab, setActiveTab] = useState<"viral" | "library" | "queue" | "scheduler">("viral");
   const [config, setConfig] = useState<BackendConfig | null>(null);
   const [backendError, setBackendError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
@@ -63,6 +136,7 @@ export default function Home() {
 
   // Auto Agent Scheduler states
   const [schedulerConfig, setSchedulerConfig] = useState<any>(null);
+  const [curiosityCatOptions, setCuriosityCatOptions] = useState<string[]>(["All"]);
   const [schedulerLogs, setSchedulerLogs] = useState<any[]>([]);
   const [triggerLoading, setTriggerLoading] = useState(false);
 
@@ -71,29 +145,57 @@ export default function Home() {
   const [viralOllamaModel, setViralOllamaModel] = useState("");
   const [enableSearch, setEnableSearch] = useState(false);
 
+  // Curiosity Topics state (curated evergreen library)
+  const [curiosityCategory, setCuriosityCategory] = useState("All");
+
   // Trending Topics state
   const [trends, setTrends] = useState<any[]>([]);
   const [trendsGeo, setTrendsGeo] = useState("IN");
   const [isFetchingTrends, setIsFetchingTrends] = useState(false);
   const [trendsError, setTrendsError] = useState("");
+
+  // Revenue-optimized topic recommender state
+  const [recommendations, setRecommendations] = useState<any[]>([]);
+  const [recsGeo, setRecsGeo] = useState("US");
+  const [discoverMode, setDiscoverMode] = useState<"trends" | "ideas">("trends");
+  const [isFetchingRecs, setIsFetchingRecs] = useState(false);
+  const [recsError, setRecsError] = useState("");
   const [viralVoice, setViralVoice] = useState("Sarah (Female - US - Soft)");
   const [viralVoiceSpeed, setViralVoiceSpeed] = useState(1.0);
   const [visualMode, setVisualMode] = useState("Cinematic Slideshow");
+  const [artStyle, setArtStyle] = useState("Photorealistic");
   const [viralLeonardoModel, setViralLeonardoModel] = useState("Lucid Realism (High Quality Face)");
   const [musicStyle, setMusicStyle] = useState("Cinematic");
   const [satisfyingBackground, setSatisfyingBackground] = useState("Slime ASMR");
   const [viralHookStyle, setViralHookStyle] = useState("Did You Know? (Fact Hook)");
   const [enableCaptions, setEnableCaptions] = useState(true);
-  const [enableTransitionSfx, setEnableTransitionSfx] = useState(true);
+  const [enableTransitionSfx, setEnableTransitionSfx] = useState(false);
   const [captionFont, setCaptionFont] = useState("Arial");
   const [captionSize, setCaptionSize] = useState(72);
   const [captionMarginV, setCaptionMarginV] = useState(150);
   const [captionColor, setCaptionColor] = useState("&H00FFFF&");
   const [captionStyle, setCaptionStyle] = useState("Viral Pop");
 
+  // Delivery quality & retention settings
+  const [quality, setQuality] = useState("High (recommended)");
+  const [motionStyle, setMotionStyle] = useState("Dynamic");
+  const [visualSourceMode, setVisualSourceMode] = useState("Smart Mix");
+  const [progressBar, setProgressBar] = useState(true);
+  const [normalizeAudio, setNormalizeAudio] = useState(true);
+  const [duckMusic, setDuckMusic] = useState(true);
+  const [enableThumbnail, setEnableThumbnail] = useState(true);
+  const [subscribeOverlay, setSubscribeOverlay] = useState(true);
+  const [channelHandle, setChannelHandle] = useState("");
+  const [thumbnailUrl, setThumbnailUrl] = useState<string | null>(null);
+
   // Social Media Upload States
   const [isYtAuthenticated, setIsYtAuthenticated] = useState(false);
   const [isIgConfigured, setIsIgConfigured] = useState(false);
+  const [imageProviderStatus, setImageProviderStatus] = useState<any>(null);
+  const [sdModels, setSdModels] = useState<any[]>([]);
+  const [sdCurrentModel, setSdCurrentModel] = useState<string>("");
+  const [switchingModel, setSwitchingModel] = useState(false);
+  const [imageProvider, setImageProvider] = useState("");
   const [isCheckingReadiness, setIsCheckingReadiness] = useState(false);
   const [uploadPlatforms, setUploadPlatforms] = useState({ youtube: false, instagram: false });
   const [uploadTitle, setUploadTitle] = useState("");
@@ -184,6 +286,14 @@ export default function Home() {
         const igAuthData = await igAuthRes.json();
         setIsIgConfigured(igAuthData.configured);
       }
+
+      // Fetch active image provider + local SD server status
+      const imgRes = await fetch("http://localhost:8000/api/image-provider/status");
+      if (imgRes.ok) {
+        const data = await imgRes.json();
+        setImageProviderStatus(data);
+        setImageProvider((prev) => prev || data.provider || "pollinations");
+      }
     } catch (err) {
       console.error("Failed to fetch platform readiness status:", err);
     } finally {
@@ -248,6 +358,104 @@ export default function Home() {
     }
   };
 
+  const handleChangeImageProvider = async (provider: string) => {
+    setImageProvider(provider);
+    try {
+      const res = await fetch(`http://localhost:8000/api/image-provider/status?provider=${provider}`);
+      if (res.ok) setImageProviderStatus(await res.json());
+    } catch (err) {
+      console.error("Failed to check image provider status:", err);
+    }
+    // The model choice is the single biggest lever on how realistic the images
+    // look, so load the catalog as soon as the local engine is selected.
+    if (provider === "local") {
+      try {
+        const res = await fetch("http://localhost:8000/api/image-provider/models");
+        if (res.ok) {
+          const data = await res.json();
+          setSdModels(data.catalog || []);
+          setSdCurrentModel(data.current || "");
+        }
+      } catch (err) {
+        console.error("Failed to load local model catalog:", err);
+      }
+    }
+  };
+
+  const handleSelectSdModel = async (model: string) => {
+    setSwitchingModel(true);
+    addLog(`Switching local image model to ${model}...`);
+    try {
+      const res = await fetch("http://localhost:8000/api/image-provider/models/select", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ model })
+      });
+      if (!res.ok) {
+        const detail = await res.json().catch(() => null);
+        throw new Error(detail?.detail || `HTTP ${res.status}`);
+      }
+      const data = await res.json();
+      setSdCurrentModel(data.model);
+      addLog(`Image model set to ${data.model} (${data.steps} steps, guidance ${data.guidance}).`);
+      if (data.download_gb) {
+        addLog(`First render with this model downloads ~${data.download_gb}GB.`);
+      }
+      handleChangeImageProvider("local");
+    } catch (err: any) {
+      addLog(`❌ Could not switch model: ${err.message || err}`);
+    } finally {
+      setSwitchingModel(false);
+    }
+  };
+
+  const handleFetchRecommendations = async () => {
+    setIsFetchingRecs(true);
+    setRecsError("");
+    try {
+      const res = await fetch(`http://localhost:8000/api/recommend-topics?geo=${recsGeo}&count=5`);
+      if (res.ok) {
+        const data = await res.json();
+        setRecommendations(data);
+      } else {
+        const detail = await res.json().catch(() => null);
+        setRecsError(detail?.detail || `HTTP error! status: ${res.status}`);
+      }
+    } catch (e: any) {
+      setRecsError(`Connection failed: ${e.message || e}`);
+    } finally {
+      setIsFetchingRecs(false);
+    }
+  };
+
+  const handleUseRecommendedTopic = (rec: any) => {
+    const parts = [`Write a 15-second viral short about: ${rec.title}.`];
+    if (rec.rationale) parts.push(`Angle: ${rec.rationale}`);
+    if (rec.niche) parts.push(`Niche: ${rec.niche} (high-RPM, ${rec.geo || "US"} audience).`);
+    setViralPrompt(parts.join(" "));
+    setEnableSearch(true);
+    const configSection = document.getElementById("viral-config-card");
+    if (configSection) configSection.scrollIntoView({ behavior: "smooth" });
+  };
+
+  const handleUseCuriosityTopic = (topic: CuriosityTopic) => {
+    setViralPrompt(
+      `Write a 15-second viral short about: ${topic.title}. Curiosity angle: ${topic.hook} Open with an irresistible hook, build tension fast, and end on a mind-blowing payoff.`
+    );
+    setEnableSearch(true);
+    const configSection = document.getElementById("viral-config-card");
+    if (configSection) configSection.scrollIntoView({ behavior: "smooth" });
+  };
+
+  const handleSurpriseCuriosityTopic = () => {
+    const pool =
+      curiosityCategory === "All"
+        ? CURIOSITY_TOPICS
+        : CURIOSITY_TOPICS.filter((t) => t.category === curiosityCategory);
+    if (pool.length === 0) return;
+    handleUseCuriosityTopic(pool[Math.floor(Math.random() * pool.length)]);
+  };
+
   const handleUpdateSceneNarration = (idx: number, val: string) => {
     setStoryboard((prev) => {
       const copy = [...prev];
@@ -277,131 +485,12 @@ export default function Home() {
     localStorage.setItem("PEXELS_API_KEY", val);
   };
 
-  const handleLongformDraft = async () => {
-    setDrafting(true);
-    setLogs([]);
-    setFinalVideoUrl(null);
-    setStoryboard([]);
-    setGenerationId(null);
-    
-    addLog("📝 Creating 5-Minute Long-Form Script & Storyboard Draft...");
-    addLog(`Topic: "${longPrompt}"`);
-    addLog(`Model: ${longOllamaModel}`);
-    
-    try {
-      const response = await fetch("http://localhost:8000/api/longform/draft", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          prompt: longPrompt,
-          model: longOllamaModel || "minimax-m3:cloud"
-        })
-      });
-      
-      if (!response.ok) {
-        throw new Error(await response.text());
-      }
-      
-      const result = await response.json();
-      setGenerationId(result.generation_id);
-      setStoryboard(result.storyboard);
-      setGeneratedTopic(result.topic);
-      
-      // Pre-fill social upload metadata
-      setUploadTitle(result.youtube_metadata?.title || result.topic || "");
-      setUploadDescription(result.youtube_metadata?.description || "");
-      setUploadTags(result.youtube_metadata?.tags?.join(", ") || "");
-      setUploadCaption(result.instagram_metadata?.caption || "");
-      
-      addLog("✅ Landscape storyboard draft generated! Pexels video clips and scene texts are ready.");
-    } catch (err: any) {
-      addLog(`❌ ERROR drafting long-form script: ${err.message || err}`);
-    } finally {
-      setDrafting(false);
-    }
-  };
-
-  const handleLongformRender = async () => {
-    if (!generationId) return;
-    setRendering(true);
-    setLogs([]);
-    setFinalVideoUrl(null);
-    
-    addLog("🚀 Starting Long-Form Video Render...");
-    addLog(`Narration Voice: ${longVoice}`);
-    addLog(`Background Music: ${longMusicStyle}`);
-    
-    try {
-      const response = await fetch("http://localhost:8000/api/longform/render", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          generation_id: generationId,
-          storyboard: storyboard,
-          pexels_api_key: pexelsApiKey,
-          voice: longVoice,
-          speed: longVoiceSpeed,
-          music_style: longMusicStyle,
-          enable_captions: longEnableCaptions,
-          caption_font: longCaptionFont,
-          caption_size: longCaptionSize,
-          caption_margin_v: longCaptionMarginV,
-          caption_color: longCaptionColor,
-          enable_transition_sfx: longEnableTransitionSfx
-        })
-      });
-      
-      if (!response.ok) {
-        throw new Error(await response.text());
-      }
-      
-      addLog("⏳ Long-form rendering queued in the background. Polling render status...");
-      setStatusText("Rendering...");
-      
-      // Poll rendering status
-      const interval = setInterval(async () => {
-        try {
-          const statusRes = await fetch(`http://localhost:8000/api/generation-status/${generationId}`);
-          if (statusRes.ok) {
-            const data = await statusRes.json();
-            if (data.status === "completed") {
-              setFinalVideoUrl(data.video_url);
-              setStoryboard(data.storyboard);
-              setStatusText("Finished!");
-              addLog("🎉 Success! Render complete. You can download or preview the final landscape video.");
-              clearInterval(interval);
-              setRendering(false);
-              loadHistory(); // refresh library
-            } else if (data.status === "failed") {
-              setStatusText("Failed");
-              addLog("❌ Video rendering failed on the server.");
-              clearInterval(interval);
-              setRendering(false);
-            } else {
-              addLog("Rendering long-form video in progress (downloading assets & editing clips)...");
-            }
-          }
-        } catch (err) {
-          console.error("Error polling render status:", err);
-        }
-      }, 5000);
-      
-      // Auto-clear after 20 minutes
-      setTimeout(() => {
-        clearInterval(interval);
-        setRendering(false);
-      }, 1200000);
-      
-    } catch (err: any) {
-      addLog(`❌ ERROR starting long-form render: ${err.message || err}`);
-      setRendering(false);
-    }
-  };
 
   const handleDraftStoryboard = async () => {
     setDrafting(true);
     setLogs([]);
     setFinalVideoUrl(null);
+    setThumbnailUrl(null);
     setStoryboard([]);
     setGenerationId(null);
     
@@ -418,7 +507,8 @@ export default function Home() {
           model: viralOllamaModel || "minimax-m3:cloud",
           hook_style: viralHookStyle,
           enable_search: enableSearch,
-          voice: viralVoice
+          voice: viralVoice,
+          art_style: artStyle
         })
       });
       
@@ -450,6 +540,7 @@ export default function Home() {
     setRendering(true);
     setLogs([]);
     setFinalVideoUrl(null);
+    setThumbnailUrl(null);
     
     addLog("🚀 Compiling & Rendering Final Video...");
     addLog(`Visual Mode: ${visualMode}`);
@@ -465,6 +556,7 @@ export default function Home() {
           generation_id: generationId,
           storyboard: storyboard,
           visual_mode: visualMode,
+          image_provider: imageProvider,
           leonardo_model: viralLeonardoModel,
           voice: viralVoice,
           speed: viralVoiceSpeed,
@@ -476,7 +568,16 @@ export default function Home() {
           caption_size: captionSize,
           caption_margin_v: captionMarginV,
           caption_color: captionColor,
-          caption_style: captionStyle
+          caption_style: captionStyle,
+          quality: quality,
+          motion_style: motionStyle,
+          visual_source_mode: visualSourceMode,
+          progress_bar: progressBar,
+          normalize_audio: normalizeAudio,
+          duck_music: duckMusic,
+          enable_thumbnail: enableThumbnail,
+          subscribe_overlay: subscribeOverlay,
+          channel_handle: channelHandle
         })
       });
       
@@ -495,6 +596,7 @@ export default function Home() {
             const data = await statusRes.json();
             if (data.status === "completed") {
               setFinalVideoUrl(data.video_url);
+              setThumbnailUrl(data.thumbnail_url || null);
               setStoryboard(data.storyboard);
               setStatusText("Finished!");
               addLog("🎉 Success! Render complete.");
@@ -594,6 +696,7 @@ export default function Home() {
         if (generationId === genId) {
           setGenerationId(null);
           setFinalVideoUrl(null);
+          setThumbnailUrl(null);
           setStoryboard([]);
           setGeneratedTopic("");
           setUploadTitle("");
@@ -623,6 +726,11 @@ export default function Home() {
       const resLogs = await fetch("http://localhost:8000/api/scheduler/logs");
       if (resLogs.ok) {
         setSchedulerLogs(await resLogs.json());
+      }
+      const resCat = await fetch("http://localhost:8000/api/curiosity-topics");
+      if (resCat.ok) {
+        const data = await resCat.json();
+        if (Array.isArray(data.categories)) setCuriosityCatOptions(data.categories);
       }
     } catch (err) {
       console.error("Error loading scheduler data:", err);
@@ -673,15 +781,47 @@ export default function Home() {
       const res = await fetch("http://localhost:8000/api/scheduler/trigger", {
         method: "POST"
       });
-      if (res.ok) {
-        addLog("🚀 Manual Agent Run triggered in the background. Generating viral short...");
-        setTimeout(loadSchedulerData, 2000);
-      } else {
+      if (!res.ok) {
         alert("Failed to trigger agent");
+        setTriggerLoading(false);
+        return;
       }
+      addLog("🚀 Manual Agent Run triggered. Generating viral short (this can take a minute)...");
+
+      // The run executes in the background, so poll the logs until the latest
+      // entry leaves the "running" state, keeping the loader live the whole time.
+      const startedAt = Date.now();
+      const poll = async () => {
+        try {
+          const r = await fetch("http://localhost:8000/api/scheduler/logs");
+          if (r.ok) {
+            const logs = await r.json();
+            setSchedulerLogs(logs);
+            const latest = logs?.[0];
+            if (latest && latest.status !== "running") {
+              setTriggerLoading(false);
+              if (latest.status === "success") {
+                addLog("✅ Agent run completed successfully.");
+              } else {
+                const reason = latest.logs?.[latest.logs.length - 1] || "see scheduler logs";
+                addLog(`❌ Agent run failed: ${reason}`);
+              }
+              return;
+            }
+          }
+        } catch (e) {
+          console.error("Error polling scheduler logs:", e);
+        }
+        if (Date.now() - startedAt > 300000) {
+          setTriggerLoading(false);
+          addLog("⌛ Stopped watching the agent run after 5 minutes. Check scheduler logs for the result.");
+          return;
+        }
+        setTimeout(poll, 4000);
+      };
+      setTimeout(poll, 3000);
     } catch (err) {
       console.error("Error triggering agent:", err);
-    } finally {
       setTriggerLoading(false);
     }
   };
@@ -702,134 +842,7 @@ export default function Home() {
     await handleDraftStoryboard();
   };
 
-  const handleGeneratePresenter = async () => {
-    setLoading(true);
-    setLogs([]);
-    setFinalVideoUrl(null);
-    setPresenterImageUrl(null);
-    setVoiceAudioUrl(null);
-    
-    addLog("🚀 Starting AI Presenter Full Pipeline...");
-    
-    try {
-      // 1. Script
-      setStatusText("Generating script...");
-      addLog("Step 1/4: Generating script using Ollama...");
-      const scriptRes = await fetch("http://localhost:8000/api/generate-script", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ prompt: scriptPrompt, model: ollamaModel })
-      });
-      if (!scriptRes.ok) throw new Error("Script generation failed");
-      const scriptText = await scriptRes.json();
-      addLog(`Script Generated: "${scriptText.substring(0, 80)}..."`);
 
-      // 2. Speech
-      setStatusText("Synthesizing voice...");
-      addLog("Step 2/4: Synthesizing Kokoro-ONNX voice audio...");
-      const speechRes = await fetch("http://localhost:8000/api/generate-speech", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ text: scriptText, voice: voice, speed: voiceSpeed, effect: voiceEffect })
-      });
-      if (!speechRes.ok) throw new Error("Speech synthesis failed");
-      const speechData = await speechRes.json();
-      setVoiceAudioUrl(speechData.url);
-      setManualAudioPath(speechData.path); // Autofill manual path
-      addLog(`Audio synthesized at: ${speechData.path}`);
-
-      // 3. Image
-      setStatusText("Generating presenter portrait...");
-      addLog("Step 3/4: Submitting presenter image generation job to Leonardo.ai...");
-      const presenterRes = await fetch("http://localhost:8000/api/generate-presenter", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ prompt: presenterPrompt, model: leonardoModel, aspect_ratio: aspectRatio })
-      });
-      if (!presenterRes.ok) throw new Error("Presenter image generation failed");
-      const presenterData = await presenterRes.json();
-      setPresenterImageUrl(presenterData.url);
-      setManualImagePath(presenterData.path); // Autofill manual path
-      addLog(`Presenter image generated at: ${presenterData.path}`);
-
-      // 4. Lipsync
-      setStatusText("Processing lipsync...");
-      addLog("Step 4/4: Executing Wav2Lip lipsync & compositing (FFmpeg)...");
-      const lipsyncRes = await fetch("http://localhost:8000/api/run-lipsync", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          image_path: presenterData.path,
-          audio_path: presenterData.path,
-          quality: lipsyncQuality,
-          wav2lip_version: wav2lipVersion,
-          nosmooth: noSmooth,
-          padding_u: padU,
-          padding_d: padD,
-          padding_l: padL,
-          padding_r: padR,
-          b_roll_url: bRollUrl,
-          layout: compositeLayout
-        })
-      });
-      if (!lipsyncRes.ok) throw new Error("Lipsync process failed");
-      const lipsyncData = await lipsyncRes.json();
-      setFinalVideoUrl(lipsyncData.url);
-      addLog(`Video render complete! Final path: ${lipsyncData.path}`);
-      addLog("🎉 AI Talking Presenter generation completed successfully.");
-      setStatusText("Finished!");
-    } catch (err: any) {
-      addLog(`❌ ERROR: ${err.message || err}`);
-      setStatusText("Failed");
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  const handleManualLipsync = async () => {
-    setLoading(true);
-    setLogs([]);
-    setFinalVideoUrl(null);
-    addLog("🎬 Starting Manual Lipsync Job...");
-    addLog(`Image: ${manualImagePath}`);
-    addLog(`Audio: ${manualAudioPath}`);
-
-    try {
-      setStatusText("Lipsynching...");
-      const response = await fetch("http://localhost:8000/api/run-lipsync", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          image_path: manualImagePath,
-          audio_path: manualAudioPath,
-          quality: manualQuality,
-          wav2lip_version: manualVersion,
-          nosmooth: manualNoSmooth,
-          padding_u: manualPadU,
-          padding_d: manualPadD,
-          padding_l: manualPadL,
-          padding_r: manualPadR,
-          b_roll_url: manualBRollUrl,
-          layout: manualLayout
-        })
-      });
-
-      if (!response.ok) {
-        const errData = await response.json();
-        throw new Error(errData.detail || "Lipsync failed");
-      }
-
-      const data = await response.json();
-      setFinalVideoUrl(data.url);
-      addLog(`Manual Lipsync Succeeded! Output: ${data.path}`);
-      setStatusText("Finished!");
-    } catch (err: any) {
-      addLog(`❌ ERROR: ${err.message || err}`);
-      setStatusText("Failed");
-    } finally {
-      setLoading(false);
-    }
-  };
 
   const handleInitYoutubeAuth = async () => {
     addLog("🔑 Launching YouTube OAuth Authentication flow...");
@@ -1007,16 +1020,16 @@ export default function Home() {
       {/* Header */}
       <header className="header">
         <h1 className="title-glow">🎬 ShortsGen AI</h1>
-        <p className="subtitle">Premium Talking Head & Viral Split-Screen Video Shorts Creator</p>
+        <p className="subtitle">AI Shorts &amp; Reels Creator for YouTube and Instagram</p>
       </header>
 
       {/* Backend Status Alert */}
       {backendError && (
-        <div className="glass-card" style={{ borderColor: "#ef4444", background: "rgba(239, 68, 68, 0.05)", display: "flex", gap: "12px", alignItems: "center" }}>
-          <AlertCircle size={24} color="#ef4444" style={{ flexShrink: 0 }} />
+        <div className="glass-card" style={{ borderColor: "var(--danger)", background: "rgba(239, 68, 68, 0.05)", display: "flex", gap: "12px", alignItems: "center" }}>
+          <AlertCircle size={24} color="var(--danger)" style={{ flexShrink: 0 }} />
           <div>
-            <h4 style={{ color: "#ef4444", fontWeight: 600 }}>Backend Connection Offline</h4>
-            <p className="form-label-info" style={{ color: "#fca5a5" }}>{backendError}</p>
+            <h4 style={{ color: "var(--danger)", fontWeight: 600 }}>Backend Connection Offline</h4>
+            <p className="form-label-info" style={{ color: "var(--danger)" }}>{backendError}</p>
           </div>
           <button onClick={loadConfig} className="btn btn-secondary" style={{ width: "auto", marginLeft: "auto", padding: "8px 16px", fontSize: "14px" }}>
             <RefreshCw size={14} /> Retry
@@ -1036,29 +1049,29 @@ export default function Home() {
             alignItems: "center", 
             justifyContent: "space-between", 
             gap: "16px",
-            borderColor: "rgba(168, 85, 247, 0.15)",
-            background: "rgba(168, 85, 247, 0.02)"
+            borderColor: "rgba(200, 255, 0, 0.15)",
+            background: "rgba(200, 255, 0, 0.02)"
           }}
         >
           <div style={{ display: "flex", alignItems: "center", gap: "12px" }}>
-            <Settings size={20} color="#a855f7" />
+            <Settings size={20} color="var(--accent)" />
             <div>
-              <h3 style={{ fontSize: "16px", fontWeight: 600, color: "#f8fafc", margin: 0 }}>Social Publishing Readiness</h3>
-              <p style={{ fontSize: "12px", color: "#94a3b8", margin: "2px 0 0 0" }}>Check authorization status for direct video publishing to YouTube and Instagram.</p>
+              <h3 style={{ fontSize: "16px", fontWeight: 600, color: "var(--text-primary)", margin: 0 }}>Social Publishing Readiness</h3>
+              <p style={{ fontSize: "12px", color: "var(--text-secondary)", margin: "2px 0 0 0" }}>Check authorization status for direct video publishing to YouTube and Instagram.</p>
             </div>
           </div>
 
           <div style={{ display: "flex", alignItems: "center", gap: "16px", flexWrap: "wrap" }}>
             {/* YouTube Readiness */}
             <div style={{ display: "flex", alignItems: "center", gap: "8px", background: "rgba(255, 255, 255, 0.02)", border: "1px solid rgba(255, 255, 255, 0.05)", padding: "6px 12px", borderRadius: "10px" }}>
-              <span style={{ fontSize: "13px", fontWeight: 500, color: "#cbd5e1" }}>YouTube Shorts:</span>
+              <span style={{ fontSize: "13px", fontWeight: 500, color: "var(--text-secondary)" }}>YouTube Shorts:</span>
               {isYtAuthenticated ? (
-                <span style={{ display: "flex", alignItems: "center", gap: "4px", color: "#10b981", fontSize: "13px", fontWeight: 600 }}>
+                <span style={{ display: "flex", alignItems: "center", gap: "4px", color: "var(--ok)", fontSize: "13px", fontWeight: 600 }}>
                   <CheckCircle2 size={14} /> Ready
                 </span>
               ) : (
                 <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
-                  <span style={{ display: "flex", alignItems: "center", gap: "4px", color: "#ef4444", fontSize: "13px", fontWeight: 600 }}>
+                  <span style={{ display: "flex", alignItems: "center", gap: "4px", color: "var(--danger)", fontSize: "13px", fontWeight: 600 }}>
                     <AlertCircle size={14} /> Unauthorized
                   </span>
                   <button 
@@ -1074,23 +1087,41 @@ export default function Home() {
 
             {/* Instagram Readiness */}
             <div style={{ display: "flex", alignItems: "center", gap: "8px", background: "rgba(255, 255, 255, 0.02)", border: "1px solid rgba(255, 255, 255, 0.05)", padding: "6px 12px", borderRadius: "10px" }}>
-              <span style={{ fontSize: "13px", fontWeight: 500, color: "#cbd5e1" }}>Instagram Reels:</span>
+              <span style={{ fontSize: "13px", fontWeight: 500, color: "var(--text-secondary)" }}>Instagram Reels:</span>
               {isIgConfigured ? (
-                <span style={{ display: "flex", alignItems: "center", gap: "4px", color: "#10b981", fontSize: "13px", fontWeight: 600 }}>
+                <span style={{ display: "flex", alignItems: "center", gap: "4px", color: "var(--ok)", fontSize: "13px", fontWeight: 600 }}>
                   <CheckCircle2 size={14} /> Ready
                 </span>
               ) : (
-                <span style={{ display: "flex", alignItems: "center", gap: "4px", color: "#eab308", fontSize: "13px", fontWeight: 600 }} title="Set INSTAGRAM_BUSINESS_ACCOUNT_ID and INSTAGRAM_ACCESS_TOKEN in .env">
+                <span style={{ display: "flex", alignItems: "center", gap: "4px", color: "var(--warn)", fontSize: "13px", fontWeight: 600 }} title="Set INSTAGRAM_BUSINESS_ACCOUNT_ID and INSTAGRAM_ACCESS_TOKEN in .env">
                   <AlertCircle size={14} /> Needs Keys
                 </span>
               )}
             </div>
 
+            {/* Image Engine Readiness */}
+            <div style={{ display: "flex", alignItems: "center", gap: "8px", background: "rgba(255, 255, 255, 0.02)", border: "1px solid rgba(255, 255, 255, 0.05)", padding: "6px 12px", borderRadius: "10px" }}>
+              <span style={{ fontSize: "13px", fontWeight: 500, color: "var(--text-secondary)" }}>
+                Image Engine{imageProviderStatus?.provider ? ` (${imageProviderStatus.provider})` : ""}:
+              </span>
+              {imageProviderStatus?.available ? (
+                <span style={{ display: "flex", alignItems: "center", gap: "4px", color: "var(--ok)", fontSize: "13px", fontWeight: 600 }}
+                  title={imageProviderStatus?.device ? `${imageProviderStatus.model} on ${imageProviderStatus.device}` : ""}>
+                  <CheckCircle2 size={14} /> {imageProviderStatus?.provider === "local" ? (imageProviderStatus?.device || "Ready") : "Ready"}
+                </span>
+              ) : (
+                <span style={{ display: "flex", alignItems: "center", gap: "4px", color: "var(--danger)", fontSize: "13px", fontWeight: 600 }}
+                  title={imageProviderStatus?.provider === "local" ? "Start it with: python sd_server.py" : "Provider unavailable"}>
+                  <AlertCircle size={14} /> {imageProviderStatus?.provider === "local" ? "Server Off" : "Unavailable"}
+                </span>
+              )}
+            </div>
+
             {/* Refresh button */}
-            <button 
+            <button
               onClick={refreshReadiness}
               disabled={isCheckingReadiness}
-              className="btn btn-secondary" 
+              className="btn btn-secondary"
               style={{ width: "auto", height: "34px", padding: "0 10px", margin: 0 }}
               title="Refresh Readiness Status"
             >
@@ -1107,24 +1138,6 @@ export default function Home() {
           className={`tab-btn ${activeTab === "viral" ? "tab-btn-active" : ""}`}
         >
           <Sparkles size={18} /> 📱 Viral Shorts Studio
-        </button>
-        <button 
-          onClick={() => setActiveTab("full")} 
-          className={`tab-btn ${activeTab === "full" ? "tab-btn-active" : ""}`}
-        >
-          <Tv size={18} /> 🚀 Full Presenter Pipeline
-        </button>
-        <button 
-          onClick={() => setActiveTab("manual")} 
-          className={`tab-btn ${activeTab === "manual" ? "tab-btn-active" : ""}`}
-        >
-          <Sliders size={18} /> 🎬 Manual Lipsync Studio
-        </button>
-        <button 
-          onClick={() => setActiveTab("longform")} 
-          className={`tab-btn ${activeTab === "longform" ? "tab-btn-active" : ""}`}
-        >
-          <Tv size={18} /> 🖥️ Landscape Studio
         </button>
         <button 
           onClick={() => { setActiveTab("library"); loadHistory(); }} 
@@ -1157,14 +1170,18 @@ export default function Home() {
             <>
               {/* Trending Topics Discoverer */}
               <div className="glass-card" style={{ marginBottom: "20px" }}>
-                <h2 className="card-title" style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
-                  <span style={{ display: "flex", alignItems: "center", gap: "8px" }}>
-                    <span style={{ fontSize: "1.2em" }}>🔥</span> Discover Trending Topics
-                  </span>
-                  <span className="badge" style={{ background: "#ef4444", fontSize: "0.75rem", padding: "2px 8px" }}>Real-time</span>
-                </h2>
-                
-                <p className="card-subtitle" style={{ color: "#94a3b8", fontSize: "0.9rem", marginBottom: "15px" }}>
+                <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: "16px", gap: "12px", flexWrap: "wrap" }}>
+                  <h2 className="card-title" style={{ margin: 0 }}>
+                    <DollarSign /> Discover Topics
+                  </h2>
+                  <div style={{ display: "inline-flex", background: "var(--surface-2)", border: "1px solid var(--border)", borderRadius: "10px", padding: "3px" }}>
+                    <button onClick={() => setDiscoverMode("trends")} style={{ cursor: "pointer", border: "none", width: "auto", padding: "6px 14px", fontSize: "13px", fontWeight: 600, borderRadius: "7px", background: discoverMode === "trends" ? "var(--accent)" : "transparent", color: discoverMode === "trends" ? "var(--accent-ink)" : "var(--text-secondary)" }}>🔥 Trending</button>
+                    <button onClick={() => setDiscoverMode("ideas")} style={{ cursor: "pointer", border: "none", width: "auto", padding: "6px 14px", fontSize: "13px", fontWeight: 600, borderRadius: "7px", background: discoverMode === "ideas" ? "var(--accent)" : "transparent", color: discoverMode === "ideas" ? "var(--accent-ink)" : "var(--text-secondary)" }}>💲 High-RPM</button>
+                  </div>
+                </div>
+
+                {discoverMode === "trends" && (<>
+                <p className="card-subtitle" style={{ color: "var(--text-secondary)", fontSize: "0.9rem", marginBottom: "15px" }}>
                   Find out what people are searching for right now and instantly generate viral shorts about them.
                 </p>
 
@@ -1194,7 +1211,7 @@ export default function Home() {
                 </div>
 
                 {trendsError && (
-                  <p style={{ color: "#ef4444", fontSize: "0.9rem", marginBottom: "15px" }}>{trendsError}</p>
+                  <p style={{ color: "var(--danger)", fontSize: "0.9rem", marginBottom: "15px" }}>{trendsError}</p>
                 )}
 
                 {trends.length > 0 && (
@@ -1213,10 +1230,10 @@ export default function Home() {
                       <div 
                         key={idx} 
                         style={{ 
-                          background: "#0f172a", 
+                          background: "var(--surface-2)", 
                           borderRadius: "8px", 
                           padding: "12px", 
-                          border: "1px solid #334155", 
+                          border: "1px solid var(--border)", 
                           display: "flex", 
                           flexDirection: "column",
                           justifyContent: "space-between",
@@ -1232,18 +1249,18 @@ export default function Home() {
                               style={{ width: "100%", height: "110px", objectFit: "cover", borderRadius: "6px", marginBottom: "10px" }}
                             />
                           ) : (
-                            <div style={{ height: "110px", background: "#1e293b", borderRadius: "6px", display: "flex", alignItems: "center", justifyContent: "center", color: "#475569", fontSize: "0.85rem", marginBottom: "10px" }}>
+                            <div style={{ height: "110px", background: "var(--surface-2)", borderRadius: "6px", display: "flex", alignItems: "center", justifyContent: "center", color: "var(--text-muted)", fontSize: "0.85rem", marginBottom: "10px" }}>
                               No Thumbnail
                             </div>
                           )}
-                          <h4 style={{ margin: "0 0 4px 0", color: "#f1f5f9", fontSize: "1rem" }}>{t.title}</h4>
-                          <span style={{ background: "#ef4444", color: "#ffffff", fontSize: "0.75rem", padding: "2px 8px", borderRadius: "10px", fontWeight: "bold" }}>
+                          <h4 style={{ margin: "0 0 4px 0", color: "var(--text-primary)", fontSize: "1rem" }}>{t.title}</h4>
+                          <span style={{ background: "var(--danger)", color: "#ffffff", fontSize: "0.75rem", padding: "2px 8px", borderRadius: "10px", fontWeight: "bold" }}>
                             🔥 {t.traffic}
                           </span>
                           
                           {t.news_title && (
-                            <p style={{ fontSize: "0.8rem", color: "#94a3b8", marginTop: "8px", lineHeight: "1.25" }}>
-                              <b>News</b>: <a href={t.news_url} target="_blank" rel="noopener noreferrer" style={{ color: "#c084fc", textDecoration: "none" }}>{t.news_title}</a>
+                            <p style={{ fontSize: "0.8rem", color: "var(--text-secondary)", marginTop: "8px", lineHeight: "1.25" }}>
+                              <b>News</b>: <a href={t.news_url} target="_blank" rel="noopener noreferrer" style={{ color: "var(--accent)", textDecoration: "none" }}>{t.news_title}</a>
                             </p>
                           )}
                         </div>
@@ -1266,6 +1283,159 @@ export default function Home() {
                     ))}
                   </div>
                 )}
+                </>)}
+
+                {discoverMode === "ideas" && (<>
+                <p className="card-subtitle" style={{ color: "var(--text-secondary)", fontSize: "0.9rem", marginBottom: "15px" }}>
+                  Trends from high-paying markets (USA pays the most), ranked toward high-CPM niches like finance, tech &amp; business. Pick one and make a video.
+                </p>
+
+                <div className="form-row" style={{ alignItems: "flex-end", marginBottom: "20px" }}>
+                  <div className="form-group" style={{ flex: 1 }}>
+                    <label className="form-label">Target Market (by RPM)</label>
+                    <select
+                      className="form-select"
+                      value={recsGeo}
+                      onChange={(e) => setRecsGeo(e.target.value)}
+                    >
+                      <option value="US">🇺🇸 United States — Highest RPM</option>
+                      <option value="AU">🇦🇺 Australia — Very High RPM</option>
+                      <option value="CA">🇨🇦 Canada — High RPM</option>
+                      <option value="GB">🇬🇧 United Kingdom — High RPM</option>
+                    </select>
+                  </div>
+                  <button
+                    className="btn btn-primary"
+                    onClick={handleFetchRecommendations}
+                    disabled={isFetchingRecs}
+                    style={{ height: "42px", minWidth: "190px", background: "linear-gradient(135deg, var(--ok) 0%, var(--ok) 100%)" }}
+                  >
+                    {isFetchingRecs ? "Thinking..." : "Get High-RPM Topic Ideas"}
+                  </button>
+                </div>
+
+                {recsError && (
+                  <p style={{ color: "var(--danger)", fontSize: "0.9rem", marginBottom: "15px" }}>{recsError}</p>
+                )}
+
+                {recommendations.length > 0 && (
+                  <div
+                    style={{
+                      display: "grid",
+                      gridTemplateColumns: "repeat(auto-fill, minmax(240px, 1fr))",
+                      gap: "15px",
+                      maxHeight: "380px",
+                      overflowY: "auto",
+                      paddingRight: "5px",
+                      marginTop: "10px"
+                    }}
+                  >
+                    {recommendations.map((rec, idx) => {
+                      const tier = String(rec.rpm_tier || "Medium");
+                      const tierColor = tier === "High" ? "var(--ok)" : tier === "Low" ? "var(--text-muted)" : "var(--warn)";
+                      return (
+                        <div
+                          key={idx}
+                          className="trend-card"
+                          style={{
+                            background: "var(--surface-2)",
+                            borderRadius: "8px",
+                            padding: "14px",
+                            border: "1px solid var(--border)",
+                            display: "flex",
+                            flexDirection: "column",
+                            justifyContent: "space-between",
+                            transition: "all 0.2s ease"
+                          }}
+                        >
+                          <div>
+                            <div style={{ display: "flex", gap: "6px", flexWrap: "wrap", marginBottom: "8px" }}>
+                              <span style={{ background: tierColor, color: "var(--accent-ink)", fontSize: "0.72rem", padding: "2px 8px", borderRadius: "10px", fontWeight: "bold" }}>
+                                {tier} RPM
+                              </span>
+                              <span style={{ background: "var(--surface-2)", color: "var(--accent)", fontSize: "0.72rem", padding: "2px 8px", borderRadius: "10px", fontWeight: "bold", textTransform: "capitalize" }}>
+                                {rec.niche || "general"}
+                              </span>
+                              {rec.est_rpm && (
+                                <span style={{ background: "var(--surface-2)", color: "var(--ok)", fontSize: "0.72rem", padding: "2px 8px", borderRadius: "10px", fontWeight: "bold" }}>
+                                  ~{rec.est_rpm} / 1k
+                                </span>
+                              )}
+                            </div>
+                            <h4 style={{ margin: "0 0 6px 0", color: "var(--text-primary)", fontSize: "1rem", lineHeight: "1.3" }}>{rec.title}</h4>
+                            {rec.rationale && (
+                              <p style={{ fontSize: "0.8rem", color: "var(--text-secondary)", marginTop: "4px", lineHeight: "1.3" }}>{rec.rationale}</p>
+                            )}
+                          </div>
+
+                          <button
+                            className="btn btn-secondary"
+                            style={{ width: "100%", marginTop: "12px", padding: "6px 0", fontSize: "0.85rem" }}
+                            onClick={() => handleUseRecommendedTopic(rec)}
+                          >
+                            Use this topic
+                          </button>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+                </>)}
+              </div>
+
+              {/* Curiosity Topics — curated evergreen library that trends on YouTube */}
+              <div className="glass-card curiosity-card-wrap" style={{ marginBottom: "20px" }}>
+                <div className="curiosity-head">
+                  <div>
+                    <h2 className="card-title" style={{ margin: 0 }}>
+                      <Lightbulb /> Curiosity Topics
+                    </h2>
+                    <p className="card-subtitle" style={{ marginTop: "6px" }}>
+                      Hand-picked curiosity-gap ideas built to trend on Shorts. Tap one to load it straight into the drafter.
+                    </p>
+                  </div>
+                  <button
+                    className="curiosity-surprise"
+                    onClick={handleSurpriseCuriosityTopic}
+                    title="Pick a random topic and load it"
+                  >
+                    <Shuffle size={15} /> Surprise me
+                  </button>
+                </div>
+
+                <div className="curiosity-chips">
+                  {CURIOSITY_CATEGORIES.map((cat) => (
+                    <button
+                      key={cat}
+                      onClick={() => setCuriosityCategory(cat)}
+                      className={`curiosity-chip ${curiosityCategory === cat ? "curiosity-chip-active" : ""}`}
+                    >
+                      {cat}
+                    </button>
+                  ))}
+                </div>
+
+                <div className="curiosity-grid">
+                  {CURIOSITY_TOPICS
+                    .filter((t) => curiosityCategory === "All" || t.category === curiosityCategory)
+                    .map((topic, idx) => (
+                      <button
+                        key={`${topic.title}-${idx}`}
+                        className="curiosity-item"
+                        onClick={() => handleUseCuriosityTopic(topic)}
+                      >
+                        <span className="curiosity-item-cat">
+                          <span className="curiosity-item-emoji">{topic.emoji}</span>
+                          {topic.category}
+                        </span>
+                        <span className="curiosity-item-title">{topic.title}</span>
+                        <span className="curiosity-item-hook">{topic.hook}</span>
+                        <span className="curiosity-item-cta">
+                          Use topic <ArrowRight size={13} />
+                        </span>
+                      </button>
+                    ))}
+                </div>
               </div>
 
               <div className="glass-card" id="viral-config-card">
@@ -1314,7 +1484,7 @@ export default function Home() {
                         onChange={(e) => setEnableSearch(e.target.checked)}
                         style={{ marginRight: "6px" }}
                       />
-                      <span style={{ fontSize: "12px", fontWeight: 600, color: "#d8b4fe" }}>🔍 Fact-Check with Internet Search (RAG)</span>
+                      <span style={{ fontSize: "12px", fontWeight: 600, color: "var(--accent)" }}>🔍 Fact-Check with Internet Search (RAG)</span>
                     </label>
                   </div>
                 </div>
@@ -1323,7 +1493,7 @@ export default function Home() {
                   onClick={handleDraftStoryboard}
                   disabled={drafting || !config} 
                   className="btn btn-primary"
-                  style={{ marginTop: "15px", background: "linear-gradient(135deg, #a855f7 0%, #7c3aed 100%)" }}
+                  style={{ marginTop: "15px", background: "linear-gradient(135deg, var(--accent) 0%, var(--accent) 100%)" }}
                 >
                   📝 {drafting ? "Drafting Storyboard..." : "Draft Script & Storyboard"}
                 </button>
@@ -1334,29 +1504,121 @@ export default function Home() {
 
                 <div className="form-row">
                   <div className="form-group">
+                    <label className="form-label">Image Engine / Provider</label>
+                    <select
+                      className="form-select"
+                      value={imageProvider}
+                      onChange={(e) => handleChangeImageProvider(e.target.value)}
+                    >
+                      <option value="pollinations">Pollinations (Free hosted — no key, capped at 576×1024)</option>
+                      <option value="local">Local SDXL (Free, on-device — full 1080p detail)</option>
+                      <option value="leonardo">Leonardo (Cloud API — needs key)</option>
+                    </select>
+                    {/* Sharpness is decided here, not in the encoder: an image
+                        generated below the delivery frame has to be upscaled,
+                        and upscaling cannot put detail back. */}
+                    {imageProviderStatus?.max_resolution && (
+                      <p className="form-label-info">
+                        Generates at {imageProviderStatus.max_resolution}, delivered at{" "}
+                        {imageProviderStatus.delivery_resolution}
+                        {imageProviderStatus.upscale_factor > 1.05 ? (
+                          <>
+                            {" "}— upscaled {imageProviderStatus.upscale_factor}×.{" "}
+                            <strong style={{ color: "var(--warn)" }}>
+                              Upscaling cannot add detail back.
+                            </strong>
+                          </>
+                        ) : (
+                          <> — near-native, no meaningful upscale.</>
+                        )}
+                      </p>
+                    )}
+
+                    {imageProvider === "local" && sdModels.length > 0 && (
+                      <div style={{ marginTop: "10px" }}>
+                        <label className="form-label">Local Model</label>
+                        <select
+                          className="form-select"
+                          value={sdCurrentModel}
+                          disabled={switchingModel}
+                          onChange={(e) => handleSelectSdModel(e.target.value)}
+                        >
+                          {sdModels.map((m: any) => (
+                            <option key={m.id} value={m.id}>{m.name}</option>
+                          ))}
+                        </select>
+                        {(() => {
+                          const active = sdModels.find((m: any) => m.id === sdCurrentModel);
+                          if (!active) return null;
+                          return (
+                            <p className="form-label-info">
+                              {active.note} {active.steps} steps
+                              {active.download_gb ? `, ~${active.download_gb}GB download on first use` : ""}.
+                            </p>
+                          );
+                        })()}
+                      </div>
+                    )}
+                  </div>
+                  <div className="form-group">
                     <label className="form-label">Visual Format Mode</label>
-                    <select 
+                    <select
                       className="form-select"
                       value={visualMode}
                       onChange={(e) => setVisualMode(e.target.value)}
                     >
                       <option value="Cinematic Slideshow">Cinematic Slideshow (Pan & Zoom)</option>
                       <option value="Leonardo Motion Video">Leonardo Motion (Image-to-Video API)</option>
-                    </select>
-                  </div>
-                  <div className="form-group">
-                    <label className="form-label">Leonardo Generator Model</label>
-                    <select 
-                      className="form-select"
-                      value={viralLeonardoModel}
-                      onChange={(e) => setViralLeonardoModel(e.target.value)}
-                    >
-                      {config?.leonardo_models.map(m => (
-                        <option key={m} value={m}>{m}</option>
-                      )) || <option>Loading...</option>}
+                      <option value="Hailuo Animated Video">Hailuo Animated Video (MiniMax)</option>
                     </select>
                   </div>
                 </div>
+
+                <div className="form-row">
+                  <div className="form-group">
+                    <label className="form-label">Art Style</label>
+                    <select
+                      className="form-select"
+                      value={artStyle}
+                      onChange={(e) => setArtStyle(e.target.value)}
+                    >
+                      {(config?.art_styles && config.art_styles.length > 0
+                        ? config.art_styles
+                        : ["Photorealistic", "Stickman Animation"]
+                      ).map((s: string) => (
+                        <option key={s} value={s}>{s}</option>
+                      ))}
+                    </select>
+                  </div>
+                </div>
+
+                {visualMode === "Hailuo Animated Video" && (
+                  <p style={{ color: "var(--warn)", fontSize: 12, marginTop: -8 }}>
+                    ~5–9 min/scene · needs MINIMAX_API_KEY (free trial at platform.minimax.io). Falls back to slideshow if unavailable.
+                  </p>
+                )}
+                {artStyle === "Stickman Animation" && visualMode === "Hailuo Animated Video" && (
+                  <p style={{ color: "var(--accent)", fontSize: 12, marginTop: -4 }}>
+                    Best match for animated stickman videos.
+                  </p>
+                )}
+
+                {imageProvider === "leonardo" && (
+                  <div className="form-row">
+                    <div className="form-group">
+                      <label className="form-label">Leonardo Generator Model</label>
+                      <select
+                        className="form-select"
+                        value={viralLeonardoModel}
+                        onChange={(e) => setViralLeonardoModel(e.target.value)}
+                      >
+                        {config?.leonardo_models.map(m => (
+                          <option key={m} value={m}>{m}</option>
+                        )) || <option>Loading...</option>}
+                      </select>
+                    </div>
+                  </div>
+                )}
 
                 <div className="form-row">
                   <div className="form-group">
@@ -1431,9 +1693,12 @@ export default function Home() {
                       onChange={(e) => setEnableTransitionSfx(e.target.checked)}
                     />
                     <div className="checkbox-custom"></div>
-                    <span style={{ fontSize: "14px", fontWeight: 600 }}>Enable Transition Sound Effects (Whoosh & Pop)</span>
+                    <span style={{ fontSize: "14px", fontWeight: 600 }}>Transition Sound Effects</span>
                   </label>
-                  <p className="form-label-info" style={{ marginLeft: "30px", marginTop: "4px" }}>Adds satisfying audio sweeps at scene switches.</p>
+                  <p className="form-label-info" style={{ marginLeft: "30px", marginTop: "4px" }}>
+                    Off by default &mdash; the bundled whoosh reads as noise rather than a transition.
+                    Replace <code>assets/sfx/whoosh.wav</code> with your own before turning this on.
+                  </p>
                 </div>
 
                 <div className="form-group" style={{ borderTop: "1px solid rgba(255, 255, 255, 0.05)", paddingTop: "15px" }}>
@@ -1452,9 +1717,27 @@ export default function Home() {
                       </label>
 
                       <div className="form-group" style={{ margin: 0 }}>
+                        <label className="form-label" style={{ marginBottom: "6px" }}>Caption Style</label>
+                        <select
+                          className="form-select"
+                          value={captionStyle}
+                          onChange={(e) => setCaptionStyle(e.target.value)}
+                          disabled={!enableCaptions}
+                        >
+                          <option value="Viral Pop">Viral Pop (Pops + Color Highlights)</option>
+                          <option value="Soft Pill">Soft Pill (Rounded Plate + Highlights)</option>
+                          <option value="Standard">Standard Bottom Text</option>
+                        </select>
+                        <p className="form-label-info">
+                          Soft Pill draws a rounded translucent plate behind the words, so they stay
+                          readable over bright or busy footage where an outline alone disappears.
+                        </p>
+                      </div>
+
+                      <div className="form-group" style={{ margin: 0 }}>
                         <label className="form-label" style={{ display: "flex", justifyContent: "space-between", marginBottom: "6px" }}>
                           <span>Text Size</span>
-                          <span style={{ color: "#c084fc", fontWeight: 600 }}>{captionSize}px</span>
+                          <span style={{ color: "var(--accent)", fontWeight: 600 }}>{captionSize}px</span>
                         </label>
                         <div className="slider-group">
                           <input 
@@ -1473,7 +1756,7 @@ export default function Home() {
                       <div className="form-group" style={{ margin: 0 }}>
                         <label className="form-label" style={{ display: "flex", justifyContent: "space-between", marginBottom: "6px" }}>
                           <span>Vertical Position (from bottom)</span>
-                          <span style={{ color: "#c084fc", fontWeight: 600 }}>{captionMarginV}px</span>
+                          <span style={{ color: "var(--accent)", fontWeight: 600 }}>{captionMarginV}px</span>
                         </label>
                         <div className="slider-group">
                           <input 
@@ -1504,12 +1787,12 @@ export default function Home() {
                                   display: "flex",
                                   alignItems: "center",
                                   gap: "6px",
-                                  background: isSelected ? "rgba(168, 85, 247, 0.25)" : "rgba(255,255,255,0.03)",
-                                  border: `1px solid ${isSelected ? "#a855f7" : "rgba(255,255,255,0.08)"}`,
+                                  background: isSelected ? "rgba(200, 255, 0, 0.25)" : "rgba(255,255,255,0.03)",
+                                  border: `1px solid ${isSelected ? "var(--accent)" : "rgba(255,255,255,0.08)"}`,
                                   borderRadius: "20px",
                                   padding: "6px 12px",
                                   cursor: enableCaptions ? "pointer" : "not-allowed",
-                                  color: isSelected ? "#f8fafc" : "#94a3b8",
+                                  color: isSelected ? "var(--text-primary)" : "var(--text-secondary)",
                                   fontSize: "12px",
                                   fontWeight: 600,
                                   transition: "all 0.2s ease"
@@ -1551,7 +1834,7 @@ export default function Home() {
                           height: "320px", 
                           borderRadius: "14px", 
                           overflow: "hidden", 
-                          border: "2px solid rgba(168, 85, 247, 0.3)",
+                          border: "2px solid rgba(200, 255, 0, 0.3)",
                           boxShadow: "0 10px 30px rgba(0,0,0,0.5)",
                           backgroundImage: "url('/sample_short.png')",
                           backgroundSize: "cover",
@@ -1589,20 +1872,147 @@ export default function Home() {
                   </div>
                 </div>
 
-                <button 
+                <div className="form-group" style={{ borderTop: "1px solid rgba(255, 255, 255, 0.05)", paddingTop: "15px", marginTop: "18px" }}>
+                  <label className="form-label">
+                    <Gauge size={16} style={{ display: "inline", marginRight: "6px" }} /> Delivery Quality &amp; Retention
+                  </label>
+                  <p className="form-label-info" style={{ marginBottom: "14px" }}>
+                    Everything YouTube judges on playback: sharpness, motion, loudness and the first three seconds.
+                  </p>
+
+                  {/* The single biggest lever on whether a short looks real:
+                      filmed footage has no anatomy for a model to get wrong. */}
+                  <div className="form-group">
+                    <label className="form-label">Where Visuals Come From</label>
+                    <select
+                      className="form-select"
+                      value={visualSourceMode}
+                      onChange={(e) => setVisualSourceMode(e.target.value)}
+                    >
+                      {(config?.visual_source_modes ?? ["Smart Mix", "Real Footage Only", "AI Only"]).map((m) => (
+                        <option key={m} value={m}>{m}</option>
+                      ))}
+                    </select>
+                    <p className="form-label-info">
+                      {visualSourceMode === "Real Footage Only" && (
+                        <>Every scene uses real Pexels video. Most believable, but abstract topics get loose matches.</>
+                      )}
+                      {visualSourceMode === "Smart Mix" && (
+                        <>Real footage for anything filmable, AI only for shots that can&apos;t exist
+                          (inside a black hole, the year 3000). Recommended.</>
+                      )}
+                      {visualSourceMode === "AI Only" && (
+                        <>Every scene generated. Full creative control, but people may come out
+                          with distorted hands and faces.</>
+                      )}
+                      {config?.stock_available === false && (
+                        <strong style={{ color: "var(--warn)", display: "block", marginTop: "4px" }}>
+                          No PEXELS_API_KEY set — real footage will fall back to AI generation.
+                        </strong>
+                      )}
+                    </p>
+                  </div>
+
+                  <div className="form-row">
+                    <div className="form-group">
+                      <label className="form-label">Encode Quality</label>
+                      <select className="form-select" value={quality} onChange={(e) => setQuality(e.target.value)}>
+                        {(config?.quality_presets ?? ["High (recommended)"]).map((q) => (
+                          <option key={q} value={q}>{q}</option>
+                        ))}
+                      </select>
+                      <p className="form-label-info">
+                        Delivered as {config?.delivery?.resolution ?? "1080x1920"} @ {config?.delivery?.fps ?? 30}fps,
+                        fast-start so playback never stalls on the first frame.
+                      </p>
+                    </div>
+                    <div className="form-group">
+                      <label className="form-label">Camera Motion</label>
+                      <select className="form-select" value={motionStyle} onChange={(e) => setMotionStyle(e.target.value)}>
+                        {(config?.motion_styles ?? ["Dynamic", "Subtle", "Off"]).map((m) => (
+                          <option key={m} value={m}>{m}</option>
+                        ))}
+                      </select>
+                      <p className="form-label-info">
+                        Dynamic alternates the push and pan each scene so stills stop reading as a slideshow.
+                      </p>
+                    </div>
+                  </div>
+
+                  <div style={{ display: "flex", flexDirection: "column", gap: "12px", marginTop: "8px" }}>
+                    <label className="checkbox-container" style={{ margin: 0 }}>
+                      <input type="checkbox" checked={normalizeAudio} onChange={(e) => setNormalizeAudio(e.target.checked)} />
+                      <div className="checkbox-custom"></div>
+                      <span style={{ fontSize: "14px", fontWeight: 600 }}>
+                        Normalize loudness to {config?.delivery?.target_lufs ?? -14} LUFS
+                      </span>
+                    </label>
+                    <p className="form-label-info" style={{ marginLeft: "30px", marginTop: "-6px" }}>
+                      Matches YouTube&apos;s playback target, so the platform leaves your mix alone instead of turning a quiet one up along with its noise floor.
+                    </p>
+
+                    <label className="checkbox-container" style={{ margin: 0 }}>
+                      <input type="checkbox" checked={duckMusic} onChange={(e) => setDuckMusic(e.target.checked)} />
+                      <div className="checkbox-custom"></div>
+                      <span style={{ fontSize: "14px", fontWeight: 600 }}>Duck music under narration</span>
+                    </label>
+                    <p className="form-label-info" style={{ marginLeft: "30px", marginTop: "-6px" }}>
+                      Sidechain compression pulls the bed down while the voice speaks and lets it swell back between lines.
+                    </p>
+
+                    <label className="checkbox-container" style={{ margin: 0 }}>
+                      <input type="checkbox" checked={progressBar} onChange={(e) => setProgressBar(e.target.checked)} />
+                      <div className="checkbox-custom"></div>
+                      <span style={{ fontSize: "14px", fontWeight: 600 }}>Burn a retention progress bar</span>
+                    </label>
+                    <p className="form-label-info" style={{ marginLeft: "30px", marginTop: "-6px" }}>
+                      Shorts hide the scrubber — a visible &ldquo;almost done&rdquo; cue keeps viewers from swiping away mid-video.
+                    </p>
+
+                    <label className="checkbox-container" style={{ margin: 0 }}>
+                      <input type="checkbox" checked={enableThumbnail} onChange={(e) => setEnableThumbnail(e.target.checked)} />
+                      <div className="checkbox-custom"></div>
+                      <span style={{ fontSize: "14px", fontWeight: 600 }}>Generate a title thumbnail</span>
+                    </label>
+                    <p className="form-label-info" style={{ marginLeft: "30px", marginTop: "-6px" }}>
+                      A graded, big-text tile for search, the channel grid and suggested feeds.
+                    </p>
+
+                    <label className="checkbox-container" style={{ margin: 0 }}>
+                      <input type="checkbox" checked={subscribeOverlay} onChange={(e) => setSubscribeOverlay(e.target.checked)} />
+                      <div className="checkbox-custom"></div>
+                      <span style={{ fontSize: "14px", fontWeight: 600 }}>Blinking SUBSCRIBE call-to-action</span>
+                    </label>
+                  </div>
+
+                  {subscribeOverlay && (
+                    <div className="form-group" style={{ marginTop: "12px" }}>
+                      <label className="form-label">Channel Handle (optional)</label>
+                      <input
+                        className="form-input"
+                        value={channelHandle}
+                        onChange={(e) => setChannelHandle(e.target.value)}
+                        placeholder="@yourchannel"
+                      />
+                      <p className="form-label-info">Shown under the SUBSCRIBE badge in the closing seconds.</p>
+                    </div>
+                  )}
+                </div>
+
+                <button
                   onClick={handleRenderStoryboard}
-                  disabled={rendering || !config || storyboard.length === 0} 
+                  disabled={rendering || !config || storyboard.length === 0}
                   className="btn btn-primary"
-                  style={{ 
+                  style={{
                     marginTop: "20px",
-                    background: "linear-gradient(135deg, #ec4899 0%, #f43f5e 100%)",
-                    boxShadow: "0 4px 15px rgba(244, 63, 94, 0.2)" 
+                    background: "var(--surface-2)", border: "1px solid rgba(245,178,61,0.25)",
+                    boxShadow: "0 4px 15px rgba(244, 63, 94, 0.2)"
                   }}
                 >
                   🎬 {rendering ? "Rendering Video..." : "Compile & Render Video"}
                 </button>
                 {storyboard.length === 0 && (
-                  <p className="form-label-info" style={{ color: "#fca5a5", marginTop: "8px", textAlign: "center" }}>
+                  <p className="form-label-info" style={{ color: "var(--danger)", marginTop: "8px", textAlign: "center" }}>
                     ⚠️ Please draft a script and storyboard above first to enable video rendering.
                   </p>
                 )}
@@ -1611,419 +2021,6 @@ export default function Home() {
           )}
 
           {/* TAB 2: FULL PRESENTER PIPELINE */}
-          {activeTab === "full" && (
-            <div className="glass-card">
-              <h2 className="card-title"><Tv /> Presenter Pipeline Settings</h2>
-              
-              <div className="form-group">
-                <label className="form-label">Script Topic / Prompt (Ollama)</label>
-                <textarea 
-                  className="form-textarea" 
-                  rows={2}
-                  value={scriptPrompt}
-                  onChange={(e) => setScriptPrompt(e.target.value)}
-                  placeholder="Ask Ollama to write a custom monologue script..."
-                />
-              </div>
-
-              <div className="form-row">
-                <div className="form-group">
-                  <label className="form-label">Ollama Model</label>
-                  <select 
-                    className="form-select"
-                    value={ollamaModel}
-                    onChange={(e) => setOllamaModel(e.target.value)}
-                  >
-                    {config?.ollama_models.map(m => (
-                      <option key={m} value={m}>{m}</option>
-                    )) || <option>Loading...</option>}
-                  </select>
-                </div>
-                <div className="form-group">
-                  <label className="form-label">Narrator Voice</label>
-                  <select 
-                    className="form-select"
-                    value={voice}
-                    onChange={(e) => setVoice(e.target.value)}
-                  >
-                    {config?.voices.map(v => (
-                      <option key={v} value={v}>{v}</option>
-                    )) || <option>Loading...</option>}
-                  </select>
-                </div>
-              </div>
-
-              <div className="form-row">
-                <div className="form-group">
-                  <label className="form-label">Speech Speed ({voiceSpeed}x)</label>
-                  <input 
-                    type="range" min="0.5" max="2.0" step="0.1" className="form-input"
-                    value={voiceSpeed} onChange={(e) => setVoiceSpeed(parseFloat(e.target.value))}
-                  />
-                </div>
-                <div className="form-group">
-                  <label className="form-label">Voice Pitch Effect</label>
-                  <select className="form-select" value={voiceEffect} onChange={(e) => setVoiceEffect(e.target.value)}>
-                    <option value="Normal">Normal</option>
-                    <option value="Kid (High Pitch)">Kid (High Pitch)</option>
-                    <option value="Deep (Low Pitch)">Deep (Low Pitch)</option>
-                  </select>
-                </div>
-              </div>
-
-              <div className="form-group">
-                <label className="form-label">Visual Portrait Prompt (Leonardo.ai)</label>
-                <textarea 
-                  className="form-textarea" 
-                  rows={2}
-                  value={presenterPrompt}
-                  onChange={(e) => setPresenterPrompt(e.target.value)}
-                  placeholder="Describe your talking presenter face, outfit, and background..."
-                />
-              </div>
-
-              <div className="form-row">
-                <div className="form-group">
-                  <label className="form-label">Leonardo Model</label>
-                  <select className="form-select" value={leonardoModel} onChange={(e) => setLeonardoModel(e.target.value)}>
-                    {config?.leonardo_models.map(m => (
-                      <option key={m} value={m}>{m}</option>
-                    )) || <option>Loading...</option>}
-                  </select>
-                </div>
-                <div className="form-group">
-                  <label className="form-label">Aspect Ratio</label>
-                  <select className="form-select" value={aspectRatio} onChange={(e) => setAspectRatio(e.target.value)}>
-                    {config?.aspect_ratios.map(ar => (
-                      <option key={ar} value={ar}>{ar}</option>
-                    )) || <option>Loading...</option>}
-                  </select>
-                </div>
-              </div>
-
-              <div className="form-row">
-                <div className="form-group">
-                  <label className="form-label">Wav2Lip Quality</label>
-                  <select className="form-select" value={lipsyncQuality} onChange={(e) => setLipsyncQuality(e.target.value)}>
-                    <option value="Fast">Fast</option>
-                    <option value="Improved">Improved</option>
-                    <option value="Enhanced">Enhanced</option>
-                  </select>
-                </div>
-                <div className="form-group" style={{ display: "flex", alignItems: "center" }}>
-                  <label className="checkbox-container">
-                    <input type="checkbox" checked={noSmooth} onChange={(e) => setNoSmooth(e.target.checked)} />
-                    <div className="checkbox-custom"></div>
-                    <span style={{ fontSize: "14px" }}>Disable Lip Smoothing (nosmooth)</span>
-                  </label>
-                </div>
-              </div>
-
-              <div className="form-group">
-                <label className="form-label">Compositing B-Roll Layout</label>
-                <select className="form-select" value={compositeLayout} onChange={(e) => setCompositeLayout(e.target.value)}>
-                  <option value="None (Presenter Only)">None (Presenter Only)</option>
-                  <option value="Split-Screen (Top B-Roll, Bottom Presenter)">Split-Screen (Top B-Roll, Bottom Presenter)</option>
-                  <option value="Picture-in-Picture (Presenter Bottom Right)">Picture-in-Picture (Presenter Bottom Right)</option>
-                  <option value="Green Screen (Chroma Key Presenter on B-Roll)">Green Screen (Chroma Key Presenter on B-Roll)</option>
-                </select>
-              </div>
-
-              <div className="form-group">
-                <label className="form-label">B-Roll Video Direct URL (Optional)</label>
-                <input 
-                  type="text" className="form-input" value={bRollUrl} 
-                  onChange={(e) => setBRollUrl(e.target.value)} 
-                  placeholder="Direct MP4 video URL (e.g. from Pexels)..."
-                />
-              </div>
-
-              <button 
-                onClick={handleGeneratePresenter} 
-                disabled={loading || !config} 
-                className="btn btn-primary"
-              >
-                <Play size={18} /> {loading ? "Generating Presenter Video..." : "Run Talking Head Pipeline"}
-              </button>
-            </div>
-          )}
-
-          {/* TAB 3: MANUAL LIPSYNC STUDIO */}
-          {activeTab === "manual" && (
-            <div className="glass-card">
-              <h2 className="card-title"><Sliders /> Manual Lipsync Tools</h2>
-              
-              <div className="form-group">
-                <label className="form-label">Presenter Image File Path (Absolute Local Path)</label>
-                <input 
-                  type="text" className="form-input" value={manualImagePath}
-                  onChange={(e) => setManualImagePath(e.target.value)}
-                  placeholder="Paste absolute path (e.g. /Volumes/.../presenter.png)"
-                />
-                <p className="form-label-info">If you generated an image in the pipeline tab, it auto-fills here.</p>
-              </div>
-
-              <div className="form-group">
-                <label className="form-label">Vocal Audio File Path (Absolute Local Path)</label>
-                <input 
-                  type="text" className="form-input" value={manualAudioPath}
-                  onChange={(e) => setManualAudioPath(e.target.value)}
-                  placeholder="Paste absolute path (e.g. /Volumes/.../speech.wav)"
-                />
-              </div>
-
-              <div className="form-row">
-                <div className="form-group">
-                  <label className="form-label">Wav2Lip Model</label>
-                  <select className="form-select" value={manualVersion} onChange={(e) => setManualVersion(e.target.value)}>
-                    <option value="Wav2Lip_GAN">Wav2Lip_GAN</option>
-                    <option value="Wav2Lip">Wav2Lip</option>
-                  </select>
-                </div>
-                <div className="form-group">
-                  <label className="form-label">Quality Mode</label>
-                  <select className="form-select" value={manualQuality} onChange={(e) => setManualQuality(e.target.value)}>
-                    <option value="Fast">Fast</option>
-                    <option value="Improved">Improved</option>
-                    <option value="Enhanced">Enhanced</option>
-                  </select>
-                </div>
-              </div>
-
-              <div className="form-group">
-                <label className="form-label">Background / B-Roll Video URL (Optional)</label>
-                <input 
-                  type="text" className="form-input" value={manualBRollUrl}
-                  onChange={(e) => setManualBRollUrl(e.target.value)}
-                  placeholder="Direct video link..."
-                />
-              </div>
-
-              <div className="form-group">
-                <label className="form-label">B-Roll Composite Layout</label>
-                <select className="form-select" value={manualLayout} onChange={(e) => setManualLayout(e.target.value)}>
-                  <option value="None (Presenter Only)">None (Presenter Only)</option>
-                  <option value="Split-Screen (Top B-Roll, Bottom Presenter)">Split-Screen (Top B-Roll, Bottom Presenter)</option>
-                  <option value="Picture-in-Picture (Presenter Bottom Right)">Picture-in-Picture (Presenter Bottom Right)</option>
-                  <option value="Green Screen (Chroma Key Presenter on B-Roll)">Green Screen (Chroma Key Presenter on B-Roll)</option>
-                </select>
-              </div>
-
-              <button 
-                onClick={handleManualLipsync} 
-                disabled={loading || !config} 
-                className="btn btn-primary"
-              >
-                <Play size={18} /> {loading ? "Lipsynching..." : "Sync Audio with Portrait"}
-              </button>
-            </div>
-          )}
-
-          {/* TAB 4: LONG-FORM LANDSCAPE STUDIO */}
-          {activeTab === "longform" && (
-            <>
-              <div className="glass-card">
-                <h2 className="card-title"><Sparkles /> Landscape Script Configuration</h2>
-                
-                <div className="form-group">
-                  <label className="form-label">Video Topic or Category Prompt</label>
-                  <textarea 
-                    className="form-textarea" 
-                    rows={2}
-                    value={longPrompt}
-                    onChange={(e) => setLongPrompt(e.target.value)}
-                    placeholder="Describe your video topic... (e.g. quantum physics facts, dark history of ancient cities)"
-                  />
-                </div>
-
-                <div className="form-row">
-                  <div className="form-group">
-                    <label className="form-label">Ollama LLM Model</label>
-                    <select 
-                      className="form-select"
-                      value={longOllamaModel}
-                      onChange={(e) => setLongOllamaModel(e.target.value)}
-                    >
-                      {config?.ollama_models.map(m => (
-                        <option key={m} value={m}>{m}</option>
-                      )) || <option>Loading...</option>}
-                    </select>
-                  </div>
-                  <div className="form-group">
-                    <label className="form-label">Pexels API Key</label>
-                    <input 
-                      type="password" 
-                      className="form-input"
-                      value={pexelsApiKey}
-                      onChange={(e) => handlePexelsKeyChange(e.target.value)}
-                      placeholder="Enter Pexels API Key..."
-                    />
-                    <p className="form-label-info">Saved locally in your browser's localStorage.</p>
-                  </div>
-                </div>
-
-                <button 
-                  onClick={handleLongformDraft}
-                  disabled={drafting || !config} 
-                  className="btn btn-primary"
-                  style={{ marginTop: "15px", background: "linear-gradient(135deg, #a855f7 0%, #7c3aed 100%)" }}
-                >
-                  📝 {drafting ? "Drafting Landscape Storyboard..." : "Draft Landscape Script & Storyboard"}
-                </button>
-              </div>
-
-              <div className="glass-card" style={{ marginTop: "20px" }}>
-                <h2 className="card-title"><Tv /> Video Style & Rendering Settings</h2>
-
-                <div className="form-row">
-                  <div className="form-group">
-                    <label className="form-label">Visual Format Mode</label>
-                    <input 
-                      type="text" 
-                      className="form-input" 
-                      value="Pexels Stock Video (Landscape 16:9)" 
-                      disabled 
-                      style={{ opacity: 0.8 }}
-                    />
-                  </div>
-                  <div className="form-group">
-                    <label className="form-label">Background Music</label>
-                    <select 
-                      className="form-select"
-                      value={longMusicStyle}
-                      onChange={(e) => setLongMusicStyle(e.target.value)}
-                    >
-                      {config?.music_presets.map(m => (
-                        <option key={m} value={m}>{m}</option>
-                      )) || <option>Loading...</option>}
-                    </select>
-                  </div>
-                </div>
-
-                <div className="form-row">
-                  <div className="form-group">
-                    <label className="form-label">Voice Narrator</label>
-                    <select 
-                      className="form-select"
-                      value={longVoice}
-                      onChange={(e) => {
-                        const newVoice = e.target.value;
-                        setLongVoice(newVoice);
-                        if (storyboard && storyboard.length > 0) {
-                          const updated = storyboard.map(scene => ({
-                            ...scene,
-                            speaker: newVoice
-                          }));
-                          setStoryboard(updated);
-                        }
-                      }}
-                    >
-                      {config?.voices.map(v => (
-                        <option key={v} value={v}>{v}</option>
-                      )) || <option>Loading...</option>}
-                    </select>
-                  </div>
-                  <div className="form-group">
-                    <label className="form-label">Voice Speed ({longVoiceSpeed}x)</label>
-                    <input 
-                      type="range" 
-                      min="0.5" 
-                      max="2.0" 
-                      step="0.1"
-                      className="form-input" 
-                      value={longVoiceSpeed}
-                      onChange={(e) => setLongVoiceSpeed(parseFloat(e.target.value))}
-                    />
-                  </div>
-                </div>
-
-                <div className="form-group" style={{ marginTop: "12px", marginBottom: "12px" }}>
-                  <label className="checkbox-container" style={{ margin: 0 }}>
-                    <input 
-                      type="checkbox" 
-                      checked={longEnableTransitionSfx}
-                      onChange={(e) => setLongEnableTransitionSfx(e.target.checked)}
-                    />
-                    <div className="checkbox-custom"></div>
-                    <span style={{ fontSize: "14px", fontWeight: 600 }}>Enable Transition Sound Effects (Whoosh & Pop)</span>
-                  </label>
-                </div>
-
-                <div className="form-group" style={{ borderTop: "1px solid rgba(255, 255, 255, 0.05)", paddingTop: "15px" }}>
-                  <label className="form-label"><Subtitles size={16} style={{ display: "inline", marginRight: "6px" }} /> Auto-Caption & Position Settings</label>
-                  
-                  <div style={{ display: "flex", flexWrap: "wrap", gap: "20px", marginTop: "12px" }}>
-                    <div style={{ flex: "1 1 280px", display: "flex", flexDirection: "column", gap: "16px" }}>
-                      <label className="checkbox-container" style={{ margin: 0 }}>
-                        <input 
-                          type="checkbox" 
-                          checked={longEnableCaptions}
-                          onChange={(e) => setLongEnableCaptions(e.target.checked)}
-                        />
-                        <div className="checkbox-custom"></div>
-                        <span style={{ fontSize: "14px", fontWeight: 600 }}>Burn Centered Word Subtitles</span>
-                      </label>
-
-                      <div className="form-group" style={{ margin: 0 }}>
-                        <label className="form-label" style={{ display: "flex", justifyContent: "space-between", marginBottom: "6px" }}>
-                          <span>Text Size</span>
-                          <span style={{ color: "#c084fc", fontWeight: 600 }}>{longCaptionSize}px</span>
-                        </label>
-                        <div className="slider-group">
-                          <input 
-                            type="range" 
-                            min="18" 
-                            max="72" 
-                            value={longCaptionSize} 
-                            onChange={(e) => setLongCaptionSize(parseInt(e.target.value))}
-                            style={{ flexGrow: 1, padding: 0, height: "6px", background: "rgba(255,255,255,0.1)", borderRadius: "3px", cursor: "pointer" }}
-                            disabled={!longEnableCaptions}
-                          />
-                        </div>
-                      </div>
-
-                      <div className="form-group" style={{ margin: 0 }}>
-                        <label className="form-label" style={{ display: "flex", justifyContent: "space-between", marginBottom: "6px" }}>
-                          <span>Vertical Position (from bottom)</span>
-                          <span style={{ color: "#c084fc", fontWeight: 600 }}>{longCaptionMarginV}px</span>
-                        </label>
-                        <div className="slider-group">
-                          <input 
-                            type="range" 
-                            min="20" 
-                            max="300" 
-                            value={longCaptionMarginV} 
-                            onChange={(e) => setLongCaptionMarginV(parseInt(e.target.value))}
-                            style={{ flexGrow: 1, padding: 0, height: "6px", background: "rgba(255,255,255,0.1)", borderRadius: "3px", cursor: "pointer" }}
-                            disabled={!longEnableCaptions}
-                          />
-                        </div>
-                      </div>
-                    </div>
-                  </div>
-                </div>
-
-                <button 
-                  onClick={handleLongformRender}
-                  disabled={rendering || !config || storyboard.length === 0} 
-                  className="btn btn-primary"
-                  style={{ 
-                    marginTop: "20px",
-                    background: "linear-gradient(135deg, #ec4899 0%, #f43f5e 100%)",
-                    boxShadow: "0 4px 15px rgba(244, 63, 94, 0.2)" 
-                  }}
-                >
-                  🎬 {rendering ? "Rendering Long-form Video..." : "Compile & Render Long-form Video"}
-                </button>
-                {storyboard.length === 0 && (
-                  <p className="form-label-info" style={{ color: "#fca5a5", marginTop: "8px", textAlign: "center" }}>
-                    ⚠️ Please draft a script and storyboard above first to enable video rendering.
-                  </p>
-                )}
-              </div>
-            </>
-          )}
-
         </div>
 
         {/* Right Side: Output and Previews */}
@@ -2040,7 +2037,7 @@ export default function Home() {
                   <span style={{ 
                     fontSize: "12px", 
                     fontWeight: 700, 
-                    color: statusText === "Finished!" ? "#10b981" : statusText === "Failed" ? "#ef4444" : "#a855f7",
+                    color: statusText === "Finished!" ? "var(--ok)" : statusText === "Failed" ? "var(--danger)" : "var(--accent)",
                     background: "rgba(255,255,255,0.03)",
                     padding: "4px 10px",
                     borderRadius: "12px",
@@ -2052,9 +2049,9 @@ export default function Home() {
               </div>
 
               {loading ? (
-                <div className="video-container" style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", background: "#05040a" }}>
+                <div className="video-container" style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", background: "var(--bg-2)" }}>
                   <div className="loader-glow"></div>
-                  <h4 style={{ color: "#a855f7", fontWeight: 700 }}>Processing AI pipeline...</h4>
+                  <h4 style={{ color: "var(--accent)", fontWeight: 700 }}>Processing AI pipeline...</h4>
                   <p className="form-label-info" style={{ width: "80%", textAlign: "center", marginTop: "8px" }}>Exchanges models, draws images, loops voiceover, synthesizes lip-movements and merges B-roll layouts.</p>
                 </div>
               ) : finalVideoUrl ? (
@@ -2065,30 +2062,65 @@ export default function Home() {
                   </video>
                 </div>
               ) : (
-                <div className="video-container" style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", background: "#06050e", opacity: 0.8 }}>
-                  <Tv size={48} color="#475569" style={{ marginBottom: "15px" }} />
-                  <p style={{ color: "#64748b", fontSize: "14px", fontWeight: 500 }}>No video generated yet.</p>
+                <div className="video-container" style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", background: "var(--bg-2)", opacity: 0.8 }}>
+                  <Tv size={48} color="var(--text-muted)" style={{ marginBottom: "15px" }} />
+                  <p style={{ color: "var(--text-muted)", fontSize: "14px", fontWeight: 500 }}>No video generated yet.</p>
                   <p className="form-label-info" style={{ textAlign: "center", width: "80%" }}>Select a tab, fill in the topic details, and click Generate to start rendering your shorts video.</p>
                 </div>
               )}
 
               {/* Download link */}
               {finalVideoUrl && !loading && (
-                <a 
-                  href={finalVideoUrl} 
-                  download 
-                  className="btn btn-secondary" 
+                <a
+                  href={finalVideoUrl}
+                  download
+                  className="btn btn-secondary"
                   style={{ marginTop: "10px", fontSize: "14px", padding: "8px 16px" }}
                 >
                   📥 Download Rendered Video
                 </a>
               )}
+
+              {/* Generated thumbnail — what viewers actually click on in search
+                  and suggested feeds, so it gets its own preview and download. */}
+              {thumbnailUrl && !loading && (
+                <div style={{ marginTop: "16px", paddingTop: "16px", borderTop: "1px solid var(--border)" }}>
+                  <span className="form-label" style={{ fontSize: "12px", textTransform: "uppercase", letterSpacing: "0.5px", display: "block", marginBottom: "8px" }}>
+                    Generated Thumbnail
+                  </span>
+                  <div style={{ display: "flex", gap: "14px", alignItems: "flex-start" }}>
+                    <img
+                      src={thumbnailUrl}
+                      alt="Generated video thumbnail"
+                      style={{
+                        width: "108px",
+                        borderRadius: "var(--border-radius-sm)",
+                        border: "1px solid var(--border-strong)",
+                        display: "block"
+                      }}
+                    />
+                    <div style={{ flex: 1, minWidth: 0 }}>
+                      <p className="form-label-info" style={{ margin: "0 0 10px 0" }}>
+                        Graded and captioned for legibility at grid size.
+                      </p>
+                      <a
+                        href={thumbnailUrl}
+                        download
+                        className="btn btn-secondary"
+                        style={{ fontSize: "13px", padding: "6px 12px", display: "inline-flex", alignItems: "center", gap: "6px" }}
+                      >
+                        <Download size={14} /> Download Thumbnail
+                      </a>
+                    </div>
+                  </div>
+                </div>
+              )}
             </div>
 
             {/* Social Media Publish Section */}
             {finalVideoUrl && !loading && (
-              <div className="glass-card" style={{ padding: "18px", border: "1px solid rgba(168, 85, 247, 0.2)", marginTop: "15px" }}>
-                <h3 className="card-title" style={{ fontSize: "18px", display: "flex", gap: "8px", alignItems: "center", color: "#c084fc", margin: "0 0 10px 0" }}>
+              <div className="glass-card" style={{ padding: "18px", border: "1px solid rgba(200, 255, 0, 0.2)", marginTop: "15px" }}>
+                <h3 className="card-title" style={{ fontSize: "18px", display: "flex", gap: "8px", alignItems: "center", color: "var(--accent)", margin: "0 0 10px 0" }}>
                   <Sparkles size={18} /> Publish to Social Media
                 </h3>
                 <p className="form-label-info" style={{ marginBottom: "15px" }}>
@@ -2107,10 +2139,10 @@ export default function Home() {
                           onChange={(e) => setUploadPlatforms({ ...uploadPlatforms, youtube: e.target.checked })}
                           style={{ marginRight: "8px" }}
                         />
-                        <span style={{ fontSize: "15px", fontWeight: 600, color: "#f87171" }}>YouTube Shorts</span>
+                        <span style={{ fontSize: "15px", fontWeight: 600, color: "var(--danger)" }}>YouTube Shorts</span>
                       </label>
                       {isYtAuthenticated ? (
-                        <span style={{ fontSize: "11px", color: "#10b981", fontWeight: 700 }}>Connected ✅</span>
+                        <span style={{ fontSize: "11px", color: "var(--ok)", fontWeight: 700 }}>Connected ✅</span>
                       ) : (
                         <button 
                           onClick={handleInitYoutubeAuth}
@@ -2176,7 +2208,7 @@ export default function Home() {
 
                         {/* Scheduling UI inside YouTube Section */}
                         <div style={{ background: "rgba(0,0,0,0.15)", padding: "10px", borderRadius: "6px", margin: "12px 0 10px 0", border: "1px solid rgba(255,255,255,0.03)" }}>
-                          <span style={{ color: "#f87171", fontSize: "11px", fontWeight: 600, display: "block", marginBottom: "6px", textTransform: "uppercase" }}>Scheduling</span>
+                          <span style={{ color: "var(--danger)", fontSize: "11px", fontWeight: 600, display: "block", marginBottom: "6px", textTransform: "uppercase" }}>Scheduling</span>
                           <div style={{ display: "flex", gap: "15px", marginBottom: "6px" }}>
                             <label style={{ display: "flex", alignItems: "center", cursor: "pointer", margin: 0 }}>
                               <input 
@@ -2186,7 +2218,7 @@ export default function Home() {
                                 onChange={() => setYtPublishImmediate(true)}
                                 style={{ marginRight: "4px" }}
                               />
-                              <span style={{ fontSize: "12px", color: "#cbd5e1" }}>Immediate</span>
+                              <span style={{ fontSize: "12px", color: "var(--text-secondary)" }}>Immediate</span>
                             </label>
 
                             <label style={{ display: "flex", alignItems: "center", cursor: "pointer", margin: 0 }}>
@@ -2197,7 +2229,7 @@ export default function Home() {
                                 onChange={() => setYtPublishImmediate(false)}
                                 style={{ marginRight: "4px" }}
                               />
-                              <span style={{ fontSize: "12px", color: "#cbd5e1" }}>Later</span>
+                              <span style={{ fontSize: "12px", color: "var(--text-secondary)" }}>Later</span>
                             </label>
                           </div>
 
@@ -2218,7 +2250,7 @@ export default function Home() {
                           disabled={ytIsUploading}
                           className="btn btn-primary"
                           style={{ 
-                            background: "linear-gradient(135deg, #ef4444 0%, #dc2626 100%)",
+                            background: "linear-gradient(135deg, var(--danger) 0%, var(--danger) 100%)",
                             boxShadow: "0 4px 12px rgba(239, 68, 68, 0.2)",
                             marginTop: "5px",
                             padding: "8px 12px",
@@ -2235,14 +2267,14 @@ export default function Home() {
                             <span className="form-label" style={{ fontSize: "10px", textTransform: "uppercase", display: "block", marginBottom: "4px" }}>YouTube Progress Logs</span>
                             <div className="log-console" style={{ height: "90px", fontSize: "11px", overflowY: "auto", padding: "6px" }}>
                               {ytUploadLogs.map((log, i) => (
-                                <div key={i} style={{ color: log.startsWith("❌") ? "#ef4444" : log.startsWith("✅") || log.includes("successful") ? "#10b981" : "#e2e8f0", marginBottom: "2px" }}>{log}</div>
+                                <div key={i} style={{ color: log.startsWith("❌") ? "var(--danger)" : log.startsWith("✅") || log.includes("successful") ? "var(--ok)" : "var(--text-primary)", marginBottom: "2px" }}>{log}</div>
                               ))}
                             </div>
                           </div>
                         )}
                       </div>
                     ) : (
-                      <p style={{ fontSize: "12px", color: "#64748b", margin: "10px 0 0 0" }}>Check the box above to enable YouTube Shorts publishing configuration.</p>
+                      <p style={{ fontSize: "12px", color: "var(--text-muted)", margin: "10px 0 0 0" }}>Check the box above to enable YouTube Shorts publishing configuration.</p>
                     )}
                   </div>
 
@@ -2259,9 +2291,9 @@ export default function Home() {
                         <span style={{ fontSize: "15px", fontWeight: 600, color: "#f472b6" }}>Instagram Reels</span>
                       </label>
                       {isIgConfigured ? (
-                        <span style={{ fontSize: "11px", color: "#10b981", fontWeight: 700 }}>Ready ✅</span>
+                        <span style={{ fontSize: "11px", color: "var(--ok)", fontWeight: 700 }}>Ready ✅</span>
                       ) : (
-                        <span style={{ fontSize: "11px", color: "#eab308", fontWeight: 700 }}>Not Configured ⚠️</span>
+                        <span style={{ fontSize: "11px", color: "var(--warn)", fontWeight: 700 }}>Not Configured ⚠️</span>
                       )}
                     </div>
 
@@ -2290,7 +2322,7 @@ export default function Home() {
                                 onChange={() => setIgPublishImmediate(true)}
                                 style={{ marginRight: "4px" }}
                               />
-                              <span style={{ fontSize: "12px", color: "#cbd5e1" }}>Immediate</span>
+                              <span style={{ fontSize: "12px", color: "var(--text-secondary)" }}>Immediate</span>
                             </label>
 
                             <label style={{ display: "flex", alignItems: "center", cursor: "pointer", margin: 0 }}>
@@ -2301,7 +2333,7 @@ export default function Home() {
                                 onChange={() => setIgPublishImmediate(false)}
                                 style={{ marginRight: "4px" }}
                               />
-                              <span style={{ fontSize: "12px", color: "#cbd5e1" }}>Later</span>
+                              <span style={{ fontSize: "12px", color: "var(--text-secondary)" }}>Later</span>
                             </label>
                           </div>
 
@@ -2339,14 +2371,14 @@ export default function Home() {
                             <span className="form-label" style={{ fontSize: "10px", textTransform: "uppercase", display: "block", marginBottom: "4px" }}>Instagram Progress Logs</span>
                             <div className="log-console" style={{ height: "90px", fontSize: "11px", overflowY: "auto", padding: "6px" }}>
                               {igUploadLogs.map((log, i) => (
-                                <div key={i} style={{ color: log.startsWith("❌") ? "#ef4444" : log.startsWith("✅") || log.includes("successful") ? "#10b981" : "#e2e8f0", marginBottom: "2px" }}>{log}</div>
+                                <div key={i} style={{ color: log.startsWith("❌") ? "var(--danger)" : log.startsWith("✅") || log.includes("successful") ? "var(--ok)" : "var(--text-primary)", marginBottom: "2px" }}>{log}</div>
                               ))}
                             </div>
                           </div>
                         )}
                       </div>
                     ) : (
-                      <p style={{ fontSize: "12px", color: "#64748b", margin: "10px 0 0 0" }}>Check the box above to enable Instagram Reels publishing configuration.</p>
+                      <p style={{ fontSize: "12px", color: "var(--text-muted)", margin: "10px 0 0 0" }}>Check the box above to enable Instagram Reels publishing configuration.</p>
                     )}
                   </div>
 
@@ -2354,34 +2386,13 @@ export default function Home() {
               </div>
             )}
 
-            {/* Intermediate Assets (Only for Talking Head) */}
-            {activeTab === "full" && (presenterImageUrl || voiceAudioUrl) && (
-              <div className="glass-card" style={{ padding: "18px" }}>
-                <h3 className="card-title" style={{ fontSize: "16px", marginBottom: "12px" }}>Pipeline Assets</h3>
-                <div style={{ display: "flex", gap: "15px", alignItems: "center" }}>
-                  {presenterImageUrl && (
-                    <div style={{ flexShrink: 0 }}>
-                      <img src={presenterImageUrl} className="img-preview" style={{ height: "120px", width: "70px", margin: 0 }} alt="Presenter Asset" />
-                    </div>
-                  )}
-                  {voiceAudioUrl && (
-                    <div style={{ flexGrow: 1 }}>
-                      <label className="form-label" style={{ fontSize: "12px" }}><Volume2 size={12} style={{ display: "inline" }} /> Voice Audio</label>
-                      <audio key={voiceAudioUrl} controls className="audio-preview" style={{ height: "30px", marginTop: "4px" }}>
-                        <source src={voiceAudioUrl} type="audio/wav" />
-                      </audio>
-                    </div>
-                  )}
-                </div>
-              </div>
-            )}
 
             {/* Log Console */}
             <div className="glass-card" style={{ padding: "18px" }}>
               <h3 className="card-title" style={{ fontSize: "16px", marginBottom: "8px" }}><FileText size={16} /> Console Execution Logs</h3>
               <div className="log-console">
                 {logs.length === 0 ? (
-                  <div className="log-entry" style={{ color: "#475569" }}>Waiting to run a generation job...</div>
+                  <div className="log-entry" style={{ color: "var(--text-muted)" }}>Waiting to run a generation job...</div>
                 ) : (
                   logs.map((log, i) => (
                     <div key={i} className="log-entry">{log}</div>
@@ -2403,7 +2414,7 @@ export default function Home() {
                   <h2 className="card-title" style={{ margin: 0, display: "flex", alignItems: "center", gap: "8px" }}>
                     <Tv /> Video Library History
                   </h2>
-                  <p style={{ color: "#94a3b8", fontSize: "13px", marginTop: "4px" }}>
+                  <p style={{ color: "var(--text-secondary)", fontSize: "13px", marginTop: "4px" }}>
                     Browse your database of previously generated video shorts, drafts, and talking head presentations.
                   </p>
                 </div>
@@ -2414,10 +2425,10 @@ export default function Home() {
 
               <div className="library-grid">
                 {history.length === 0 ? (
-                  <div style={{ gridColumn: "1/-1", textAlign: "center", padding: "60px 20px", color: "#64748b" }}>
+                  <div style={{ gridColumn: "1/-1", textAlign: "center", padding: "60px 20px", color: "var(--text-muted)" }}>
                     <Tv size={48} style={{ marginBottom: "15px", opacity: 0.3 }} />
                     <p style={{ fontSize: "15px", fontWeight: 500 }}>No video history found.</p>
-                    <p style={{ fontSize: "12px", color: "#475569", marginTop: "4px" }}>Start generating shorts to build your video library.</p>
+                    <p style={{ fontSize: "12px", color: "var(--text-muted)", marginTop: "4px" }}>Start generating shorts to build your video library.</p>
                   </div>
                 ) : (
                   history.map((item) => (
@@ -2430,35 +2441,35 @@ export default function Home() {
                             textTransform: "uppercase",
                             padding: "3px 8px", 
                             borderRadius: "10px",
-                            background: item.status === "completed" ? "rgba(16, 185, 129, 0.1)" : item.status === "draft" ? "rgba(168, 85, 247, 0.1)" : "rgba(239, 68, 68, 0.1)",
-                            color: item.status === "completed" ? "#10b981" : item.status === "draft" ? "#c084fc" : "#ef4444",
-                            border: `1px solid ${item.status === "completed" ? "rgba(16, 185, 129, 0.2)" : item.status === "draft" ? "rgba(168, 85, 247, 0.2)" : "rgba(239, 68, 68, 0.2)"}`
+                            background: item.status === "completed" ? "rgba(16, 185, 129, 0.1)" : item.status === "draft" ? "rgba(200, 255, 0, 0.1)" : "rgba(239, 68, 68, 0.1)",
+                            color: item.status === "completed" ? "var(--ok)" : item.status === "draft" ? "var(--accent)" : "var(--danger)",
+                            border: `1px solid ${item.status === "completed" ? "rgba(16, 185, 129, 0.2)" : item.status === "draft" ? "rgba(200, 255, 0, 0.2)" : "rgba(239, 68, 68, 0.2)"}`
                           }}>
                             {item.status}
                           </span>
-                          <span style={{ fontSize: "11px", color: "#64748b" }}>
+                          <span style={{ fontSize: "11px", color: "var(--text-muted)" }}>
                             {new Date(item.created_at).toLocaleDateString()}
                           </span>
                         </div>
                         
-                        <h4 style={{ color: "#f8fafc", fontSize: "15px", fontWeight: 600, margin: "0 0 8px 0", lineHeight: "1.4" }}>
+                        <h4 style={{ color: "var(--text-primary)", fontSize: "15px", fontWeight: 600, margin: "0 0 8px 0", lineHeight: "1.4" }}>
                           {item.topic || item.prompt || "Untitled Short"}
                         </h4>
                         
                         {item.status === "completed" && item.video_url && (
-                          <div className="video-container" style={{ minHeight: "150px", background: "#06050e", borderRadius: "8px", overflow: "hidden", margin: "10px 0" }}>
+                          <div className="video-container" style={{ minHeight: "150px", background: "var(--bg-2)", borderRadius: "8px", overflow: "hidden", margin: "10px 0" }}>
                             <video src={item.video_url} controls style={{ width: "100%", maxHeight: "200px" }} />
                           </div>
                         )}
                         
                         {item.status === "draft" && (
-                          <div style={{ padding: "12px", background: "rgba(255,255,255,0.02)", borderRadius: "8px", border: "1px dashed rgba(255,255,255,0.05)", margin: "10px 0", textAlign: "center", color: "#94a3b8", fontSize: "12px" }}>
+                          <div style={{ padding: "12px", background: "rgba(255,255,255,0.02)", borderRadius: "8px", border: "1px dashed rgba(255,255,255,0.05)", margin: "10px 0", textAlign: "center", color: "var(--text-secondary)", fontSize: "12px" }}>
                             📝 Storyboard draft ready for editing.
                           </div>
                         )}
 
                         {item.status === "failed" && (
-                          <div style={{ padding: "12px", background: "rgba(239,68,68,0.02)", borderRadius: "8px", border: "1px dashed rgba(239,68,68,0.08)", margin: "10px 0", textAlign: "center", color: "#fca5a5", fontSize: "12px" }}>
+                          <div style={{ padding: "12px", background: "rgba(239,68,68,0.02)", borderRadius: "8px", border: "1px dashed rgba(239,68,68,0.08)", margin: "10px 0", textAlign: "center", color: "var(--danger)", fontSize: "12px" }}>
                             ❌ Generation failed.
                           </div>
                         )}
@@ -2485,9 +2496,9 @@ export default function Home() {
                           style={{
                             width: "100%",
                             marginTop: "12px",
-                            background: "linear-gradient(135deg, #a855f7 0%, #ec4899 100%)",
+                            background: "linear-gradient(135deg, var(--accent) 0%, var(--accent-press) 100%)",
                             border: "none",
-                            color: "white",
+                            color: "var(--accent-ink)",
                             fontWeight: 600,
                             padding: "8px 0"
                           }}
@@ -2509,8 +2520,8 @@ export default function Home() {
                           style={{
                             width: "100%",
                             marginTop: "12px",
-                            borderColor: "rgba(168, 85, 247, 0.4)",
-                            color: "#d8b4fe"
+                            borderColor: "rgba(200, 255, 0, 0.4)",
+                            color: "var(--accent)"
                           }}
                         >
                           ✏️ Edit Storyboard Draft
@@ -2524,7 +2535,7 @@ export default function Home() {
                           width: "100%",
                           marginTop: "8px",
                           borderColor: "rgba(239, 68, 68, 0.2)",
-                          color: "#f87171",
+                          color: "var(--danger)",
                           background: "rgba(239, 68, 68, 0.05)",
                           display: "flex",
                           alignItems: "center",
@@ -2548,7 +2559,7 @@ export default function Home() {
                   <h2 className="card-title" style={{ margin: 0, display: "flex", alignItems: "center", gap: "8px" }}>
                     <Layers /> Social Upload Queue
                   </h2>
-                  <p style={{ color: "#94a3b8", fontSize: "13px", marginTop: "4px" }}>
+                  <p style={{ color: "var(--text-secondary)", fontSize: "13px", marginTop: "4px" }}>
                     Monitor the background social media uploader, track status, and view execution logs for scheduled posts.
                   </p>
                 </div>
@@ -2559,10 +2570,10 @@ export default function Home() {
 
               <div className="queue-list">
                 {uploadQueue.length === 0 ? (
-                  <div style={{ textAlign: "center", padding: "60px 20px", color: "#64748b" }}>
+                  <div style={{ textAlign: "center", padding: "60px 20px", color: "var(--text-muted)" }}>
                     <Layers style={{ marginBottom: "15px", opacity: 0.3 }} size={48} />
                     <p style={{ fontSize: "15px", fontWeight: 500 }}>No scheduled upload jobs in queue.</p>
-                    <p style={{ fontSize: "12px", color: "#475569", marginTop: "4px" }}>Publish or schedule a video from the publisher panel to start.</p>
+                    <p style={{ fontSize: "12px", color: "var(--text-muted)", marginTop: "4px" }}>Publish or schedule a video from the publisher panel to start.</p>
                   </div>
                 ) : (
                   uploadQueue.map((job) => {
@@ -2575,7 +2586,7 @@ export default function Home() {
                         <div className="queue-item-header">
                           <div>
                             <div style={{ display: "flex", alignItems: "center", gap: "10px", flexWrap: "wrap" }}>
-                              <h4 style={{ color: "#f8fafc", fontSize: "16px", fontWeight: 600, margin: 0 }}>
+                              <h4 style={{ color: "var(--text-primary)", fontSize: "16px", fontWeight: 600, margin: 0 }}>
                                 {job.topic || "Untitled Video"}
                               </h4>
                               <span className={`status-badge status-${job.status}`}>
@@ -2583,14 +2594,14 @@ export default function Home() {
                               </span>
                             </div>
                             
-                            <div style={{ display: "flex", gap: "12px", marginTop: "6px", fontSize: "12px", color: "#94a3b8" }}>
+                            <div style={{ display: "flex", gap: "12px", marginTop: "6px", fontSize: "12px", color: "var(--text-secondary)" }}>
                               <span>
                                 📤 Platforms: {platformsList.map((p: string) => p === "youtube" ? "YouTube Shorts" : "Instagram Reels").join(", ")}
                               </span>
                               <span>•</span>
                               <span>
                                 {isScheduled ? (
-                                  <span style={{ color: "#f59e0b", fontWeight: 500 }}>
+                                  <span style={{ color: "var(--warn)", fontWeight: 500 }}>
                                     🕒 Scheduled for: {new Date(job.scheduled_time).toLocaleString()}
                                   </span>
                                 ) : (
@@ -2603,7 +2614,7 @@ export default function Home() {
                           <button
                             onClick={() => setExpandedJobId(isExpanded ? null : job.id)}
                             className="btn btn-secondary"
-                            style={{ width: "auto", margin: 0, padding: "6px 12px", fontSize: "12px", borderColor: isExpanded ? "#a855f7" : "rgba(255,255,255,0.1)" }}
+                            style={{ width: "auto", margin: 0, padding: "6px 12px", fontSize: "12px", borderColor: isExpanded ? "var(--accent)" : "rgba(255,255,255,0.1)" }}
                           >
                             {isExpanded ? "Hide Logs Console" : "View Logs Console"}
                           </button>
@@ -2611,17 +2622,17 @@ export default function Home() {
 
                         {isExpanded && (
                           <div style={{ borderTop: "1px solid rgba(255,255,255,0.05)", paddingTop: "12px", marginTop: "6px" }}>
-                            <span style={{ fontSize: "11px", fontWeight: 600, color: "#a855f7", textTransform: "uppercase", letterSpacing: "0.5px", display: "block", marginBottom: "6px" }}>
+                            <span style={{ fontSize: "11px", fontWeight: 600, color: "var(--accent)", textTransform: "uppercase", letterSpacing: "0.5px", display: "block", marginBottom: "6px" }}>
                               Execution Terminal Log
                             </span>
-                            <div className="log-console" style={{ height: "180px", overflowY: "auto", fontSize: "12px", fontFamily: "monospace", background: "#05040a" }}>
+                            <div className="log-console" style={{ height: "180px", overflowY: "auto", fontSize: "12px", fontFamily: "monospace", background: "var(--bg-2)" }}>
                               {job.logs && job.logs.length > 0 ? (
                                 job.logs.map((log: string, lIdx: number) => (
                                   <div 
                                     key={lIdx} 
                                     className="log-entry" 
                                     style={{ 
-                                      color: log.startsWith("❌") || log.toLowerCase().includes("error") ? "#ef4444" : log.startsWith("✅") || log.toLowerCase().includes("success") ? "#10b981" : "#cbd5e1",
+                                      color: log.startsWith("❌") || log.toLowerCase().includes("error") ? "var(--danger)" : log.startsWith("✅") || log.toLowerCase().includes("success") ? "var(--ok)" : "var(--text-secondary)",
                                       marginBottom: "4px" 
                                     }}
                                   >
@@ -2629,7 +2640,7 @@ export default function Home() {
                                   </div>
                                 ))
                               ) : (
-                                <div style={{ color: "#475569" }}>No logs captured for this job.</div>
+                                <div style={{ color: "var(--text-muted)" }}>No logs captured for this job.</div>
                               )}
                             </div>
                           </div>
@@ -2649,7 +2660,7 @@ export default function Home() {
                   <h2 className="card-title" style={{ margin: 0, display: "flex", alignItems: "center", gap: "8px" }}>
                     🤖 Daily Auto-Agent Scheduler
                   </h2>
-                  <p style={{ color: "#94a3b8", fontSize: "13px", marginTop: "4px" }}>
+                  <p style={{ color: "var(--text-secondary)", fontSize: "13px", marginTop: "4px" }}>
                     Configure the autonomous scheduler agent to dynamically find trends, compose custom music, render videos, and post on YouTube.
                   </p>
                 </div>
@@ -2662,15 +2673,18 @@ export default function Home() {
                 <div className="scheduler-layout" style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "24px" }}>
                   {/* Left Side: Settings */}
                   <div style={{ display: "flex", flexDirection: "column", gap: "16px", background: "rgba(255,255,255,0.02)", padding: "20px", borderRadius: "12px", border: "1px solid rgba(255,255,255,0.05)" }}>
-                    <h3 style={{ margin: "0 0 10px 0", color: "#f8fafc", fontSize: "16px", display: "flex", alignItems: "center", gap: "8px" }}>
+                    <h3 style={{ margin: "0 0 10px 0", color: "var(--text-primary)", fontSize: "16px", display: "flex", alignItems: "center", gap: "8px" }}>
                       ⚙️ Scheduler Settings
                     </h3>
                     
                     {/* Enable Toggle */}
-                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", background: "rgba(168, 85, 247, 0.05)", border: "1px solid rgba(168, 85, 247, 0.2)", padding: "12px 16px", borderRadius: "8px" }}>
+                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", background: "rgba(200, 255, 0, 0.05)", border: "1px solid rgba(200, 255, 0, 0.2)", padding: "12px 16px", borderRadius: "8px" }}>
                       <div>
-                        <div style={{ fontWeight: 600, color: "#e9d5ff", fontSize: "14px" }}>Enable Automatic Posting</div>
-                        <div style={{ fontSize: "12px", color: "#c084fc" }}>Autonomously publish 2 videos daily</div>
+                        <div style={{ fontWeight: 600, color: "var(--text-primary)", fontSize: "14px" }}>Enable Automatic Posting</div>
+                        <div style={{ fontSize: "12px", color: "var(--accent)" }}>
+                          Autonomously publish {2 * (schedulerConfig.videos_per_run || 1)} videos daily
+                          {" "}({schedulerConfig.videos_per_run || 1} per slot × 2 slots)
+                        </div>
                       </div>
                       <input 
                         type="checkbox" 
@@ -2679,15 +2693,59 @@ export default function Home() {
                           const updated = { ...schedulerConfig, enabled: e.target.checked };
                           saveSchedulerConfig(updated);
                         }}
-                        style={{ width: "20px", height: "20px", cursor: "pointer", accentColor: "#a855f7" }}
+                        style={{ width: "20px", height: "20px", cursor: "pointer", accentColor: "var(--accent)" }}
                       />
                     </div>
 
                     <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "12px" }}>
+                      {/* Topic Source */}
+                      <div className="form-group">
+                        <label className="form-label">Topic Source</label>
+                        <select
+                          value={schedulerConfig.topic_source || "trends"}
+                          onChange={(e) => {
+                            const updated = { ...schedulerConfig, topic_source: e.target.value };
+                            saveSchedulerConfig(updated);
+                          }}
+                          className="form-input"
+                        >
+                          <option value="trends">🔥 Live Google Trends</option>
+                          <option value="curiosity">💡 Curiosity Topics (curated)</option>
+                          <option value="mixed">🔀 Mixed (blend both)</option>
+                        </select>
+                        <p className="form-label-info">
+                          {(schedulerConfig.topic_source || "trends") === "trends"
+                            ? "Picks the best safe topic from live trends."
+                            : (schedulerConfig.topic_source === "curiosity")
+                            ? "Pulls evergreen curiosity-gap topics; the hook is fed in as script context."
+                            : "Alternates randomly between live trends and curiosity topics."}
+                        </p>
+                      </div>
+
+                      {/* Curiosity Category (only relevant when curiosity topics are in play) */}
+                      {(schedulerConfig.topic_source === "curiosity" || schedulerConfig.topic_source === "mixed") && (
+                        <div className="form-group">
+                          <label className="form-label">Curiosity Category</label>
+                          <select
+                            value={schedulerConfig.curiosity_category || "All"}
+                            onChange={(e) => {
+                              const updated = { ...schedulerConfig, curiosity_category: e.target.value };
+                              saveSchedulerConfig(updated);
+                            }}
+                            className="form-input"
+                          >
+                            {curiosityCatOptions.map((cat) => (
+                              <option key={cat} value={cat}>{cat === "All" ? "All categories" : cat}</option>
+                            ))}
+                          </select>
+                          <p className="form-label-info">Keep runs on-theme for a niche channel.</p>
+                        </div>
+                      )}
+
                       {/* Region */}
                       <div className="form-group">
                         <label className="form-label">Trending Region</label>
-                        <select 
+                        <select
                           value={schedulerConfig.region}
                           onChange={(e) => {
                             const updated = { ...schedulerConfig, region: e.target.value };
@@ -2701,6 +2759,7 @@ export default function Home() {
                           <option value="CA">Canada (CA)</option>
                           <option value="AU">Australia (AU)</option>
                         </select>
+                        <p className="form-label-info">Used by the trends source.</p>
                       </div>
 
                       {/* YouTube Default Privacy */}
@@ -2718,6 +2777,63 @@ export default function Home() {
                           <option value="unlisted">Unlisted</option>
                           <option value="public">Public (Immediate Post)</option>
                         </select>
+                      </div>
+
+                      {/* Videos per run (each a different topic) */}
+                      <div className="form-group">
+                        <label className="form-label">Videos Per Run</label>
+                        <select
+                          value={schedulerConfig.videos_per_run || 1}
+                          onChange={(e) => {
+                            const updated = { ...schedulerConfig, videos_per_run: parseInt(e.target.value) };
+                            saveSchedulerConfig(updated);
+                          }}
+                          className="form-input"
+                        >
+                          {[1, 2, 3, 4, 5, 6, 8, 10].map((n) => (
+                            <option key={n} value={n}>{n} video{n > 1 ? "s" : ""} (different topics)</option>
+                          ))}
+                        </select>
+                        <div className="form-label-info">
+                          Each run generates this many videos, every one on a distinct trending topic.
+                        </div>
+                      </div>
+                    </div>
+
+                    {/* Subscribe / channel growth */}
+                    <div className="form-group" style={{ borderTop: "1px solid rgba(255,255,255,0.06)", paddingTop: "14px" }}>
+                      <label className="checkbox-container" style={{ marginBottom: "12px" }}>
+                        <input
+                          type="checkbox"
+                          checked={schedulerConfig.subscribe_overlay !== false}
+                          onChange={(e) => saveSchedulerConfig({ ...schedulerConfig, subscribe_overlay: e.target.checked })}
+                        />
+                        <span className="checkbox-custom"></span>
+                        <span style={{ fontSize: "14px", color: "var(--text-secondary)" }}>Show animated SUBSCRIBE button at the end of each video</span>
+                      </label>
+                      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "12px" }}>
+                        <div>
+                          <label className="form-label">Channel Handle (shown on screen)</label>
+                          <input
+                            type="text"
+                            value={schedulerConfig.channel_handle || ""}
+                            placeholder="@yourchannel"
+                            onChange={(e) => setSchedulerConfig({ ...schedulerConfig, channel_handle: e.target.value })}
+                            onBlur={(e) => saveSchedulerConfig({ ...schedulerConfig, channel_handle: e.target.value })}
+                            className="form-input"
+                          />
+                        </div>
+                        <div>
+                          <label className="form-label">Channel URL (in description)</label>
+                          <input
+                            type="text"
+                            value={schedulerConfig.youtube_channel_url || ""}
+                            placeholder="https://youtube.com/@yourchannel?sub_confirmation=1"
+                            onChange={(e) => setSchedulerConfig({ ...schedulerConfig, youtube_channel_url: e.target.value })}
+                            onBlur={(e) => saveSchedulerConfig({ ...schedulerConfig, youtube_channel_url: e.target.value })}
+                            className="form-input"
+                          />
+                        </div>
                       </div>
                     </div>
 
@@ -2768,20 +2884,45 @@ export default function Home() {
                     </div>
 
                     <div className="form-group">
-                      <label className="form-label">Leonardo Model (Image Synthesis)</label>
-                      <select 
-                        value={schedulerConfig.leonardo_model}
+                      <label className="form-label">Image Provider</label>
+                      <select
+                        value={schedulerConfig.image_provider || "local"}
                         onChange={(e) => {
-                          const updated = { ...schedulerConfig, leonardo_model: e.target.value };
+                          const updated = { ...schedulerConfig, image_provider: e.target.value };
                           saveSchedulerConfig(updated);
                         }}
                         className="form-input"
                       >
-                        {config?.leonardo_models.map((m: string) => (
-                          <option key={m} value={m}>{m}</option>
-                        ))}
+                        <option value="local">Local (on-device SD · M4 GPU · free)</option>
+                        <option value="pollinations">Pollinations (free hosted · no key)</option>
+                        <option value="leonardo">Leonardo (cloud · needs API tokens)</option>
                       </select>
+                      <div className="form-label-info">
+                        {(schedulerConfig.image_provider || "local") === "local"
+                          ? "Requires the local SD server running (python sd_server.py)."
+                          : (schedulerConfig.image_provider === "leonardo"
+                            ? "Uses your Leonardo API credits."
+                            : "No setup needed; images generated by a free hosted endpoint.")}
+                      </div>
                     </div>
+
+                    {(schedulerConfig.image_provider || "local") === "leonardo" && (
+                      <div className="form-group">
+                        <label className="form-label">Leonardo Model (Image Synthesis)</label>
+                        <select
+                          value={schedulerConfig.leonardo_model}
+                          onChange={(e) => {
+                            const updated = { ...schedulerConfig, leonardo_model: e.target.value };
+                            saveSchedulerConfig(updated);
+                          }}
+                          className="form-input"
+                        >
+                          {config?.leonardo_models.map((m: string) => (
+                            <option key={m} value={m}>{m}</option>
+                          ))}
+                        </select>
+                      </div>
+                    )}
 
                     <div className="form-group">
                       <label className="form-label">Default Voice Actor</label>
@@ -2801,7 +2942,7 @@ export default function Home() {
 
                     {/* Subtitle Settings */}
                     <div style={{ borderTop: "1px solid rgba(255,255,255,0.08)", paddingTop: "16px", marginTop: "8px" }}>
-                      <h4 style={{ margin: "0 0 12px 0", color: "#e9d5ff", fontSize: "14px", fontWeight: 600 }}>
+                      <h4 style={{ margin: "0 0 12px 0", color: "var(--text-primary)", fontSize: "14px", fontWeight: 600 }}>
                         📝 Subtitle Customization
                       </h4>
                       
@@ -2854,6 +2995,7 @@ export default function Home() {
                                   style={{ padding: "6px 10px", fontSize: "12px" }}
                                 >
                                   <option value="Viral Pop">Viral Pop (Pops + Color Highlights)</option>
+                                  <option value="Soft Pill">Soft Pill (Rounded Plate + Highlights)</option>
                                   <option value="Standard">Standard Bottom Text</option>
                                 </select>
                               </div>
@@ -2863,7 +3005,7 @@ export default function Home() {
                             <div className="form-group" style={{ margin: 0 }}>
                               <label className="form-label" style={{ display: "flex", justifyContent: "space-between", marginBottom: "4px", fontSize: "12px" }}>
                                 <span>Font Size</span>
-                                <span style={{ color: "#c084fc", fontWeight: 600 }}>{schedulerConfig.caption_size}px</span>
+                                <span style={{ color: "var(--accent)", fontWeight: 600 }}>{schedulerConfig.caption_size}px</span>
                               </label>
                               <div className="slider-group" style={{ gap: "8px" }}>
                                 <input 
@@ -2884,7 +3026,7 @@ export default function Home() {
                             <div className="form-group" style={{ margin: 0 }}>
                               <label className="form-label" style={{ display: "flex", justifyContent: "space-between", marginBottom: "4px", fontSize: "12px" }}>
                                 <span>Vertical Margin</span>
-                                <span style={{ color: "#c084fc", fontWeight: 600 }}>{schedulerConfig.caption_margin_v}px</span>
+                                <span style={{ color: "var(--accent)", fontWeight: 600 }}>{schedulerConfig.caption_margin_v}px</span>
                               </label>
                               <div className="slider-group" style={{ gap: "8px" }}>
                                 <input 
@@ -2919,12 +3061,12 @@ export default function Home() {
                                         display: "flex",
                                         alignItems: "center",
                                         gap: "4px",
-                                        background: isSelected ? "rgba(168, 85, 247, 0.25)" : "rgba(255,255,255,0.03)",
-                                        border: `1px solid ${isSelected ? "#a855f7" : "rgba(255,255,255,0.08)"}`,
+                                        background: isSelected ? "rgba(200, 255, 0, 0.25)" : "rgba(255,255,255,0.03)",
+                                        border: `1px solid ${isSelected ? "var(--accent)" : "rgba(255,255,255,0.08)"}`,
                                         borderRadius: "16px",
                                         padding: "4px 8px",
                                         cursor: "pointer",
-                                        color: isSelected ? "#f8fafc" : "#94a3b8",
+                                        color: isSelected ? "var(--text-primary)" : "var(--text-secondary)",
                                         fontSize: "11px",
                                         fontWeight: 600,
                                         transition: "all 0.2s ease"
@@ -2955,14 +3097,14 @@ export default function Home() {
                         className="btn btn-secondary"
                         style={{
                           width: "100%",
-                          background: "linear-gradient(135deg, #a855f7 0%, #ec4899 100%)",
+                          background: "linear-gradient(135deg, var(--accent) 0%, var(--accent-press) 100%)",
                           border: "none",
-                          color: "white",
+                          color: "var(--accent-ink)",
                           fontWeight: 600,
                           padding: "10px 0"
                         }}
                       >
-                        {triggerLoading ? "🚀 Triggering..." : "🔥 Trigger Agent Run Now"}
+                        {triggerLoading ? "⏳ Agent running… generating video" : "🔥 Trigger Agent Run Now"}
                       </button>
                     </div>
                   </div>
@@ -2970,7 +3112,7 @@ export default function Home() {
                   {/* Right Side: Logs & Execution History */}
                   <div style={{ display: "flex", flexDirection: "column", gap: "16px" }}>
                     <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-                      <h3 style={{ margin: 0, color: "#f8fafc", fontSize: "16px" }}>
+                      <h3 style={{ margin: 0, color: "var(--text-primary)", fontSize: "16px" }}>
                         📜 Scheduler Execution Logs
                       </h3>
                       {schedulerLogs.length > 0 && (
@@ -2979,7 +3121,7 @@ export default function Home() {
                           style={{
                             background: "rgba(239, 68, 68, 0.1)",
                             border: "1px solid rgba(239, 68, 68, 0.2)",
-                            color: "#ef4444",
+                            color: "var(--danger)",
                             borderRadius: "6px",
                             padding: "4px 10px",
                             fontSize: "11px",
@@ -3008,14 +3150,14 @@ export default function Home() {
                       paddingRight: "6px"
                     }}>
                       {schedulerLogs.length === 0 ? (
-                        <div style={{ textAlign: "center", padding: "40px", color: "#64748b" }}>
+                        <div style={{ textAlign: "center", padding: "40px", color: "var(--text-muted)" }}>
                           No execution logs found. Trigger a run or wait for the scheduler to execute.
                         </div>
                       ) : (
                         schedulerLogs.map((log: any, lIdx: number) => (
                           <div key={log.id || lIdx} style={{ 
                             background: "rgba(255,255,255,0.02)", 
-                            border: `1px solid ${log.status === "success" ? "rgba(16, 185, 129, 0.15)" : log.status === "failed" ? "rgba(239, 68, 68, 0.15)" : "rgba(168, 85, 247, 0.15)"}`, 
+                            border: `1px solid ${log.status === "success" ? "rgba(16, 185, 129, 0.15)" : log.status === "failed" ? "rgba(239, 68, 68, 0.15)" : "rgba(200, 255, 0, 0.15)"}`, 
                             borderRadius: "8px", 
                             padding: "12px" 
                           }}>
@@ -3026,37 +3168,37 @@ export default function Home() {
                                 textTransform: "uppercase", 
                                 padding: "2px 6px", 
                                 borderRadius: "4px",
-                                background: log.status === "success" ? "rgba(16, 185, 129, 0.1)" : log.status === "failed" ? "rgba(239, 68, 68, 0.1)" : "rgba(168, 85, 247, 0.1)",
-                                color: log.status === "success" ? "#10b981" : log.status === "failed" ? "#ef4444" : "#a855f7"
+                                background: log.status === "success" ? "rgba(16, 185, 129, 0.1)" : log.status === "failed" ? "rgba(239, 68, 68, 0.1)" : "rgba(200, 255, 0, 0.1)",
+                                color: log.status === "success" ? "var(--ok)" : log.status === "failed" ? "var(--danger)" : "var(--accent)"
                               }}>
                                 {log.status}
                               </span>
-                              <span style={{ fontSize: "11px", color: "#64748b" }}>
+                              <span style={{ fontSize: "11px", color: "var(--text-muted)" }}>
                                 {new Date(log.timestamp).toLocaleString()}
                               </span>
                             </div>
                             
-                            <div style={{ fontWeight: 600, color: "#f8fafc", fontSize: "13px", marginBottom: "4px" }}>
+                            <div style={{ fontWeight: 600, color: "var(--text-primary)", fontSize: "13px", marginBottom: "4px" }}>
                               📌 {log.topic}
                             </div>
-                            <div style={{ fontSize: "11px", color: "#94a3b8", marginBottom: "8px" }}>
+                            <div style={{ fontSize: "11px", color: "var(--text-secondary)", marginBottom: "8px" }}>
                               🕒 Slot: {log.slot}
                             </div>
                             
                             {/* Expandable step-by-step logs */}
                             <details style={{ cursor: "pointer" }}>
-                              <summary style={{ fontSize: "11px", color: "#a855f7", outline: "none", fontWeight: 500 }}>
+                              <summary style={{ fontSize: "11px", color: "var(--accent)", outline: "none", fontWeight: 500 }}>
                                 View Detailed Steps
                               </summary>
                               <div style={{ 
-                                background: "#06050e", 
+                                background: "var(--bg-2)", 
                                 border: "1px solid rgba(255,255,255,0.05)", 
                                 borderRadius: "6px", 
                                 padding: "8px 12px", 
                                 marginTop: "8px",
                                 fontFamily: "monospace",
                                 fontSize: "11px",
-                                color: "#10b981",
+                                color: "var(--ok)",
                                 overflowX: "auto",
                                 maxHeight: "150px",
                                 whiteSpace: "pre-wrap"
@@ -3084,7 +3226,7 @@ export default function Home() {
                   </div>
                 </div>
               ) : (
-                <div style={{ textAlign: "center", padding: "40px", color: "#64748b" }}>
+                <div style={{ textAlign: "center", padding: "40px", color: "var(--text-muted)" }}>
                   Loading scheduler configuration...
                 </div>
               )}
@@ -3094,29 +3236,29 @@ export default function Home() {
       )}
 
       {/* Interactive Storyboard Editor */}
-      {(activeTab === "viral" || activeTab === "longform") && storyboard.length > 0 && (
+      {activeTab === "viral" && storyboard.length > 0 && (
         <div className="glass-card" style={{ marginTop: "24px", padding: "24px" }}>
           <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", borderBottom: "1px solid rgba(255,255,255,0.08)", paddingBottom: "15px", marginBottom: "20px" }}>
             <div>
-              <h2 className="card-title" style={{ color: "#f43f5e", margin: 0, display: "flex", alignItems: "center", gap: "8px" }}>
+              <h2 className="card-title" style={{ color: "var(--text-primary)", margin: 0, display: "flex", alignItems: "center", gap: "8px" }}>
                 <Layers /> Interactive Storyboard: {generatedTopic}
               </h2>
-              <p style={{ color: "#94a3b8", fontSize: "13px", marginTop: "4px" }}>
+              <p style={{ color: "var(--text-secondary)", fontSize: "13px", marginTop: "4px" }}>
                 Edit narration scripts, adjust scene image prompts, select custom voiceovers per speaker, and regenerate individual assets before rendering.
               </p>
             </div>
             
             {/* Render Button */}
             <button
-              onClick={activeTab === "longform" ? handleLongformRender : handleRenderStoryboard}
+              onClick={handleRenderStoryboard}
               disabled={rendering || storyboard.length === 0}
               className="btn btn-primary"
               style={{
                 width: "auto",
                 minWidth: "180px",
                 height: "44px",
-                background: "linear-gradient(135deg, #a855f7 0%, #ec4899 100%)",
-                boxShadow: "0 4px 15px rgba(236, 72, 153, 0.3)",
+                background: "var(--accent)",
+                boxShadow: "none",
                 fontWeight: 700,
                 fontSize: "14px",
                 margin: 0
@@ -3145,10 +3287,10 @@ export default function Home() {
                   <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", borderBottom: "1px solid rgba(255,255,255,0.03)", paddingBottom: "10px" }}>
                     <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
                       <span className="step-num">{idx + 1}</span>
-                      <h3 style={{ fontSize: "16px", fontWeight: 600, color: "#f8fafc", margin: 0 }}>Scene {idx + 1}</h3>
+                      <h3 style={{ fontSize: "16px", fontWeight: 600, color: "var(--text-primary)", margin: 0 }}>Scene {idx + 1}</h3>
                     </div>
                     {scene.duration && (
-                      <span style={{ fontSize: "12px", color: "#94a3b8", background: "rgba(255,255,255,0.03)", padding: "3px 8px", borderRadius: "12px" }}>
+                      <span style={{ fontSize: "12px", color: "var(--text-secondary)", background: "rgba(255,255,255,0.03)", padding: "3px 8px", borderRadius: "12px" }}>
                         ⏱️ {scene.duration.toFixed(2)}s
                       </span>
                     )}
@@ -3158,46 +3300,29 @@ export default function Home() {
                     
                     {/* Left Column: Visual Asset */}
                     <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: "10px" }}>
-                      {activeTab === "longform" ? (
-                        scene.video_url ? (
-                          <video 
-                            src={scene.video_url} 
-                            style={{ width: "120px", aspectRatio: "16/9", objectFit: "cover", borderRadius: "8px", border: "1px solid rgba(255,255,255,0.1)", boxShadow: "0 4px 12px rgba(0,0,0,0.3)" }} 
-                            controls
-                          />
-                        ) : (
-                          <div style={{ width: "120px", aspectRatio: "16/9", background: "#06050e", border: "1px dashed rgba(255,255,255,0.1)", borderRadius: "8px", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", color: "#475569", fontSize: "11px", textAlign: "center", padding: "4px" }}>
-                            <Film size={20} style={{ marginBottom: "4px" }} />
-                            Pexels Video
-                          </div>
-                        )
+                      {scene.image_url ? (
+                        <img
+                          src={scene.image_url}
+                          alt={`Scene ${idx + 1}`}
+                          style={{ width: "120px", aspectRatio: "9/16", objectFit: "cover", borderRadius: "8px", border: "1px solid rgba(255,255,255,0.1)", boxShadow: "0 4px 12px rgba(0,0,0,0.3)" }}
+                        />
                       ) : (
-                        scene.image_url ? (
-                          <img 
-                            src={scene.image_url} 
-                            alt={`Scene ${idx + 1}`} 
-                            style={{ width: "120px", aspectRatio: "9/16", objectFit: "cover", borderRadius: "8px", border: "1px solid rgba(255,255,255,0.1)", boxShadow: "0 4px 12px rgba(0,0,0,0.3)" }} 
-                          />
-                        ) : (
-                          <div style={{ width: "120px", aspectRatio: "9/16", background: "#06050e", border: "1px dashed rgba(255,255,255,0.1)", borderRadius: "8px", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", color: "#475569", fontSize: "12px" }}>
-                            <ImageIcon size={24} style={{ marginBottom: "8px" }} />
-                            No Image
-                          </div>
-                        )
+                        <div style={{ width: "120px", aspectRatio: "9/16", background: "var(--bg-2)", border: "1px dashed rgba(255,255,255,0.1)", borderRadius: "8px", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", color: "var(--text-muted)", fontSize: "12px" }}>
+                          <ImageIcon size={24} style={{ marginBottom: "8px" }} />
+                          No Image
+                        </div>
                       )}
-                      
-                      {activeTab !== "longform" && (
-                        <button
-                          className="btn btn-secondary"
-                          onClick={() => handleRegenerateAsset(idx, "image")}
-                          disabled={isRegeneratingImage || rendering}
-                          style={{ width: "100%", padding: "6px 0", fontSize: "12px" }}
-                        >
-                          {isRegeneratingImage ? (
-                            <RefreshCw size={12} style={{ animation: "spin 1s linear infinite", marginRight: "4px" }} />
-                          ) : "🎨"} Regenerate Visual
-                        </button>
-                      )}
+
+                      <button
+                        className="btn btn-secondary"
+                        onClick={() => handleRegenerateAsset(idx, "image")}
+                        disabled={isRegeneratingImage || rendering}
+                        style={{ width: "100%", padding: "6px 0", fontSize: "12px" }}
+                      >
+                        {isRegeneratingImage ? (
+                          <RefreshCw size={12} style={{ animation: "spin 1s linear infinite", marginRight: "4px" }} />
+                        ) : "🎨"} Regenerate Visual
+                      </button>
                     </div>
 
                     {/* Middle Column: Text Fields & Voice */}
@@ -3254,7 +3379,7 @@ export default function Home() {
                             <source src={scene.audio_url} type="audio/wav" />
                           </audio>
                         ) : (
-                          <div style={{ fontSize: "11px", color: "#64748b", padding: "6px", background: "rgba(0,0,0,0.2)", borderRadius: "4px", textAlign: "center" }}>
+                          <div style={{ fontSize: "11px", color: "var(--text-muted)", padding: "6px", background: "rgba(0,0,0,0.2)", borderRadius: "4px", textAlign: "center" }}>
                             No Audio synthesized yet
                           </div>
                         )}
