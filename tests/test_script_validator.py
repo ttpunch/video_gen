@@ -99,3 +99,32 @@ def test_autofix_makes_script_pass():
     sv.autofix(d)
     hard, soft = sv.validate_script(d, "Why flamingos are pink")
     assert hard == [] and soft == []
+
+
+# --------------------------------------------------------------------------
+# Hook length (the opening line is the swipe-or-stay decision)
+# --------------------------------------------------------------------------
+
+def test_long_winded_hook_is_hard():
+    d = _good_script()
+    d["scenes"][0]["narration"] = (
+        "So today I wanted to sit down and actually properly explain to you "
+        "exactly why flamingos are famously known for being this particular shade of pink."
+    )
+    hard, _soft = sv.validate_script(d, "Why flamingos are pink")
+    assert any("hook" in h.lower() for h in hard)
+
+
+def test_punchy_hook_is_not_flagged():
+    d = _good_script()
+    d["scenes"][0]["narration"] = "Flamingos aren't actually born pink at all."  # 7 words
+    hard, _soft = sv.validate_script(d, "Why flamingos are pink")
+    assert not any("hook" in h.lower() for h in hard)
+
+
+def test_very_short_hook_is_not_penalised():
+    """Brevity is fine; only a rambling opener is the failure mode."""
+    d = _good_script()
+    d["scenes"][0]["narration"] = "This changes everything."  # 3 words
+    hard, _soft = sv.validate_script(d, "Why flamingos are pink")
+    assert not any("hook" in h.lower() for h in hard)

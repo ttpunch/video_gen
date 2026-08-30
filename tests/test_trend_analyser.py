@@ -261,3 +261,27 @@ def test_focus_constrains_every_area(monkeypatch):
     monkeypatch.setattr(ta.requests, "post", fake_post)
     ta.discover_domains("m", 1, focus="cricket")
     assert "cricket" in captured["prompt"]
+
+
+def test_focus_reaches_the_topic_writing_stage_not_only_domain_discovery(monkeypatch):
+    """A domain nominally on-focus can still drift once handed to topic-writing
+    alone. Measured live: with focus applied only at domain discovery, a
+    'personal finance and investing' batch included 'Peculiar Pets That Live
+    Centuries' -- domains are not a strong enough guarantee by themselves."""
+    monkeypatch.setattr(ta, "discover_domains", lambda *a, **k: ["coins"])
+    captured = {}
+
+    class R:
+        status_code = 200
+        @staticmethod
+        def json():
+            return {"response": '{"topics":[{"title":"T","hook":"h","niche":"n","rpm_tier":"High"}]}'}
+
+    def fake_post(url, json=None, timeout=None):
+        captured["prompt"] = json["prompt"]
+        return R()
+
+    monkeypatch.setattr(ta.requests, "post", fake_post)
+    ta.generate_ideas("m", count=1, focus="personal finance and investing")
+    assert "personal finance and investing" in captured["prompt"], \
+        "focus must be restated to the stage that actually writes the topic"

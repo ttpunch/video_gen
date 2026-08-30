@@ -22,7 +22,6 @@ from backend import run_viral_shorts_pipeline_new, generate_validated_script
 from search_helper import get_web_grounding_context, clean_json_response
 from uploader_youtube import upload_video_to_youtube, is_youtube_authenticated
 from notifier import notify
-from script_utils import filter_fresh_trends
 from curiosity_topics import select_curiosity_topic
 
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
@@ -364,7 +363,9 @@ def recommend_viral_topics(trends_list, ollama_model, count=5, performance_hint=
             break
     return recs
 
-def _run_single_video(topic, rationale, slot_name, config, ollama_model, all_logs, context=""):
+def _run_single_video(topic, rationale, slot_name, config, ollama_model, all_logs,
+                      context="", hook_style="Did You Know? (Fact Hook)",
+                      duration_preset=None):
     """Generate, render and publish ONE video for the given topic.
 
     ``context`` is an optional curiosity angle/hook that is woven into the
@@ -416,7 +417,12 @@ def _run_single_video(topic, rationale, slot_name, config, ollama_model, all_log
         if context:
             log_step(f"Applying curiosity angle as script context: {context}")
             script_prompt = f"{topic}. Curiosity angle to emphasize: {context}"
-        script_data = generate_validated_script(script_prompt, ollama_model, hook_style="Did You Know? (Fact Hook)", enable_search=bool(web_context), log=log_step)
+        from backend import DEFAULT_DURATION_PRESET
+        script_data = generate_validated_script(
+            script_prompt, ollama_model, hook_style=hook_style,
+            enable_search=bool(web_context), log=log_step,
+            duration_preset=duration_preset or DEFAULT_DURATION_PRESET,
+        )
         scenes = script_data.get("scenes")
         if not scenes or len(scenes) != 7:
             raise Exception("Failed to generate a valid 7-scene script and storyboard.")
@@ -531,13 +537,15 @@ def _run_single_video(topic, rationale, slot_name, config, ollama_model, all_log
             def upload_progress(pct):
                 log_step(f"YouTube Upload Progress: {pct}%")
                 
+            from backend import video_used_synthetic_media
             yt_video_id = upload_video_to_youtube(
                 final_video,
                 title=yt_title,
                 description=yt_desc,
                 tags=yt_tags,
                 privacy_status=privacy_status,
-                progress_callback=upload_progress
+                progress_callback=upload_progress,
+                contains_synthetic_media=video_used_synthetic_media(scenes),
             )
             
             log_step(f"YouTube Upload Successful! Video ID: {yt_video_id}")
@@ -586,28 +594,44 @@ def run_viral_agent_job(slot_name, config=None):
     ollama_model = config.get("model", "deepseek-v4-pro:cloud")
     topic_source = str(config.get("topic_source", "trends") or "trends").lower()
     curiosity_category = config.get("curiosity_category", "All") or "All"
+    # Optional: constrains every generated topic to one interest (e.g.
+    # "cricket", "cooking"). 2026 short-form research finds channels that
+    # reinforce one topic for ~30 days build audience faster than ones that
+    # jump subject every video; leaving this blank keeps the fully open-ended
+    # behaviour (any subject the model knows, never repeating) unchanged.
+    channel_niche = str(config.get("channel_niche", "") or "").strip()
     all_logs = load_scheduler_logs()
 
-    # Live trends are only needed for the "trends" and "mixed" sources.
-    trends = []
+    # The "trends" source used to fetch Google Trends and rank the ~10 raw
+    # headlines with ``select_viral_topic``, which silently fell back to
+    # unranked, un-safety-filtered raw trend titles whenever the LLM's JSON
+    # parse failed -- undetectable from the logs, and the actual cause of
+    # unattended uploads like a raw criminal-trial headline reaching a video
+    # topic. ``trend_analyser`` generates and hard-filters topics instead of
+    # ranking a thin scraped pool, and raises loudly on failure rather than
+    # degrading silently. Gathered once per run (not once per video) so a
+    # multi-video run does not repeat the Trends/Wikipedia network round trip.
+    signals = None
     if topic_source in ("trends", "mixed"):
-        print(f"[agent] Run '{slot_name}': generating {count} video(s). Fetching trends ({region})...")
-        trends = fetch_google_trends(region)
-        if not trends:
+        import trend_analyser
+        print(f"[agent] Run '{slot_name}': generating {count} video(s). Gathering trend signals ({region})...")
+        try:
+            signals = trend_analyser.gather_signals(region)
+        except Exception as e:
+            print(f"[agent] Trend signal gathering failed ({e}); "
+                 f"{'falling back to curiosity topics' if topic_source == 'mixed' else 'this run will fail'}.")
             if topic_source == "trends":
                 ts = datetime.now().strftime("%H:%M:%S")
                 entry = {
                     "id": str(uuid.uuid4()), "timestamp": datetime.now().isoformat() + "Z",
                     "slot": slot_name, "topic": "N/A", "status": "failed", "video_path": None,
                     "youtube_id": None,
-                    "logs": [f"[{ts}] No trending topics retrieved from Google Trends."],
+                    "logs": [f"[{ts}] Trend signal gathering failed: {e}"],
                 }
                 all_logs.insert(0, entry)
                 save_scheduler_logs(all_logs)
-                notify("Viral agent run failed", "No trends retrieved from Google Trends.", context={"slot": slot_name})
+                notify("Viral agent run failed", f"Trend signal gathering failed: {e}", context={"slot": slot_name})
                 return entry
-            # Mixed run with no trends available -> fall back to curiosity only.
-            print("[agent] No trends retrieved; mixed run will use curated curiosity topics only.")
     else:
         print(f"[agent] Run '{slot_name}': generating {count} video(s) from curated curiosity topics ({curiosity_category}).")
 
@@ -624,12 +648,19 @@ def run_viral_agent_job(slot_name, config=None):
     except Exception:
         pass
 
+    # Every unattended video used to open with the identical hardcoded
+    # "Did You Know?" hook regardless of topic -- rotate through the full set
+    # instead, never repeating the immediately previous pick, so consecutive
+    # uploads do not read as the same template with the words swapped out.
+    from backend import ROTATING_HOOK_STYLES
+    last_hook = None
+
     results = []
     for i in range(count):
         label = slot_name if count == 1 else f"{slot_name} - video {i + 1}/{count}"
 
         # Decide this video's topic source.
-        if topic_source == "curiosity" or (topic_source == "mixed" and not trends):
+        if topic_source == "curiosity" or (topic_source == "mixed" and signals is None):
             use_curiosity = True
         elif topic_source == "mixed":
             use_curiosity = random.random() < 0.5
@@ -646,16 +677,29 @@ def run_viral_agent_job(slot_name, config=None):
             rationale = f"Curated curiosity topic — {pick['category']}."
             context = pick.get("hook", "")
         else:
-            pool = filter_fresh_trends(trends, used_topics) or trends
-            topic, rationale = select_viral_topic(
-                pool, ollama_model, performance_hint=performance_hint, exclude_topics=used_topics
-            )
-            if not topic:
-                print(f"[agent] No fresh topic found for video {i + 1}; stopping early.")
-                break
+            try:
+                import trend_analyser
+                picks = trend_analyser.analyse(
+                    geo=region, model=ollama_model, count=1, used_topics=used_topics,
+                    performance_hint=performance_hint, signals=signals, focus=channel_niche,
+                )
+                topic, rationale, context = picks[0]["title"], picks[0]["rationale"], picks[0]["rationale"]
+            except Exception as e:
+                print(f"[agent] Trend analysis failed for video {i + 1} ({e}); "
+                     "falling back to a curiosity topic for this one.")
+                pick = select_curiosity_topic(exclude_topics=used_topics, category=curiosity_category)
+                if not pick:
+                    print(f"[agent] No fresh topic available for video {i + 1}; stopping early.")
+                    break
+                topic, rationale, context = pick["title"], f"Curated curiosity topic — {pick['category']}.", pick.get("hook", "")
+
+        hook_style = random.choice([h for h in ROTATING_HOOK_STYLES if h != last_hook] or ROTATING_HOOK_STYLES)
+        last_hook = hook_style
 
         used_topics.insert(0, topic)  # so the next video avoids it
-        results.append(_run_single_video(topic, rationale, label, config, ollama_model, all_logs, context=context))
+        results.append(_run_single_video(topic, rationale, label, config, ollama_model, all_logs,
+                                         context=context, hook_style=hook_style,
+                                         duration_preset=config.get("duration_preset")))
 
     return results[0] if results else None
 

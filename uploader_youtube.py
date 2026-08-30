@@ -112,8 +112,20 @@ def trigger_youtube_auth_flow_url() -> str:
         f.write(creds.to_json())
     return "Authentication successful!"
 
-def upload_video_to_youtube(video_path: str, title: str, description: str, tags: list, privacy_status: str = "private", progress_callback=None):
-    """Uploads local video file to YouTube Shorts using official client libraries."""
+def upload_video_to_youtube(video_path: str, title: str, description: str, tags: list,
+                            privacy_status: str = "private", progress_callback=None,
+                            contains_synthetic_media: bool = False):
+    """Uploads local video file to YouTube Shorts using official client libraries.
+
+    ``contains_synthetic_media`` sets ``status.containsSyntheticMedia`` (YouTube
+    Data API v3, added 2024-10-30) -- the field behind YouTube's "Altered or
+    Synthetic Content" disclosure, in full enforcement since January 2026.
+    Realistic AI-generated visuals that a viewer could mistake for real footage
+    require this; the app previously had no handling for it at all. Callers
+    should pass True whenever any scene's visuals came from image generation
+    rather than real stock footage -- see ``video_used_synthetic_media`` in
+    backend.py, which derives this from the stored storyboard.
+    """
     if not os.path.exists(video_path):
         raise FileNotFoundError(f"Video file not found at: {video_path}")
         
@@ -128,7 +140,8 @@ def upload_video_to_youtube(video_path: str, title: str, description: str, tags:
         },
         "status": {
             "privacyStatus": privacy_status,
-            "selfDeclaredMadeForKids": False
+            "selfDeclaredMadeForKids": False,
+            "containsSyntheticMedia": bool(contains_synthetic_media),
         }
     }
     

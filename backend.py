@@ -115,14 +115,30 @@ SATISFYING_PRESETS = {
     "Satisfying Liquid": "https://images.pexels.com/video-files/8564860/8564860-sd_540_960_30fps.mp4"
 }
 
+# Every autonomous video used to hardcode "Did You Know? (Fact Hook)" (see
+# viral_agent.py's ``_run_single_video``), so every unattended upload opened
+# with the identical hook regardless of topic -- a large, previously invisible
+# contributor to "the videos feel similar". The scheduler now rotates through
+# this whole set (see ROTATING_HOOK_STYLES below); the two entries marked NEW
+# fill formulas that 2026 short-form research names as the highest and
+# second-highest performing hook types, and were not covered by the original
+# five (which cluster around one "did you know / secrets" register).
 VIRAL_HOOKS = {
     "None (Direct Prompt)": "",
     "Did You Know? (Fact Hook)": "Start the script with a mind-blowing 'Did you know...' hook in Scene 1 to grab immediate attention.",
     "3 Shocking Secrets": "Frame the script around '3 shocking secrets they don't want you to know', starting with a high-intensity hook in Scene 1.",
     "I Was Today Years Old": "Start the script with 'I was today years old when I found out this mind-blowing truth...' in Scene 1.",
     "This Changes Everything": "Start with 'This insane discovery changes everything we thought we knew about history...' in Scene 1.",
-    "Banned Facts": "Start with 'These are the banned facts they tried to hide from us...' in Scene 1."
+    "Banned Facts": "Start with 'These are the banned facts they tried to hide from us...' in Scene 1.",
+    "Contrarian Claim (NEW)": "Open by stating the thing most people believe about the topic, then flatly contradict it in the same breath (e.g. 'Everyone thinks X. They're wrong.'). No hedging.",
+    "Mistake Warning (NEW)": "Open by naming a specific, common mistake almost everyone makes related to the topic, framed as a direct warning to the viewer (e.g. 'You've been doing X wrong your whole life.').",
 }
+
+#: Hook styles the autonomous scheduler rotates through, one per video, never
+#: repeating the immediately previous pick. "None (Direct Prompt)" is excluded
+#: here -- an unattended video with no hook instruction is exactly the
+#: generic-feeling failure mode this rotation exists to prevent.
+ROTATING_HOOK_STYLES = [k for k in VIRAL_HOOKS if k != "None (Direct Prompt)"]
 
 # Helpers
 def download_file(url, folder, prefix):
@@ -328,7 +344,21 @@ def generate_ass_subtitles(storyboard, output_path, font_name="Arial", font_size
     return True
 
 # Core Pipeline Functions
-def generate_ollama_script(prompt: str, model: str, hook_style: str = "None (Direct Prompt)", enable_search: bool = False, art_style: str = "Photorealistic"):
+#: Word-count targets per bucket, calibrated against the app's existing 15-20s
+#: baseline (65-85 words there implies ~4.3 spoken words/sec at this TTS voice
+#: speed). "Standard" is the new default: 2026 short-form research puts peak
+#: retention for most niches at 25-35s, not the 15-20s this app previously
+#: hardcoded everywhere.
+DURATION_PRESETS = {
+    "Quick (15-20s)": (65, 85, "15-20"),
+    "Standard (25-35s)": (110, 145, "25-35"),
+}
+DEFAULT_DURATION_PRESET = "Standard (25-35s)"
+
+
+def generate_ollama_script(prompt: str, model: str, hook_style: str = "None (Direct Prompt)",
+                           enable_search: bool = False, art_style: str = "Photorealistic",
+                           duration_preset: str = DEFAULT_DURATION_PRESET):
     url = f"{OLLAMA_HOST}/api/generate"
     
     hook_instruction = VIRAL_HOOKS.get(hook_style, "")
@@ -344,14 +374,20 @@ def generate_ollama_script(prompt: str, model: str, hook_style: str = "None (Dir
         except Exception as e:
             print(f"Failed to perform web search grounding: {e}")
             
+    min_words, max_words, seconds_label = DURATION_PRESETS.get(
+        duration_preset, DURATION_PRESETS[DEFAULT_DURATION_PRESET])
+
     # Stage 1: Creative Story / Script Writer (Free-form text)
     storyteller_system = (
         "You are a world-class short-form video scriptwriter for YouTube Shorts, Instagram Reels "
-        "and TikTok whose videos routinely go viral. Write a punchy ~15-second voiceover script "
-        "about the given topic.\n"
+        f"and TikTok whose videos routinely go viral. Write a punchy ~{seconds_label}-second voiceover "
+        "script about the given topic.\n"
         "VIRAL RULES (follow all):\n"
-        "- HOOK FIRST: The opening sentence (first ~3 seconds) must stop the scroll. Use a bold claim, "
-        "a shocking/surprising fact, or a curiosity gap. Never open with 'In this video', 'Today', or a slow intro.\n"
+        "- HOOK FIRST: The opening sentence is the single highest-leverage line in the whole script -- "
+        "most viewers decide to keep watching or swipe away within the first 1-3 seconds. It must be "
+        "EXACTLY 8-14 words (a viewer reads/hears this in under 3 seconds; longer and you've already "
+        "lost the swipe decision). Use a bold contrarian claim, a specific common mistake, a shocking "
+        "fact, or a curiosity gap. Never open with 'In this video', 'Today', or a slow intro.\n"
         "- OPEN LOOP: Tease something the viewer only fully understands at the end, so they keep watching.\n"
         "- PACING: Short, punchy, spoken-style sentences (each about 6-12 words) that read cleanly as "
         "on-screen captions. One idea per sentence.\n"
@@ -360,11 +396,14 @@ def generate_ollama_script(prompt: str, model: str, hook_style: str = "None (Dir
         "viewer to SUBSCRIBE for more (e.g. 'Subscribe so you never miss one').\n"
         "- Be specific and accurate about the topic; no vague filler or repetition.\n"
         "- Do NOT repeat any sentence or phrase; every line must add new information.\n"
-        "Total length about 65-85 words (about 15-20 seconds spoken). "
+        f"Total length about {min_words}-{max_words} words (about {seconds_label} seconds spoken). "
         "Output ONLY the raw narration text - no scene numbers, brackets, speaker names, emojis, or stage directions."
     )
     
-    storyteller_prompt = f"System: {storyteller_system}\n{grounding_info}\nUser: Write a 15-second viral story about: {prompt}."
+    storyteller_prompt = (
+        f"System: {storyteller_system}\n{grounding_info}\n"
+        f"User: Write a {seconds_label}-second viral story about: {prompt}."
+    )
     if hook_instruction:
         storyteller_prompt += f" Hook Instruction: {hook_instruction}"
         
@@ -511,23 +550,29 @@ def generate_ollama_script(prompt: str, model: str, hook_style: str = "None (Dir
 
 def generate_validated_script(prompt, model, hook_style="None (Direct Prompt)",
                               enable_search=False, attempts=2, log=print,
-                              art_style="Photorealistic"):
+                              art_style="Photorealistic",
+                              duration_preset=DEFAULT_DURATION_PRESET):
     """Generate a script and run it through the deterministic viral checker.
 
-    Regenerates on HARD failures (off-topic, repeats, wrong length, fallback...),
-    auto-fixes SOFT issues (missing CTA, non-realistic style), and raises if it
-    still cannot produce a valid script - so a broken video never reaches render.
+    Regenerates on HARD failures (off-topic, repeats, wrong length, fallback,
+    a hook that runs long...), auto-fixes SOFT issues (missing CTA, non-realistic
+    style), and raises if it still cannot produce a valid script - so a broken
+    video never reaches render.
     """
+    min_words, max_words, _label = DURATION_PRESETS.get(
+        duration_preset, DURATION_PRESETS[DEFAULT_DURATION_PRESET])
     last_hard = ["unknown error"]
     for attempt in range(1, attempts + 1):
         try:
-            data = generate_ollama_script(prompt, model, hook_style, enable_search=enable_search, art_style=art_style)
+            data = generate_ollama_script(prompt, model, hook_style, enable_search=enable_search,
+                                          art_style=art_style, duration_preset=duration_preset)
         except Exception as e:
             last_hard = [f"generation error: {e}"]
             log(f"[validator] attempt {attempt}/{attempts}: {last_hard[0]}")
             continue
 
-        hard, soft = validate_script(data, prompt, art_style=art_style)
+        hard, soft = validate_script(data, prompt, art_style=art_style,
+                                     min_words=min_words, max_words=max_words)
         if not hard:
             if soft:
                 log(f"[validator] auto-fixing soft issues: {soft}")
@@ -773,27 +818,46 @@ class UploadRequest(BaseModel):
     instagram_caption: Optional[str] = ""
 
 
+#: Models that only run generation, not embeddings -- an embedding model in the
+#: dropdown produces a confusing failure rather than a script.
+_NON_GENERATIVE = ("embed",)
+
+
 def get_ollama_models():
-    """Dynamically fetch available models from local Ollama service."""
-    ollama_models = []
+    """Available Ollama models, locally-runnable ones first.
+
+    Ordering matters because the UI selects the first entry by default. This
+    previously force-pinned a *cloud* model to the front, so a exhausted weekly
+    quota made every manual draft fail on a model the user never chose. Ollama
+    reports cloud models with size 0, which is what separates the two.
+    """
+    entries = []
     try:
         r = requests.get(f"{OLLAMA_HOST}/api/tags", timeout=3)
         if r.status_code == 200:
-            ollama_models = [m['name'] for m in r.json().get("models", [])]
+            entries = r.json().get("models", [])
     except Exception:
         pass
-    
-    # Ensure minimax-m3:cloud is at the front of the list
-    if "minimax-m3:cloud" in ollama_models:
-        ollama_models.remove("minimax-m3:cloud")
-    ollama_models.insert(0, "minimax-m3:cloud")
-    
-    # Add other fallbacks if not present
-    for fallback in ["deepseek-v4-pro:cloud", "gemma4:31b-cloud", "qwen3.5:0.8b", "gpt-oss:120b-cloud"]:
-        if fallback not in ollama_models:
-            ollama_models.append(fallback)
-            
-    return ollama_models
+
+    local, cloud = [], []
+    for m in entries:
+        name = m.get("name", "")
+        if not name or any(x in name.lower() for x in _NON_GENERATIVE):
+            continue
+        (local if (m.get("size") or 0) > 0 else cloud).append(name)
+
+    # Largest local model first: on a single machine, size is the best available
+    # proxy for output quality, and the default should be the best that works
+    # without a network round-trip or a quota.
+    local.sort(key=lambda n: next(
+        (e.get("size", 0) for e in entries if e.get("name") == n), 0), reverse=True)
+
+    models = local + cloud
+    for fallback in ["minimax-m3:cloud", "deepseek-v4-pro:cloud",
+                     "gemma4:31b-cloud", "gpt-oss:120b-cloud"]:
+        if fallback not in models:
+            models.append(fallback)
+    return models
 
 # API Endpoints
 @app.get("/api/config")
@@ -807,6 +871,8 @@ def get_config():
         "music_presets": ["None", "Procedural Ambient"] + list(MUSIC_PRESETS.keys()),
         "satisfying_presets": ["None"] + list(SATISFYING_PRESETS.keys()),
         "viral_hooks": list(VIRAL_HOOKS.keys()),
+        "duration_presets": list(DURATION_PRESETS.keys()),
+        "default_duration_preset": DEFAULT_DURATION_PRESET,
         "ollama_models": ollama_models,
         "art_styles": list(ART_STYLE_PRESETS.keys()),
         "visual_modes": ["Cinematic Slideshow", "Leonardo Motion Video", "Hailuo Animated Video"],
@@ -1327,6 +1393,7 @@ class DraftRequest(BaseModel):
     enable_search: bool = False
     voice: Optional[str] = "Sarah (Female - US - Soft)"
     art_style: str = "Photorealistic"
+    duration_preset: str = DEFAULT_DURATION_PRESET
 
 class RenderRequest(QualityOptions):
     generation_id: str
@@ -1369,7 +1436,9 @@ class DbUploadRequest(BaseModel):
 def api_draft_script(req: DraftRequest):
     try:
         gen_id = str(uuid.uuid4())
-        script_data = generate_validated_script(req.prompt, req.model, req.hook_style, enable_search=req.enable_search, art_style=req.art_style)
+        script_data = generate_validated_script(req.prompt, req.model, req.hook_style,
+                                                 enable_search=req.enable_search, art_style=req.art_style,
+                                                 duration_preset=req.duration_preset)
         scenes = script_data.get("scenes", [])
 
         # Build initial storyboard structure.
@@ -1689,6 +1758,20 @@ def select_local_sd_model(req: SelectImageModelRequest):
         raise HTTPException(status_code=r.status_code, detail=r.text[:300])
     return r.json()
 
+def video_used_synthetic_media(storyboard) -> bool:
+    """True if any scene's visuals came from image generation rather than real
+    stock footage -- the trigger for YouTube's "Altered or Synthetic Content"
+    disclosure (``status.containsSyntheticMedia``), in full enforcement since
+    January 2026. A storyboard with no ``visual_source`` tags at all (older
+    generations, predating that field) is treated conservatively as synthetic,
+    since the pipeline's only non-stock path was AI image generation.
+    """
+    scenes = storyboard or []
+    if not scenes:
+        return False
+    return any(s.get("visual_source", "generate") == "generate" for s in scenes)
+
+
 def process_upload_job(job_id: str):
     """Executes upload processes for direct API uploads (persisted in DB)."""
     job = db_manager.get_upload_job(job_id)
@@ -1747,7 +1830,8 @@ def process_upload_job(job_id: str):
                     yt_meta.get("description", ""),
                     yt_meta.get("tags", []),
                     yt_meta.get("privacy", "private"),
-                    progress_callback=yt_progress
+                    progress_callback=yt_progress,
+                    contains_synthetic_media=video_used_synthetic_media(video_gen.get("storyboard")),
                 )
                 db_manager.record_platform_upload(gen_id, "youtube", vid_id)
                 log_message(f"YouTube upload successful! Video URL: https://youtu.be/{vid_id}")
@@ -2259,6 +2343,12 @@ class SchedulerConfigUpdate(BaseModel):
     caption_style: str
     topic_source: str = "trends"
     curiosity_category: str = "All"
+    # Optional: constrains every auto-generated topic to one interest. Blank
+    # keeps the fully open-ended behaviour; set it if you want the channel to
+    # reinforce one subject, which research finds builds audience faster than
+    # jumping topic every video.
+    channel_niche: str = ""
+    duration_preset: str = DEFAULT_DURATION_PRESET
 
 @app.get("/api/curiosity-topics")
 def get_curiosity_topics():

@@ -188,15 +188,20 @@ def discover_domains(model, count, avoid_topics=None, focus="", timeout=120):
         return pool[:count]
 
 
-def _build_prompt(domains, signals, used_topics, count, performance_hint=""):
+def _build_prompt(domains, signals, used_topics, count, performance_hint="", focus=""):
     """Prompt the model to INVENT curiosity topics inside given domains.
 
-    Two deliberate choices, both aimed at variety:
+    Three deliberate choices, all aimed at variety and control:
       * Domains are named explicitly and one topic is requested per domain, so
         the model cannot return five variations of whatever subject it likes.
       * Trend signals are supplied as optional *inspiration* rather than the
         candidate set, so a thin or news-heavy trend feed cannot drag every
         suggestion toward a court case or a cricket score.
+      * ``focus`` is restated HERE, not only when the domains were chosen.
+        Measured directly: with focus applied only at domain-discovery time, a
+        3-topic "personal finance and investing" batch included "Peculiar Pets
+        That Live Centuries" -- a domain, once handed to this stage alone,
+        drifted off-topic with no second check to catch it.
     """
     trend_lines = "\n".join(
         f"- {t['title']}" for t in (signals.get("trends") or [])[:10]
@@ -215,6 +220,11 @@ def _build_prompt(domains, signals, used_topics, count, performance_hint=""):
         "- Each must be a concrete, surprising, *verifiable* fact or phenomenon.",
         "- Phrase as a short hook-style title (max 10 words), not a news headline.",
         "- Must be visually illustrable with real stock footage.",
+    ]
+    if focus:
+        parts.append(f"- EVERY topic must clearly relate to: {focus}. Reject a "
+                     "domain rather than write an off-focus topic for it.")
+    parts += [
         "",
         "REJECT: violence, death, crime, disasters, war, politics, scandal, "
         "adult themes, and any medical or health advice.",
@@ -268,7 +278,7 @@ def generate_ideas(model, count=5, signals=None, used_topics=None,
         chosen = discover_domains(model, max(1, count),
                                   avoid_topics=used_topics, focus=focus)
 
-    prompt = _build_prompt(chosen, signals, used_topics, count, performance_hint)
+    prompt = _build_prompt(chosen, signals, used_topics, count, performance_hint, focus=focus)
     resp = requests.post(
         f"{OLLAMA_HOST}/api/generate",
         json={"model": model, "prompt": prompt, "stream": False, "format": "json"},

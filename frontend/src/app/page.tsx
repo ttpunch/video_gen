@@ -30,6 +30,8 @@ interface BackendConfig {
   stock_available?: boolean;
   default_quality?: string;
   motion_styles?: string[];
+  duration_presets?: string[];
+  default_duration_preset?: string;
   delivery?: {
     fps: number;
     resolution: string;
@@ -169,6 +171,7 @@ export default function Home() {
   const [musicStyle, setMusicStyle] = useState("Cinematic");
   const [satisfyingBackground, setSatisfyingBackground] = useState("Slime ASMR");
   const [viralHookStyle, setViralHookStyle] = useState("Did You Know? (Fact Hook)");
+  const [durationPreset, setDurationPreset] = useState("Standard (25-35s)");
   const [enableCaptions, setEnableCaptions] = useState(true);
   const [enableTransitionSfx, setEnableTransitionSfx] = useState(false);
   const [captionFont, setCaptionFont] = useState("Arial");
@@ -501,6 +504,7 @@ export default function Home() {
     addLog("📝 Creating Script & Storyboard Draft...");
     addLog(`Topic: "${viralPrompt}"`);
     addLog(`Hook Style: ${viralHookStyle}`);
+    addLog(`Duration: ${durationPreset}`);
     
     try {
       const response = await fetch("http://localhost:8000/api/draft-script", {
@@ -512,7 +516,8 @@ export default function Home() {
           hook_style: viralHookStyle,
           enable_search: enableSearch,
           voice: viralVoice,
-          art_style: artStyle
+          art_style: artStyle,
+          duration_preset: durationPreset
         })
       });
       
@@ -1482,6 +1487,22 @@ export default function Home() {
                     </select>
                     <p className="form-label-info">Shapes script opening scenes to maximize hook retention.</p>
                   </div>
+                  <div className="form-group">
+                    <label className="form-label">Target Duration</label>
+                    <select
+                      className="form-select"
+                      value={durationPreset}
+                      onChange={(e) => setDurationPreset(e.target.value)}
+                    >
+                      {(config?.duration_presets ?? ["Quick (15-20s)", "Standard (25-35s)"]).map(d => (
+                        <option key={d} value={d}>{d}</option>
+                      ))}
+                    </select>
+                    <p className="form-label-info">25-35s is the retention sweet spot for most niches; Quick trades depth for a faster loop.</p>
+                  </div>
+                </div>
+
+                <div className="form-row">
                   <div className="form-group">
                     <label className="form-label">Ollama LLM Model</label>
                     <select 
@@ -2731,10 +2752,10 @@ export default function Home() {
                         </select>
                         <p className="form-label-info">
                           {(schedulerConfig.topic_source || "trends") === "trends"
-                            ? "Picks the best safe topic from live trends."
+                            ? "Generates open-ended topics grounded in live trends; any subject is reachable, and it never repeats one you've already made."
                             : (schedulerConfig.topic_source === "curiosity")
                             ? "Pulls evergreen curiosity-gap topics; the hook is fed in as script context."
-                            : "Alternates randomly between live trends and curiosity topics."}
+                            : "Alternates randomly between live-trend generation and curiosity topics."}
                         </p>
                       </div>
 
@@ -2757,6 +2778,45 @@ export default function Home() {
                           <p className="form-label-info">Keep runs on-theme for a niche channel.</p>
                         </div>
                       )}
+
+                      {/* Channel Niche (only relevant when live-trend generation is in play) */}
+                      {(schedulerConfig.topic_source === "trends" || schedulerConfig.topic_source === "mixed" || !schedulerConfig.topic_source) && (
+                        <div className="form-group">
+                          <label className="form-label">Channel Niche (optional)</label>
+                          <input
+                            type="text"
+                            value={schedulerConfig.channel_niche || ""}
+                            onChange={(e) => {
+                              const updated = { ...schedulerConfig, channel_niche: e.target.value };
+                              saveSchedulerConfig(updated);
+                            }}
+                            placeholder="e.g. personal finance, cooking, history — leave blank to roam any subject"
+                            className="form-input"
+                          />
+                          <p className="form-label-info">
+                            Research shows channels that reinforce one topic build audience faster than ones that
+                            jump subject every video. Leave blank for maximum variety instead.
+                          </p>
+                        </div>
+                      )}
+
+                      {/* Duration Preset */}
+                      <div className="form-group">
+                        <label className="form-label">Target Duration</label>
+                        <select
+                          value={schedulerConfig.duration_preset || "Standard (25-35s)"}
+                          onChange={(e) => {
+                            const updated = { ...schedulerConfig, duration_preset: e.target.value };
+                            saveSchedulerConfig(updated);
+                          }}
+                          className="form-input"
+                        >
+                          {(config?.duration_presets ?? ["Quick (15-20s)", "Standard (25-35s)"]).map((d) => (
+                            <option key={d} value={d}>{d}</option>
+                          ))}
+                        </select>
+                        <p className="form-label-info">25-35s is the retention sweet spot for most niches.</p>
+                      </div>
 
                       {/* Region */}
                       <div className="form-group">

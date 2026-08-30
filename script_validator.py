@@ -84,6 +84,17 @@ def validate_script(data, topic, n_scenes=7, min_words=40, max_words=95,
     if any(not nr for nr in narrs):
         hard.append("a scene has empty narration")
 
+    # The opening line decides whether the viewer keeps watching or swipes,
+    # typically within 1-3 seconds -- research puts the workable spoken-hook
+    # window at roughly 8-14 words. A longer opener has already lost the
+    # decision by the time it finishes; this was previously unchecked, so a
+    # rambling first line could reach render undetected.
+    if narrs:
+        hook_word_count = len(_words(narrs[0]))
+        if hook_word_count > 16:
+            hard.append(f"hook (scene 1) is {hook_word_count} words; "
+                       "must be roughly 8-14 to land inside the 3-second decision window")
+
     total_words = len(_words(" ".join(narrs)))
     if total_words < min_words:
         hard.append(f"script too short ({total_words} words; need >= {min_words})")
