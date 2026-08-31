@@ -25,6 +25,18 @@ from notifier import notify
 from curiosity_topics import select_curiosity_topic
 
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
+# Measured on this app's actual prompts: the largest realistic call (storyboard
+# generation with full history/grounding context) is ~1000 tokens in, under
+# 700 out -- comfortably inside 4096 with 2x headroom. Ollama's model default
+# is 32768, which on a 16GB Mac allocates a KV cache far bigger than this app
+# ever uses: measured directly, capping it here took one model's resident size
+# from 6.4GB to 4.7GB and its reload time from 4.1s to 0.8s (5x), which matters
+# because keep_alive's default 5-minute idle timeout means a multi-stage
+# pipeline (script, storyboard, topic generation, web grounding) pays that
+# reload tax repeatedly whenever stages are spaced further apart than that by
+# image/TTS/render work. keep_alive is extended here to outlast a full render.
+OLLAMA_NUM_CTX = int(os.getenv("OLLAMA_NUM_CTX", "4096"))
+OLLAMA_KEEP_ALIVE = os.getenv("OLLAMA_KEEP_ALIVE", "30m")
 
 CONFIG_FILE = os.path.abspath("scheduler_config.json")
 LOGS_FILE = os.path.abspath("scheduler_logs.json")
@@ -220,7 +232,9 @@ def select_viral_topic(trends_list, ollama_model, performance_hint="", exclude_t
         "model": ollama_model,
         "prompt": full_prompt,
         "stream": False,
-        "format": "json"
+        "format": "json",
+        "keep_alive": OLLAMA_KEEP_ALIVE,
+        "options": {"num_ctx": OLLAMA_NUM_CTX}
     }
     
     try:
@@ -318,7 +332,8 @@ def recommend_viral_topics(trends_list, ollama_model, count=5, performance_hint=
         )
 
     full_prompt = f"System: {system_prompt}\nTrends List:\n{trends_text}"
-    payload = {"model": ollama_model, "prompt": full_prompt, "stream": False, "format": "json"}
+    payload = {"model": ollama_model, "prompt": full_prompt, "stream": False, "format": "json",
+              "keep_alive": OLLAMA_KEEP_ALIVE, "options": {"num_ctx": OLLAMA_NUM_CTX}}
 
     recs = []
     try:

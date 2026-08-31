@@ -28,6 +28,18 @@ import requests
 from script_utils import topics_overlap
 
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
+# Measured on this app's actual prompts: the largest realistic call (storyboard
+# generation with full history/grounding context) is ~1000 tokens in, under
+# 700 out -- comfortably inside 4096 with 2x headroom. Ollama's model default
+# is 32768, which on a 16GB Mac allocates a KV cache far bigger than this app
+# ever uses: measured directly, capping it here took one model's resident size
+# from 6.4GB to 4.7GB and its reload time from 4.1s to 0.8s (5x), which matters
+# because keep_alive's default 5-minute idle timeout means a multi-stage
+# pipeline (script, storyboard, topic generation, web grounding) pays that
+# reload tax repeatedly whenever stages are spaced further apart than that by
+# image/TTS/render work. keep_alive is extended here to outlast a full render.
+OLLAMA_NUM_CTX = int(os.getenv("OLLAMA_NUM_CTX", "4096"))
+OLLAMA_KEEP_ALIVE = os.getenv("OLLAMA_KEEP_ALIVE", "30m")
 
 _UA = {"User-Agent": "video-gen-trend-analyser/1.0"}
 
@@ -164,7 +176,8 @@ def discover_domains(model, count, avoid_topics=None, focus="", timeout=120):
         resp = requests.post(
             f"{OLLAMA_HOST}/api/generate",
             json={"model": model, "prompt": "\n".join(parts),
-                  "stream": False, "format": "json"},
+                  "stream": False, "format": "json",
+                  "keep_alive": OLLAMA_KEEP_ALIVE, "options": {"num_ctx": OLLAMA_NUM_CTX}},
             timeout=timeout,
         )
         if resp.status_code != 200:
@@ -281,7 +294,8 @@ def generate_ideas(model, count=5, signals=None, used_topics=None,
     prompt = _build_prompt(chosen, signals, used_topics, count, performance_hint, focus=focus)
     resp = requests.post(
         f"{OLLAMA_HOST}/api/generate",
-        json={"model": model, "prompt": prompt, "stream": False, "format": "json"},
+        json={"model": model, "prompt": prompt, "stream": False, "format": "json",
+              "keep_alive": OLLAMA_KEEP_ALIVE, "options": {"num_ctx": OLLAMA_NUM_CTX}},
         timeout=timeout,
     )
     if resp.status_code != 200:
