@@ -145,3 +145,15 @@ def test_scene_durations_survive_into_the_final_file(render):
     expected = sum(s["duration"] for s in storyboard)
     actual = vq.probe(video)["duration"]
     assert abs(actual - expected) < 0.5, f"expected ~{expected:.2f}s, got {actual:.2f}s"
+
+
+def test_empty_storyboard_fails_loudly_before_reaching_ffmpeg(render):
+    """Reproduced live: /api/render-storyboard was called with an empty
+    storyboard (a caller bug -- passing `storyboard: []` instead of the
+    drafted scenes). That flows into custom_script_data={"scenes": []}, which
+    takes priority over custom_storyboard, so scenes ends up empty and a
+    0-byte concat list reached ffmpeg as an opaque `exit 183` with no
+    indication the real problem was upstream. It must fail with a clear
+    message instead of ever reaching ffmpeg."""
+    with pytest.raises(RuntimeError, match="No scene segments to render"):
+        render(custom_script_data={"scenes": []})

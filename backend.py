@@ -243,7 +243,7 @@ def mix_transition_sfx(main_audio_path, output_audio_path, transition_times):
     ]
     
     try:
-        subprocess.run(ffmpeg_cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        vq.run_ffmpeg(ffmpeg_cmd, label="transition SFX mix")
     except Exception as e:
         print(f"Error mixing transition SFX: {e}")
         shutil.copy(main_audio_path, output_audio_path)
@@ -646,7 +646,7 @@ def trim_audio_silence(input_path: str) -> str:
         trimmed_path
     ]
     try:
-        subprocess.run(ffmpeg_cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        vq.run_ffmpeg(ffmpeg_cmd, label="silence trim")
         if os.path.exists(trimmed_path) and os.path.getsize(trimmed_path) > 0:
             try:
                 os.remove(input_path)
@@ -678,7 +678,7 @@ def generate_speech_audio(text: str, voice_key: str, speed: float = 1.0, effect:
         if effect == "Kid (High Pitch)":
             pitch_output_path = os.path.abspath(os.path.join("temp", f"voice_kid_{int(time.time())}.wav"))
             ffmpeg_cmd = ["ffmpeg", "-y", "-i", raw_output_path, "-af", "asetrate=24000*1.3,atempo=1/1.3", pitch_output_path]
-            subprocess.run(ffmpeg_cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            vq.run_ffmpeg(ffmpeg_cmd, label="kid-pitch voice effect")
             try:
                 os.remove(raw_output_path)
             except Exception:
@@ -688,7 +688,7 @@ def generate_speech_audio(text: str, voice_key: str, speed: float = 1.0, effect:
         elif effect == "Deep (Low Pitch)":
             pitch_output_path = os.path.abspath(os.path.join("temp", f"voice_deep_{int(time.time())}.wav"))
             ffmpeg_cmd = ["ffmpeg", "-y", "-i", raw_output_path, "-af", "asetrate=24000*0.82,atempo=1/0.82", pitch_output_path]
-            subprocess.run(ffmpeg_cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            vq.run_ffmpeg(ffmpeg_cmd, label="deep-pitch voice effect")
             try:
                 os.remove(raw_output_path)
             except Exception:
@@ -970,6 +970,32 @@ def use_stock_for_scene(scene: dict, mode: str) -> bool:
     if tag in ("generate", "generated", "ai"):
         return False
     return bool(scene.get("stock_query"))
+
+
+def concat_with_fallback(list_path: str, output_path: str, label: str) -> None:
+    """Stream-copy concat is the fast path; fall back to a re-encoding concat
+    when it fails. Stock Pexels clips, Hailuo motion clips, and Ken Burns
+    slideshow segments are each produced by a different code path, and despite
+    sharing vq.intermediate_encode_args() can still end up differing enough
+    (container-level details -c copy is sensitive to) that -c copy concat
+    rejects them -- surfaced live as ffmpeg exit 183 with the real reason
+    thrown away by the old stderr=DEVNULL call."""
+    try:
+        vq.run_ffmpeg(
+            ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", list_path,
+             "-c", "copy", output_path],
+            label=f"{label} concat (stream copy)",
+        )
+    except RuntimeError as e:
+        print(f"{label} concat via stream copy failed ({e}); re-encoding instead.")
+        is_audio = output_path.lower().endswith(".wav")
+        reencode_args = (["-c:a", "pcm_s16le"] if is_audio else
+                         ["-c:v", "libx264", "-pix_fmt", "yuv420p", "-r", str(vq.FPS)])
+        vq.run_ffmpeg(
+            ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", list_path]
+            + reencode_args + [output_path],
+            label=f"{label} concat (re-encode fallback)",
+        )
 
 
 def run_viral_shorts_pipeline_new(
@@ -1260,19 +1286,38 @@ def run_viral_shorts_pipeline_new(
     merged_video = os.path.abspath(os.path.join("temp", f"merged_video_{timestamp}.mp4"))
     merged_audio = os.path.abspath(os.path.join("temp", f"merged_audio_{timestamp}.wav"))
     
+    # A concat list built from an empty or partially-missing scene set fails at
+    # ffmpeg with an opaque, unhelpful exit code (183) and no indication the
+    # real problem was upstream (e.g. an empty storyboard reaching the
+    # renderer). Fail loudly here instead, naming exactly what's missing.
+    if not scene_videos or not scene_audios:
+        raise RuntimeError(
+            f"No scene segments to render: got {len(scene_videos)} video and "
+            f"{len(scene_audios)} audio segment(s) for {len(scenes)} scene(s) "
+            "in the storyboard. The storyboard sent to the renderer is empty "
+            "or scene processing produced nothing -- check the caller."
+        )
+    missing_video = [p for p in scene_videos if not os.path.exists(p)]
+    missing_audio = [p for p in scene_audios if not os.path.exists(p)]
+    if missing_video or missing_audio:
+        raise RuntimeError(
+            "Scene segment file(s) went missing before concat -- "
+            f"video: {missing_video or 'none missing'}, audio: {missing_audio or 'none missing'}"
+        )
+
     video_list_path = os.path.abspath(os.path.join("temp", f"video_list_{timestamp}.txt"))
     audio_list_path = os.path.abspath(os.path.join("temp", f"audio_list_{timestamp}.txt"))
-    
+
     with open(video_list_path, "w") as vf:
         for p in scene_videos:
             vf.write(f"file '{p}'\n")
     with open(audio_list_path, "w") as af:
         for p in scene_audios:
             af.write(f"file '{p}'\n")
-            
-    subprocess.run(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", video_list_path, "-c", "copy", merged_video], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    subprocess.run(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", audio_list_path, "-c", "copy", merged_audio], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    
+
+    concat_with_fallback(video_list_path, merged_video, "video")
+    concat_with_fallback(audio_list_path, merged_audio, "audio")
+
     try:
         os.remove(video_list_path)
         os.remove(audio_list_path)
