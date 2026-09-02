@@ -27,10 +27,12 @@ def init_db():
         script_data TEXT, -- JSON string
         storyboard TEXT,  -- JSON string
         final_video_path TEXT,
-        status TEXT,      -- 'draft', 'rendering', 'completed', 'failed'
+        status TEXT,      -- 'drafting', 'draft', 'rendering', 'completed', 'failed'
         created_at TEXT
     );
     """)
+
+    _migrate_video_generations_columns(cursor)
     
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS upload_jobs (
@@ -142,6 +144,24 @@ def _migrate_video_stats_columns(cursor):
     for col, col_type in _VIDEO_STATS_ENGAGEMENT_COLUMNS.items():
         if col not in existing:
             cursor.execute(f"ALTER TABLE video_stats ADD COLUMN {col} {col_type}")
+
+
+# Added so /api/draft-script can run as a background job: the client gets a
+# generation_id back immediately and polls /api/generation-status for these
+# instead of holding one HTTP request open for a multi-minute local-LLM
+# script generation (which was hanging with no visibility -- see backend.py's
+# run_draft_task).
+_VIDEO_GENERATIONS_PROGRESS_COLUMNS = {
+    "logs": "TEXT",           # JSON array of progress strings
+    "error_message": "TEXT",  # set on status='failed'
+}
+
+
+def _migrate_video_generations_columns(cursor):
+    existing = {row[1] for row in cursor.execute("PRAGMA table_info(video_generations)").fetchall()}
+    for col, col_type in _VIDEO_GENERATIONS_PROGRESS_COLUMNS.items():
+        if col not in existing:
+            cursor.execute(f"ALTER TABLE video_generations ADD COLUMN {col} {col_type}")
 
 # Cost / budget helpers
 def record_api_cost(video_generation_id, service, operation, cost):
@@ -420,13 +440,14 @@ def create_video_generation(gen_id, prompt, topic, script_data, storyboard, stat
     conn.close()
     return gen_id
 
-def update_video_generation(gen_id, topic=None, script_data=None, storyboard=None, final_video_path=None, status=None):
+def update_video_generation(gen_id, topic=None, script_data=None, storyboard=None, final_video_path=None,
+                            status=None, logs=None, error_message=None):
     conn = get_db_connection()
     cursor = conn.cursor()
-    
+
     fields = []
     values = []
-    
+
     if topic is not None:
         fields.append("topic = ?")
         values.append(topic)
@@ -442,7 +463,13 @@ def update_video_generation(gen_id, topic=None, script_data=None, storyboard=Non
     if status is not None:
         fields.append("status = ?")
         values.append(status)
-        
+    if logs is not None:
+        fields.append("logs = ?")
+        values.append(json.dumps(logs))
+    if error_message is not None:
+        fields.append("error_message = ?")
+        values.append(error_message)
+
     if not fields:
         conn.close()
         return
@@ -467,6 +494,8 @@ def get_video_generation(gen_id):
         res["script_data"] = json.loads(res["script_data"])
     if res.get("storyboard"):
         res["storyboard"] = json.loads(res["storyboard"])
+    if res.get("logs"):
+        res["logs"] = json.loads(res["logs"])
     return res
 
 def get_recent_topics(limit=40):

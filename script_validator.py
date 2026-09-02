@@ -188,6 +188,73 @@ def ensure_cta(data):
     return data
 
 
+def _trim_hook_to_word_limit(narration: str, max_words: int = 14) -> str:
+    """Trim scene 1's narration to the last full sentence that fits within
+    ``max_words``, or a hard word-count cut if no sentence boundary fits.
+    Preserves original case/punctuation (unlike the lowercased ``_words``
+    used for validation) since this text is what actually gets spoken."""
+    tokens = re.findall(r"\S+", narration)
+    if len(tokens) <= max_words:
+        return narration
+    # Prefer cutting at a sentence-ending word inside the limit, so the
+    # trimmed hook still reads as a complete thought rather than trailing off.
+    for cut in range(max_words, 0, -1):
+        if re.search(r"[.!?]$", tokens[cut - 1]):
+            return " ".join(tokens[:cut])
+    trimmed = " ".join(tokens[:max_words]).rstrip(",;:")
+    return trimmed if trimmed[-1:] in ".!?" else trimmed + "."
+
+
+def mechanically_fix_hard_issues(data: dict, hard_issues: list, min_words: int = 40) -> tuple:
+    """Fix HARD validator issues in place where a full LLM regeneration is not
+    actually needed, so a multi-minute story+storyboard regeneration cycle
+    isn't spent on content the deterministic checker already knows how to
+    correct itself. Returns ``(data, remaining_issues)`` -- issues that could
+    not be fixed mechanically and still require real regeneration.
+
+    Only two hard issues are mechanically fixable without inventing new
+    content: an over-length hook (trim it) and a duplicate line in the final
+    CTA slot (swap in a generic, content-independent call to action). Any
+    other duplicate, or any other hard issue, needs the LLM's judgment --
+    silently rewriting mid-script content here would risk a worse, less
+    coherent result than just asking again.
+    """
+    scenes = data.get("scenes") or []
+    remaining = []
+
+    for issue in hard_issues:
+        if issue.startswith("hook (scene 1) is") and scenes:
+            narration = scenes[0].get("narration", "")
+            fixed = _trim_hook_to_word_limit(narration)
+            if len(_words(fixed)) >= min(8, min_words):
+                scenes[0]["narration"] = fixed
+                continue
+            remaining.append(issue)
+            continue
+
+        if issue == "duplicate narration lines" and scenes:
+            seen = set()
+            still_duplicated = False
+            for i, s in enumerate(scenes):
+                norm = _norm(s.get("narration", ""))
+                if norm and norm in seen:
+                    if i == len(scenes) - 1:
+                        s["narration"] = "Subscribe so you never miss one!"
+                    else:
+                        # An earlier duplicate needs real replacement content
+                        # only the LLM can supply -- can't fix this one safely.
+                        still_duplicated = True
+                else:
+                    seen.add(norm)
+            if still_duplicated:
+                remaining.append(issue)
+            continue
+
+        remaining.append(issue)
+
+    return data, remaining
+
+
 def autofix(data, art_style="Photorealistic"):
     """Apply all soft fixes in place and return the data.
 

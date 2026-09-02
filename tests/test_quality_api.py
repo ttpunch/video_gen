@@ -113,6 +113,11 @@ def test_draft_preserves_the_stock_tags_the_render_depends_on(client, monkeypatc
     drafted through the UI reached the renderer untagged and fell back to image
     generation -- while a hand-tagged storyboard used real footage. Same code,
     opposite result, which is exactly the discrepancy a user noticed.
+
+    /api/draft-script now runs the actual generation as a background task (so
+    a multi-minute local-LLM call doesn't hold the HTTP request open); the
+    TestClient runs background tasks to completion before .post() returns, so
+    the persisted update() call is what carries the real result to assert on.
     """
     monkeypatch.setattr(backend, "generate_validated_script", lambda *a, **k: {
         "topic": "t",
@@ -125,10 +130,15 @@ def test_draft_preserves_the_stock_tags_the_render_depends_on(client, monkeypatc
     })
     monkeypatch.setattr(backend.db_manager, "create_video_generation",
                         lambda *a, **k: None)
+    captured = {}
+    monkeypatch.setattr(backend.db_manager, "update_video_generation",
+                        lambda *a, **k: captured.update(k))
 
-    body = client.post("/api/draft-script",
-                       json={"prompt": "p", "model": "m"}).json()
-    sb = body["storyboard"]
+    resp = client.post("/api/draft-script", json={"prompt": "p", "model": "m"}).json()
+    assert resp["status"] == "drafting"
+    assert resp["generation_id"]
+
+    sb = captured["storyboard"]
     assert sb[0]["visual_source"] == "stock"
     assert sb[0]["stock_query"] == "ocean waves"
     assert sb[1]["visual_source"] == "generate"
@@ -142,8 +152,12 @@ def test_drafted_scenes_still_carry_the_fields_the_editor_needs(client, monkeypa
     })
     monkeypatch.setattr(backend.db_manager, "create_video_generation",
                         lambda *a, **k: None)
-    scene = client.post("/api/draft-script",
-                        json={"prompt": "p", "model": "m"}).json()["storyboard"][0]
+    captured = {}
+    monkeypatch.setattr(backend.db_manager, "update_video_generation",
+                        lambda *a, **k: captured.update(k))
+
+    client.post("/api/draft-script", json={"prompt": "p", "model": "m"})
+    scene = captured["storyboard"][0]
     for key in ("scene", "speaker", "narration", "visual_prompt",
                 "image_url", "image_path", "audio_url", "audio_path", "duration"):
         assert key in scene, f"draft dropped {key}"

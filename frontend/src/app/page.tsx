@@ -271,12 +271,17 @@ export default function Home() {
     setThumbnailUrl(null);
     setStoryboard([]);
     setGenerationId(null);
-    
+
     addLog("📝 Creating Script & Storyboard Draft...");
     addLog(`Topic: "${viralPrompt}"`);
     addLog(`Hook Style: ${viralHookStyle}`);
     addLog(`Duration: ${durationPreset}`);
-    
+
+    // Drafting runs as a background job on the backend (a multi-minute local
+    // LLM call previously held this fetch open with no way to show progress
+    // or give up cleanly -- reproduced live as a 280s hang with no response).
+    // Poll generation-status instead of awaiting one long request.
+    let seenLogCount = 0;
     try {
       const response = await fetch("http://localhost:8000/api/draft-script", {
         method: "POST",
@@ -291,22 +296,56 @@ export default function Home() {
           duration_preset: durationPreset
         })
       });
-      
+
       if (!response.ok) {
         throw new Error(await response.text());
       }
-      
-      const result = await response.json();
-      setGenerationId(result.generation_id);
-      setStoryboard(result.storyboard);
-      setGeneratedTopic(result.topic);
-      
-      // Pre-fill social upload metadata
-      setUploadTitle(result.youtube_metadata?.title || result.topic || "");
-      setUploadDescription(result.youtube_metadata?.description || "");
-      setUploadTags(result.youtube_metadata?.tags?.join(", ") || "");
 
-      addLog("✅ Script draft generated! Storyboard scenes are now ready for your edits.");
+      const { generation_id } = await response.json();
+      setGenerationId(generation_id);
+
+      await new Promise<void>((resolve, reject) => {
+        const interval = setInterval(async () => {
+          try {
+            const res = await fetch(`http://localhost:8000/api/generation-status/${generation_id}`);
+            if (!res.ok) return;
+            const status = await res.json();
+
+            const newLogs: string[] = (status.logs || []).slice(seenLogCount);
+            newLogs.forEach((line: string) => addLog(line));
+            seenLogCount = (status.logs || []).length;
+
+            if (status.status === "draft") {
+              clearInterval(interval);
+              clearTimeout(timeout);
+              setStoryboard(status.storyboard || []);
+              setGeneratedTopic(status.topic || "");
+              setUploadTitle(status.youtube_metadata?.title || status.topic || "");
+              setUploadDescription(status.youtube_metadata?.description || "");
+              setUploadTags(status.youtube_metadata?.tags?.join(", ") || "");
+              if (status.validation_warnings?.length) {
+                addLog(`⚠️ Draft used the least-bad attempt: ${status.validation_warnings.join("; ")}`);
+              }
+              addLog("✅ Script draft generated! Storyboard scenes are now ready for your edits.");
+              resolve();
+            } else if (status.status === "failed") {
+              clearInterval(interval);
+              clearTimeout(timeout);
+              reject(new Error(status.error_message || "Draft generation failed"));
+            }
+          } catch (pollErr) {
+            console.error("Error polling draft status:", pollErr);
+          }
+        }, 2000);
+
+        // Local 7B models can legitimately take several minutes across
+        // retries; give up client-side well past that rather than polling
+        // forever if the backend itself never reaches a terminal status.
+        const timeout = setTimeout(() => {
+          clearInterval(interval);
+          reject(new Error("Drafting timed out after 8 minutes with no result."));
+        }, 8 * 60 * 1000);
+      });
     } catch (err: any) {
       addLog(`❌ ERROR drafting script: ${err.message || err}`);
     } finally {

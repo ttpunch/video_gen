@@ -128,3 +128,61 @@ def test_very_short_hook_is_not_penalised():
     d["scenes"][0]["narration"] = "This changes everything."  # 3 words
     hard, _soft = sv.validate_script(d, "Why flamingos are pink")
     assert not any("hook" in h.lower() for h in hard)
+
+
+# --------------------------------------------------------------------------
+# Mechanical fixes -- correcting hard issues without an LLM regeneration
+# --------------------------------------------------------------------------
+
+def test_mechanical_fix_trims_an_overlong_hook():
+    d = _good_script()
+    d["scenes"][0]["narration"] = (
+        "So today I wanted to sit down and actually properly explain to you "
+        "exactly why flamingos are famously known for being this particular shade of pink."
+    )
+    hard, _soft = sv.validate_script(d, "Why flamingos are pink")
+    assert any("hook" in h for h in hard)
+
+    fixed, remaining = sv.mechanically_fix_hard_issues(d, hard, min_words=40)
+
+    assert not any("hook" in h for h in remaining)
+    hard_after, _ = sv.validate_script(fixed, "Why flamingos are pink")
+    assert not any("hook" in h for h in hard_after)
+
+
+def test_mechanical_fix_swaps_a_duplicated_final_cta():
+    d = _good_script()
+    d["scenes"][-1]["narration"] = d["scenes"][0]["narration"]  # CTA duplicates the hook
+    hard, _soft = sv.validate_script(d, "Why flamingos are pink")
+    assert any("duplicate" in h for h in hard)
+
+    fixed, remaining = sv.mechanically_fix_hard_issues(d, hard, min_words=40)
+
+    assert not any("duplicate" in h for h in remaining)
+    assert fixed["scenes"][-1]["narration"] == "Subscribe so you never miss one!"
+
+
+def test_mechanical_fix_leaves_a_mid_script_duplicate_for_regeneration():
+    """Only the CTA slot is safe to swap for a generic line -- a duplicate
+    anywhere else needs real replacement content only the LLM can supply."""
+    d = _good_script()
+    d["scenes"][2]["narration"] = d["scenes"][1]["narration"]
+    hard, _soft = sv.validate_script(d, "Why flamingos are pink")
+    assert any("duplicate" in h for h in hard)
+
+    _fixed, remaining = sv.mechanically_fix_hard_issues(d, hard, min_words=40)
+
+    assert any("duplicate" in h for h in remaining)
+
+
+def test_mechanical_fix_does_not_touch_unfixable_issues():
+    d = _good_script()
+    for s in d["scenes"]:
+        s["narration"] = "Deep space contains many mysterious objects today."
+    d["global_subject_focus"] = "a galaxy"
+    hard, _soft = sv.validate_script(d, "Why flamingos are pink")
+    assert any("off-topic" in h for h in hard)
+
+    _fixed, remaining = sv.mechanically_fix_hard_issues(d, hard, min_words=40)
+
+    assert remaining == hard

@@ -33,7 +33,7 @@ import script_utils
 import stock_footage
 import llm_client
 from script_utils import build_storyboard_from_story, normalize_scene_count
-from script_validator import validate_script, autofix, ART_STYLE_PRESETS
+from script_validator import validate_script, autofix, mechanically_fix_hard_issues, ART_STYLE_PRESETS
 from search_helper import get_web_grounding_context, clean_json_response
 from uploader_youtube import upload_video_to_youtube, is_youtube_authenticated, trigger_youtube_auth_flow_url
 
@@ -360,19 +360,21 @@ DEFAULT_DURATION_PRESET = "Standard (25-35s)"
 
 def generate_ollama_script(prompt: str, model: str, hook_style: str = "None (Direct Prompt)",
                            enable_search: bool = False, art_style: str = "Photorealistic",
-                           duration_preset: str = DEFAULT_DURATION_PRESET):
+                           duration_preset: str = DEFAULT_DURATION_PRESET, log_callback=None):
+    _log = log_callback or print
     hook_instruction = VIRAL_HOOKS.get(hook_style, "")
-    
+
     # 1. Handle dynamic web search fact checking
     grounding_info = ""
     if enable_search:
+        _log("Searching the web for facts to ground the script...")
         try:
             grounding_data = get_web_grounding_context(prompt, model)
             if grounding_data.get("requires_search") and grounding_data.get("context"):
                 grounding_info = f"\nVERIFIED INTERNET SEARCH FACTS:\n{grounding_data['context']}\n"
-                print(f"RAG Grounding: Query used: '{grounding_data['search_query']}'. Injected search context successfully.")
+                _log(f"RAG Grounding: Query used: '{grounding_data['search_query']}'. Injected search context successfully.")
         except Exception as e:
-            print(f"Failed to perform web search grounding: {e}")
+            _log(f"Failed to perform web search grounding: {e}")
             
     min_words, max_words, seconds_label = DURATION_PRESETS.get(
         duration_preset, DURATION_PRESETS[DEFAULT_DURATION_PRESET])
@@ -477,9 +479,11 @@ def generate_ollama_script(prompt: str, model: str, hook_style: str = "None (Dir
                 print(f"Story extension failed ({e}); using original {wc}-word story.")
         return t
 
+    _log(f"Generating story (up to 3 attempts) with {model}...")
     try:
         story_text = retry_call(_attempt_story, attempts=3, base_delay=2.0,
-                                label="story text", logger=print)
+                                label="story text", logger=_log)
+        _log("Story generated.")
         print(f"--- Generated Cohesive Story ---\n{story_text}\n---------------------------------")
     except Exception as e:
         raise RuntimeError(
@@ -578,9 +582,10 @@ def generate_ollama_script(prompt: str, model: str, hook_style: str = "None (Dir
             raise RuntimeError(f"invalid storyboard (got {len(scenes) if isinstance(scenes, list) else 'no'} scenes)")
         return data
 
+    _log("Segmenting story into a 7-scene storyboard...")
     try:
         data = retry_call(_attempt_storyboard, attempts=2, base_delay=2.0,
-                          label="storyboard JSON", logger=print)
+                          label="storyboard JSON", logger=_log)
         data["scenes"] = normalize_scene_count(data["scenes"], story_text, 7)
         # Make sure the global anchors exist and are tied to the actual topic.
         if not data.get("global_subject_focus"):
@@ -601,21 +606,42 @@ def generate_ollama_script(prompt: str, model: str, hook_style: str = "None (Dir
 def generate_validated_script(prompt, model, hook_style="None (Direct Prompt)",
                               enable_search=False, attempts=3, log=print,
                               art_style="Photorealistic",
-                              duration_preset=DEFAULT_DURATION_PRESET):
+                              duration_preset=DEFAULT_DURATION_PRESET,
+                              max_seconds=360.0):
     """Generate a script and run it through the deterministic viral checker.
 
     Regenerates on HARD failures (off-topic, repeats, wrong length, fallback,
     a hook that runs long...), auto-fixes SOFT issues (missing CTA, non-realistic
     style), and raises if it still cannot produce a valid script - so a broken
     video never reaches render.
+
+    Two things keep a bad first attempt from costing a full second LLM round
+    trip: ``mechanically_fix_hard_issues`` corrects an over-length hook or a
+    duplicated CTA line in place (the only two hard issues that don't need the
+    LLM's judgment to fix), and ``max_seconds`` caps the total wall-clock spend
+    -- 3 attempts x a multi-stage local-7B generation can exceed 6 minutes, so
+    once the deadline passes this returns the least-bad attempt seen so far
+    (autofixed, with its remaining issues attached as a warning) instead of
+    leaving the caller waiting through a full 3rd attempt for a result that
+    then still gets thrown away.
     """
     min_words, max_words, _label = DURATION_PRESETS.get(
         duration_preset, DURATION_PRESETS[DEFAULT_DURATION_PRESET])
     last_hard = ["unknown error"]
+    best_data, best_hard = None, None
+    start = time.time()
+
     for attempt in range(1, attempts + 1):
+        if attempt > 1 and time.time() - start > max_seconds:
+            log(f"[validator] {time.time() - start:.0f}s elapsed, over the {max_seconds:.0f}s "
+                f"budget; stopping after attempt {attempt - 1} instead of trying again.")
+            break
+
+        log(f"Drafting script (attempt {attempt}/{attempts})...")
         try:
             data = generate_ollama_script(prompt, model, hook_style, enable_search=enable_search,
-                                          art_style=art_style, duration_preset=duration_preset)
+                                          art_style=art_style, duration_preset=duration_preset,
+                                          log_callback=log)
         except Exception as e:
             last_hard = [f"generation error: {e}"]
             log(f"[validator] attempt {attempt}/{attempts}: {last_hard[0]}")
@@ -623,12 +649,27 @@ def generate_validated_script(prompt, model, hook_style="None (Direct Prompt)",
 
         hard, soft = validate_script(data, prompt, art_style=art_style,
                                      min_words=min_words, max_words=max_words)
+        if hard:
+            data, hard = mechanically_fix_hard_issues(data, hard, min_words=min_words)
+            if hard:
+                log(f"[validator] mechanical fixes left {len(hard)} issue(s) unresolved: {hard}")
+            else:
+                log("[validator] fixed hard issues in place (hook trim / CTA dedupe) -- no regeneration needed.")
+
         if not hard:
             if soft:
                 log(f"[validator] auto-fixing soft issues: {soft}")
             return autofix(data, art_style=art_style)  # enforce style + ensure CTA
+
+        if best_hard is None or len(hard) < len(best_hard):
+            best_data, best_hard = data, hard
         last_hard = hard
         log(f"[validator] attempt {attempt}/{attempts} rejected (regenerating): {hard}")
+
+    if best_data is not None:
+        log(f"[validator] returning the least-bad attempt with unresolved issues: {best_hard}")
+        best_data["_validation_warnings"] = best_hard
+        return autofix(best_data, art_style=art_style)
 
     raise RuntimeError(
         f"Script failed viral validation after {attempts} attempts for '{prompt}': {last_hard}"
@@ -1519,13 +1560,28 @@ class DbUploadRequest(BaseModel):
     youtube_tags: Optional[List[str]] = []
     youtube_privacy: Optional[str] = "private"
 
-@app.post("/api/draft-script")
-def api_draft_script(req: DraftRequest):
+def run_draft_task(gen_id: str, req: "DraftRequest") -> None:
+    """Background counterpart of api_draft_script.
+
+    A synchronous /api/draft-script held one HTTP request open for the whole
+    script+storyboard generation -- reproduced live: a request with a local
+    7B model and web search enabled produced no response in 280s (the client
+    gave up; the endpoint had no way to report progress or an intermediate
+    timeout). Running this as a background job lets the client return
+    immediately with a generation_id and poll /api/generation-status for
+    progress, matching the pattern already used for rendering.
+    """
+    logs: list = []
+
+    def _log(msg: str) -> None:
+        logs.append(msg)
+        print(msg)
+        db_manager.update_video_generation(gen_id, logs=logs)
+
     try:
-        gen_id = str(uuid.uuid4())
         script_data = generate_validated_script(req.prompt, req.model, req.hook_style,
                                                  enable_search=req.enable_search, art_style=req.art_style,
-                                                 duration_preset=req.duration_preset)
+                                                 duration_preset=req.duration_preset, log=_log)
         scenes = script_data.get("scenes", [])
 
         # Build initial storyboard structure.
@@ -1551,20 +1607,30 @@ def api_draft_script(req: DraftRequest):
                 "duration": 0.0
             })
             storyboard.append(entry)
-            
-        db_manager.create_video_generation(
-            gen_id, req.prompt, script_data.get("topic", req.prompt), script_data, storyboard, status="draft"
+
+        if script_data.get("_validation_warnings"):
+            _log(f"Draft ready with unresolved issues (used the least-bad attempt): "
+                 f"{script_data['_validation_warnings']}")
+
+        db_manager.update_video_generation(
+            gen_id, topic=script_data.get("topic", req.prompt),
+            script_data=script_data, storyboard=storyboard, status="draft",
         )
-        return {
-            "success": True,
-            "generation_id": gen_id,
-            "topic": script_data.get("topic", req.prompt),
-            "storyboard": storyboard,
-            "youtube_metadata": script_data.get("youtube_metadata"),
-            "instagram_metadata": script_data.get("instagram_metadata")
-        }
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        _log(f"Draft failed: {e}")
+        db_manager.update_video_generation(gen_id, status="failed", error_message=str(e))
+        notify("Draft script failed", f"Draft for '{req.prompt}' failed: {e}",
+              context={"generation_id": gen_id})
+
+
+@app.post("/api/draft-script")
+def api_draft_script(req: DraftRequest, background_tasks: BackgroundTasks):
+    gen_id = str(uuid.uuid4())
+    db_manager.create_video_generation(
+        gen_id, req.prompt, req.prompt, None, None, status="drafting"
+    )
+    background_tasks.add_task(run_draft_task, gen_id, req)
+    return {"success": True, "generation_id": gen_id, "status": "drafting"}
 
 @app.post("/api/regenerate-scene-asset")
 def api_regenerate_scene_asset(req: SingleAssetRegenRequest):
@@ -1948,13 +2014,22 @@ def api_generation_status(generation_id: str):
         raise HTTPException(status_code=404, detail="Generation not found")
 
     video_path = gen.get("final_video_path")
+    script_data = gen.get("script_data") or {}
     return {
         "status": gen["status"],
+        # Progress stages while status == 'drafting' or 'rendering' (e.g.
+        # "generating story (attempt 2/3)"), so the frontend can poll this
+        # instead of holding one HTTP request open for a multi-minute
+        # local-LLM script generation.
+        "logs": gen.get("logs") or [],
+        "error_message": gen.get("error_message"),
+        "topic": gen.get("topic"),
         "video_url": static_url(video_path),
         "thumbnail_url": thumbnail_url_for(video_path),
         "storyboard": gen["storyboard"],
-        "youtube_metadata": gen.get("script_data", {}).get("youtube_metadata") if gen.get("script_data") else None,
-        "instagram_metadata": gen.get("script_data", {}).get("instagram_metadata") if gen.get("script_data") else None,
+        "youtube_metadata": script_data.get("youtube_metadata"),
+        "instagram_metadata": script_data.get("instagram_metadata"),
+        "validation_warnings": script_data.get("_validation_warnings"),
     }
 
 @app.delete("/api/generation/{generation_id}")
