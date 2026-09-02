@@ -11,6 +11,7 @@ import soundfile as sf
 import shutil
 import threading
 from datetime import datetime
+from contextlib import asynccontextmanager
 from typing import Optional, List
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
@@ -55,7 +56,72 @@ OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
 OLLAMA_NUM_CTX = int(os.getenv("OLLAMA_NUM_CTX", "4096"))
 OLLAMA_KEEP_ALIVE = os.getenv("OLLAMA_KEEP_ALIVE", "30m")
 
-app = FastAPI(title="AI Video Presenter Backend", version="1.0.0")
+TEMP_DIR = "temp"
+TEMP_FILE_MAX_AGE_HOURS = 48
+
+
+def _temp_paths_still_in_use() -> Optional[set]:
+    """Every temp/ file path referenced by a generation still in 'draft' or
+    'rendering' status -- these must survive cleanup no matter how old, since
+    a paused local generation (or one a user is still editing scene-by-scene)
+    can legitimately sit for a while. Returns None if the DB can't be read,
+    so the caller skips cleanup entirely rather than risk deleting something
+    still in use."""
+    referenced = set()
+    try:
+        for gen in db_manager.list_video_generations():
+            if gen.get("status") not in ("draft", "drafting", "rendering"):
+                continue
+            for scene in (gen.get("storyboard") or []):
+                for key in ("image_path", "audio_path", "clip_path"):
+                    p = scene.get(key)
+                    if p:
+                        referenced.add(os.path.abspath(p))
+    except Exception as e:
+        print(f"Temp cleanup: could not read in-progress generations ({e}); skipping this run to be safe.")
+        return None
+    return referenced
+
+
+def cleanup_stale_temp_files(max_age_hours: float = TEMP_FILE_MAX_AGE_HOURS) -> int:
+    """Delete temp/ files older than max_age_hours, except ones a draft or
+    in-progress render still references. Orphaned video_list/audio_list/
+    merged_*/scene_*/voice_raw_* files from failed or abandoned runs
+    otherwise accumulate in temp/ forever. Runs on startup and after each
+    successful render."""
+    if not os.path.isdir(TEMP_DIR):
+        return 0
+    referenced = _temp_paths_still_in_use()
+    if referenced is None:
+        return 0
+
+    cutoff = time.time() - max_age_hours * 3600
+    deleted = 0
+    for name in os.listdir(TEMP_DIR):
+        path = os.path.abspath(os.path.join(TEMP_DIR, name))
+        if path in referenced or not os.path.isfile(path):
+            continue
+        try:
+            if os.path.getmtime(path) < cutoff:
+                os.remove(path)
+                deleted += 1
+        except OSError as e:
+            print(f"Temp cleanup: could not remove {path}: {e}")
+    if deleted:
+        print(f"Temp cleanup: removed {deleted} stale file(s) older than {max_age_hours:.0f}h from {TEMP_DIR}/.")
+    return deleted
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    try:
+        cleanup_stale_temp_files()
+    except Exception as e:
+        print(f"Startup temp cleanup failed (non-fatal): {e}")
+    yield
+
+
+app = FastAPI(title="AI Video Presenter Backend", version="1.0.0", lifespan=lifespan)
 
 # Enable CORS for Next.js app
 app.add_middleware(
@@ -1738,6 +1804,10 @@ def run_render_task(generation_id: str, req: RenderRequest):
         db_manager.update_video_generation(
             generation_id, storyboard=storyboard, final_video_path=final_video, status="completed"
         )
+        try:
+            cleanup_stale_temp_files()
+        except Exception as e:
+            print(f"Post-render temp cleanup failed (non-fatal): {e}")
     except Exception as e:
         print(f"Rendering failed: {e}")
         db_manager.update_video_generation(generation_id, status="failed")
