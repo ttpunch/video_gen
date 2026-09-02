@@ -31,11 +31,11 @@ from reliability import retry_call, RetryError
 from notifier import notify
 import script_utils
 import stock_footage
+import llm_client
 from script_utils import build_storyboard_from_story, normalize_scene_count
 from script_validator import validate_script, autofix, ART_STYLE_PRESETS
 from search_helper import get_web_grounding_context, clean_json_response
 from uploader_youtube import upload_video_to_youtube, is_youtube_authenticated, trigger_youtube_auth_flow_url
-from uploader_instagram import upload_reel_to_instagram, is_instagram_configured
 
 # Global in-memory storage for upload job logs
 upload_jobs = {}
@@ -127,14 +127,9 @@ SATISFYING_PRESETS = {
     "Satisfying Liquid": "https://images.pexels.com/video-files/8564860/8564860-sd_540_960_30fps.mp4"
 }
 
-# Every autonomous video used to hardcode "Did You Know? (Fact Hook)" (see
-# viral_agent.py's ``_run_single_video``), so every unattended upload opened
-# with the identical hook regardless of topic -- a large, previously invisible
-# contributor to "the videos feel similar". The scheduler now rotates through
-# this whole set (see ROTATING_HOOK_STYLES below); the two entries marked NEW
-# fill formulas that 2026 short-form research names as the highest and
-# second-highest performing hook types, and were not covered by the original
-# five (which cluster around one "did you know / secrets" register).
+# The two entries marked NEW fill formulas that 2026 short-form research names
+# as the highest and second-highest performing hook types, not covered by the
+# original five (which cluster around one "did you know / secrets" register).
 VIRAL_HOOKS = {
     "None (Direct Prompt)": "",
     "Did You Know? (Fact Hook)": "Start the script with a mind-blowing 'Did you know...' hook in Scene 1 to grab immediate attention.",
@@ -146,11 +141,6 @@ VIRAL_HOOKS = {
     "Mistake Warning (NEW)": "Open by naming a specific, common mistake almost everyone makes related to the topic, framed as a direct warning to the viewer (e.g. 'You've been doing X wrong your whole life.').",
 }
 
-#: Hook styles the autonomous scheduler rotates through, one per video, never
-#: repeating the immediately previous pick. "None (Direct Prompt)" is excluded
-#: here -- an unattended video with no hook instruction is exactly the
-#: generic-feeling failure mode this rotation exists to prevent.
-ROTATING_HOOK_STYLES = [k for k in VIRAL_HOOKS if k != "None (Direct Prompt)"]
 
 # Helpers
 def download_file(url, folder, prefix):
@@ -371,8 +361,6 @@ DEFAULT_DURATION_PRESET = "Standard (25-35s)"
 def generate_ollama_script(prompt: str, model: str, hook_style: str = "None (Direct Prompt)",
                            enable_search: bool = False, art_style: str = "Photorealistic",
                            duration_preset: str = DEFAULT_DURATION_PRESET):
-    url = f"{OLLAMA_HOST}/api/generate"
-    
     hook_instruction = VIRAL_HOOKS.get(hook_style, "")
     
     # 1. Handle dynamic web search fact checking
@@ -390,10 +378,32 @@ def generate_ollama_script(prompt: str, model: str, hook_style: str = "None (Dir
         duration_preset, DURATION_PRESETS[DEFAULT_DURATION_PRESET])
 
     # Stage 1: Creative Story / Script Writer (Free-form text)
+    # Smaller local models satisfice on a short, well-formed hook/escalate/
+    # payoff/CTA arc and stop, ignoring an abstract total-word target stated
+    # only once. Measured live: qwen2.5:7b-instruct returned 23-55 words
+    # against a 110-145 word target on 9 straight attempts (3 outer retries x
+    # 3 internal retries), never once landing in range. Giving it a concrete
+    # SENTENCE COUNT (models track "have I written N sentences yet" far more
+    # reliably than "have I written N words yet") and restating the
+    # requirement at both the top and bottom of the prompt is the fix.
+    # Smaller local models undershoot a stated RANGE, not just an abstract
+    # total: measured live even after adding a sentence-count target below,
+    # qwen2.5:7b-instruct landed at 67, 104, and 78 words against 110-145 --
+    # three straight misses, all under, none over. A range reads as "anywhere
+    # in here is fine" and the model anchors low; asking for the ceiling with
+    # the floor framed as a hard minimum (not a midpoint to aim near) shifts
+    # the whole distribution up instead of retrying the same coin flip.
+    target_sentences = max(6, round(max_words / 9))
+    min_sentences = max(4, round(min_words / 9))
     storyteller_system = (
         "You are a world-class short-form video scriptwriter for YouTube Shorts, Instagram Reels "
         f"and TikTok whose videos routinely go viral. Write a punchy ~{seconds_label}-second voiceover "
         "script about the given topic.\n"
+        f"HARD LENGTH REQUIREMENT: write {target_sentences} sentences, aiming for {max_words} words. "
+        f"{min_words} words is the ABSOLUTE FLOOR, not a target -- landing near it is a FAILURE. "
+        "A short, complete-sounding script that ends early is a FAILURE even if it has a hook, escalation, "
+        "and payoff -- if you're tempted to stop before hitting the sentence count, add another specific "
+        "fact, angle, or twist first. Undershooting is a failure; overshooting slightly is fine.\n"
         "VIRAL RULES (follow all):\n"
         "- HOOK FIRST: The opening sentence is the single highest-leverage line in the whole script -- "
         "most viewers decide to keep watching or swipe away within the first 1-3 seconds. It must be "
@@ -403,13 +413,18 @@ def generate_ollama_script(prompt: str, model: str, hook_style: str = "None (Dir
         "- OPEN LOOP: Tease something the viewer only fully understands at the end, so they keep watching.\n"
         "- PACING: Short, punchy, spoken-style sentences (each about 6-12 words) that read cleanly as "
         "on-screen captions. One idea per sentence.\n"
-        "- ESCALATE: Each sentence should raise curiosity, tension, or stakes more than the last.\n"
+        "- ESCALATE: Each sentence should raise curiosity, tension, or stakes more than the last. Cover "
+        f"MULTIPLE distinct facts or angles about the topic (aim for {target_sentences} of them, not fewer) "
+        "-- this is what fills the required length without padding or repetition.\n"
         "- PAYOFF + CTA: Land a satisfying payoff, then end with a punchy call to action that tells the "
         "viewer to SUBSCRIBE for more (e.g. 'Subscribe so you never miss one').\n"
         "- Be specific and accurate about the topic; no vague filler or repetition.\n"
         "- Do NOT repeat any sentence or phrase; every line must add new information.\n"
-        f"Total length MUST be {min_words}-{max_words} words (about {seconds_label} seconds spoken) - "
-        "Output ONLY the raw narration text - no scene numbers, brackets, speaker names, emojis, or stage directions."
+        f"Before you finish, count your sentences. If you have fewer than {target_sentences}, keep going -- "
+        f"do not stop at {min_sentences}.\n"
+        f"HARD LENGTH REQUIREMENT (again): write {target_sentences} sentences, aiming for {max_words} words. "
+        f"{min_words} words is the absolute floor. Output ONLY the raw narration text - no scene numbers, "
+        "brackets, speaker names, emojis, or stage directions."
     )
     
     storyteller_prompt = (
@@ -419,25 +434,47 @@ def generate_ollama_script(prompt: str, model: str, hook_style: str = "None (Dir
     if hook_instruction:
         storyteller_prompt += f" Hook Instruction: {hook_instruction}"
         
-    payload1 = {
-        "model": model,
-        "prompt": storyteller_prompt,
-        "stream": False,
-        "keep_alive": OLLAMA_KEEP_ALIVE,
-        "options": {"num_ctx": OLLAMA_NUM_CTX}
-    }
+    # This floor used to be a flat 30 words regardless of duration preset --
+    # left over from before DURATION_PRESETS existed, when every video targeted
+    # ~15-20s (~55-80 words). "Standard" now targets 110-145 words, so a
+    # 30-word story passed this check, burned a full storyboard generation, and
+    # only then got rejected by validate_script's real min_words floor -- a
+    # wasted retry cycle every time, observed live with qwen2.5:7b-instruct.
+    # Scaling with min_words catches it here instead, one stage earlier.
+    story_word_floor = max(30, int(min_words * 0.7))
+
+    def _extend_story(text: str, words_needed: int) -> str:
+        # Hitting an exact word count cold is hard for a small model; continuing
+        # existing text by a specific amount is a much easier, more reliable
+        # task -- measured live, qwen2.5:7b-instruct oscillated between ~45 and
+        # ~103 words against a 110 floor even with an explicit sentence-count
+        # target baked into the main prompt, never reliably crossing it from
+        # scratch. This is the "add more" pass instead of another cold retry.
+        extra_sentences = max(2, round(words_needed / 9))
+        extend_prompt = (
+            "System: You are extending a short-form video voiceover script that came in too short. "
+            f"Add {extra_sentences} more sentences (short, punchy, spoken-style, 6-12 words each) that "
+            "introduce NEW specific facts or angles about the topic -- never repeat anything already said. "
+            "Insert them before the final subscribe call-to-action line so the payoff still lands last. "
+            "Return the COMPLETE script (the original text plus your additions merged in, in order), not "
+            "just the new part. Output ONLY the raw narration text - no labels, headers, or explanation.\n"
+            f"User: Topic: {prompt}\nCurrent script:\n{text}"
+        )
+        return llm_client.generate(model, extend_prompt, timeout=90).strip()
 
     def _attempt_story():
         # Generous timeout for cloud models; they are slow but usually succeed on retry.
-        r = requests.post(url, json=payload1, timeout=90)
-        if r.status_code != 200:
-            raise RuntimeError(f"Ollama HTTP {r.status_code}: {r.text[:150]}")
-        t = (r.json().get("response", "") or "").strip()
-        # A real ~15-20s script is ~55-80 words. Reject short/empty output so we
-        # NEVER fall back to narrating the bare topic title (which caused the
-        # 7-second, fragmented, repeating-caption video).
-        if len(t.split()) < 30:
-            raise RuntimeError(f"story too short ({len(t.split())} words)")
+        t = llm_client.generate(model, storyteller_prompt, timeout=150)
+        wc = len(t.split())
+        if wc < story_word_floor:
+            raise RuntimeError(f"story too short ({wc} words; need >= {story_word_floor})")
+        if wc < min_words:
+            try:
+                extended = _extend_story(t, min_words - wc)
+                if len(extended.split()) > wc:
+                    t = extended
+            except Exception as e:
+                print(f"Story extension failed ({e}); using original {wc}-word story.")
         return t
 
     try:
@@ -463,7 +500,11 @@ def generate_ollama_script(prompt: str, model: str, hook_style: str = "None (Dir
         "black kit with padded gloves'). Never use a generic placeholder unrelated to the topic.\n"
         "3. 'background_music_style': choose ONE of Cinematic, Upbeat, Mysterious, Ambient that best fits the mood.\n"
         "For each scene:\n"
-        "1. 'narration': extract a short, caption-friendly segment of the story (about 16-22 words). Segment the ENTIRE story so the 7 scenes together cover every word of it; do not invent new facts.\n"
+        "1. 'narration': a LITERAL split of the story's own sentences into 7 groups, in order -- copy the "
+        "story's exact wording, do not summarize, paraphrase, shorten, or compress it. The 7 narration "
+        "fields, concatenated in order, must reproduce the ENTIRE story text with nothing lost and no words "
+        f"dropped: if the story is {min_words}+ words, your 7 narration fields combined must also total "
+        f"{min_words}+ words. Do not invent new facts, and do not omit any sentence from the story.\n"
         "2. 'speaker': pick one consistent name from: Sarah, Bella, Nicole, Sky, Alloy, Kore, River, Adam, Michael, Fenrir, Puck, Echo, Liam, Onyx, Emma, Isabella, George, Lewis (use the SAME speaker for the whole video unless the story has distinct characters).\n"
         "3. 'visual_prompt': a vivid, specific scene description - the action, emotion, pose, or setting for THIS line, "
         "with a clear focal subject and sense of motion/energy so the zoom and cut land well. It is combined with the "
@@ -522,23 +563,16 @@ def generate_ollama_script(prompt: str, model: str, hook_style: str = "None (Dir
 
     storyboarder_prompt = f"System: {storyboarder_system}{style_directive}\nStory to segment:\n{story_text}"
 
-    payload2 = {
-        "model": model,
-        "prompt": storyboarder_prompt,
-        "stream": False,
-        "format": "json",
-        "keep_alive": OLLAMA_KEEP_ALIVE,
-        "options": {"num_ctx": OLLAMA_NUM_CTX}
-    }
-
     # Stage 2 is the flaky step (cloud models time out / return slightly-off JSON).
     # Retry it, accept a reasonable scene count, and normalize to exactly 7.
     def _attempt_storyboard():
-        # Generous timeout: cloud models are slow at large JSON generations.
-        r = requests.post(url, json=payload2, timeout=120)
-        if r.status_code != 200:
-            raise RuntimeError(f"Ollama HTTP {r.status_code}: {r.text[:150]}")
-        data = json.loads(clean_json_response(r.json().get("response", "").strip()))
+        # Measured live: OpenRouter's z-ai/glm-5.3-flash took 253s for this
+        # exact 7-scene JSON storyboard call -- a 120s timeout guaranteed
+        # failure on every attempt (and, before the hard-deadline fix in
+        # llm_client.generate, hung indefinitely past that instead of raising).
+        # 280s gives a real chance to succeed rather than always falling back.
+        text = llm_client.generate(model, storyboarder_prompt, timeout=280, json_mode=True)
+        data = json.loads(clean_json_response(text))
         scenes = data.get("scenes")
         if not isinstance(scenes, list) or len(scenes) < 4:
             raise RuntimeError(f"invalid storyboard (got {len(scenes) if isinstance(scenes, list) else 'no'} scenes)")
@@ -767,12 +801,6 @@ def generate_leonardo_motion(image_id: str, prompt: str):
                 raise RuntimeError("Leonardo motion reported status FAILED.")
     raise RuntimeError("Leonardo motion generation timed out while polling.")
 
-class ScriptRequest(BaseModel):
-    prompt: str
-    model: str
-    hook_style: str = "None (Direct Prompt)"
-    enable_search: bool = False
-
 class SpeechRequest(BaseModel):
     text: str
     voice: str
@@ -824,16 +852,6 @@ class ShortRequest(QualityOptions):
     enable_search: bool = False
     enable_transition_sfx: bool = False   # off by default: the stock whoosh reads as noise, not a transition
 
-class UploadRequest(BaseModel):
-    video_path: str
-    platforms: List[str]  # e.g. ["youtube", "instagram"]
-    youtube_title: Optional[str] = ""
-    youtube_description: Optional[str] = ""
-    youtube_tags: Optional[List[str]] = []
-    youtube_privacy: Optional[str] = "private"
-    instagram_caption: Optional[str] = ""
-
-
 #: Models that only run generation, not embeddings -- an embedding model in the
 #: dropdown produces a confusing failure rather than a script.
 _NON_GENERATIVE = ("embed",)
@@ -873,6 +891,13 @@ def get_ollama_models():
                      "gemma4:31b-cloud", "gpt-oss:120b-cloud"]:
         if fallback not in models:
             models.append(fallback)
+    # OpenRouter models only show up once a key is configured -- picking one
+    # from this same dropdown is the only opt-in `llm_client` needs, since it
+    # routes by the "/" in the model id rather than a separate provider field.
+    if llm_client.OPENROUTER_API_KEY:
+        for m in llm_client.OPENROUTER_MODELS:
+            if m not in models:
+                models.append(m)
     return models
 
 # API Endpoints
@@ -890,6 +915,13 @@ def get_config():
         "duration_presets": list(DURATION_PRESETS.keys()),
         "default_duration_preset": DEFAULT_DURATION_PRESET,
         "ollama_models": ollama_models,
+        # Local Ollama stays the default even when an OpenRouter key is
+        # configured: measured live, OpenRouter's z-ai/glm-5.3-flash took 253s
+        # for the storyboard JSON stage alone (vs. ~50-65s total for the local
+        # model) -- correct and eventually-successful, but far slower than the
+        # thing OpenRouter was added to fix. It's still one dropdown pick away
+        # for when local Ollama is unavailable or its cloud quota is exhausted.
+        "default_model": (ollama_models[0] if ollama_models else ""),
         "art_styles": list(ART_STYLE_PRESETS.keys()),
         "visual_modes": ["Cinematic Slideshow", "Leonardo Motion Video", "Hailuo Animated Video"],
         "quality_presets": list(vq.QUALITY_PRESETS.keys()),
@@ -903,10 +935,6 @@ def get_config():
             "target_lufs": vq.TARGET_LUFS,
         },
     }
-
-@app.post("/api/generate-script")
-def api_generate_script(req: ScriptRequest):
-    return generate_ollama_script(req.prompt, req.model, req.hook_style)
 
 @app.post("/api/generate-speech")
 def api_generate_speech(req: SpeechRequest):
@@ -1445,8 +1473,6 @@ class DbUploadRequest(BaseModel):
     youtube_description: Optional[str] = ""
     youtube_tags: Optional[List[str]] = []
     youtube_privacy: Optional[str] = "private"
-    instagram_caption: Optional[str] = ""
-    scheduled_time: Optional[str] = None
 
 @app.post("/api/draft-script")
 def api_draft_script(req: DraftRequest):
@@ -1615,57 +1641,6 @@ def api_render_storyboard(req: RenderRequest, background_tasks: BackgroundTasks)
     background_tasks.add_task(run_render_task, req.generation_id, req)
     return {"success": True, "generation_id": req.generation_id}
 
-@app.post("/api/generate-short")
-def api_generate_short(req: ShortRequest):
-    """
-    Automated pipeline endpoint. Logs the resulting video generation directly to DB.
-    """
-    try:
-        gen_id = str(uuid.uuid4())
-        # Log initial draft status
-        db_manager.create_video_generation(gen_id, req.prompt, req.prompt, None, None, status="rendering")
-        
-        final_video, storyboard, topic, script_data = run_viral_shorts_pipeline_new(
-            prompt=req.prompt,
-            model=req.model,
-            hook_style=req.hook_style,
-            visual_mode=req.visual_mode,
-            art_style=req.art_style,
-            leonardo_model=req.leonardo_model,
-            voice=req.voice,
-            speed=req.speed,
-            music_style=req.music_style,
-            satisfying_background=req.satisfying_background,
-            enable_captions=req.enable_captions,
-            caption_font=req.caption_font,
-            caption_size=req.caption_size,
-            caption_margin_v=req.caption_margin_v,
-            caption_color=req.caption_color,
-            enable_search=req.enable_search,
-            caption_style="Viral Pop",
-            enable_transition_sfx=req.enable_transition_sfx,
-            generation_id=gen_id,
-            **quality_kwargs(req)
-        )
-        rel_out = os.path.relpath(final_video, os.path.abspath(os.path.curdir))
-        
-        db_manager.update_video_generation(
-            gen_id, topic=topic, script_data=script_data, storyboard=storyboard, final_video_path=final_video, status="completed"
-        )
-        
-        return {
-            "success": True,
-            "video_url": f"http://localhost:8000/{rel_out.replace(os.path.sep, '/')}",
-            "thumbnail_url": static_url(script_data.get("thumbnail_path")),
-            "storyboard": storyboard,
-            "topic": topic,
-            "youtube_metadata": script_data.get("youtube_metadata"),
-            "instagram_metadata": script_data.get("instagram_metadata"),
-            "generation_id": gen_id
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
 @app.get("/api/youtube/auth-status")
 def get_youtube_auth_status():
     return {"authenticated": is_youtube_authenticated()}
@@ -1677,10 +1652,6 @@ def init_youtube_auth():
         return {"success": True, "message": msg}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
-@app.get("/api/instagram/auth-status")
-def get_instagram_auth_status():
-    return {"configured": is_instagram_configured()}
 
 @app.get("/api/image-provider/status")
 def get_image_provider_status(provider: Optional[str] = None):
@@ -1852,25 +1823,6 @@ def process_upload_job(job_id: str):
                 db_manager.record_platform_upload(gen_id, "youtube", vid_id)
                 log_message(f"YouTube upload successful! Video URL: https://youtu.be/{vid_id}")
 
-        if "instagram" in job["platforms"]:
-            if db_manager.is_platform_uploaded(gen_id, "instagram"):
-                prev = db_manager.get_platform_upload(gen_id, "instagram")
-                log_message(f"Instagram: already published (media id {prev['external_id']}); skipping to avoid duplicate.")
-            else:
-                log_message("Instagram Reels upload starting...")
-                ig_meta = job.get("instagram_metadata") or {}
-
-                def ig_progress(msg):
-                    log_message(msg)
-
-                media_id = upload_reel_to_instagram(
-                    video_file,
-                    ig_meta.get("caption", ""),
-                    progress_callback=ig_progress
-                )
-                db_manager.record_platform_upload(gen_id, "instagram", media_id)
-                log_message(f"Instagram upload successful! Media ID: {media_id}")
-
         log_message("Upload process complete!")
         db_manager.update_upload_job(job_id, status="completed", logs=logs)
     except Exception as e:
@@ -1881,87 +1833,6 @@ def process_upload_job(job_id: str):
             f"Upload job {job_id} failed: {e}",
             context={"job_id": job_id, "platforms": job.get("platforms")}
         )
-
-def upload_scheduler_loop():
-    """Background polling thread for scheduled uploads."""
-    print("Starting background upload scheduler thread...")
-    while True:
-        try:
-            # Query db for scheduled jobs
-            now_iso = datetime.utcnow().isoformat() + "Z"
-            pending_jobs = db_manager.get_pending_scheduled_jobs(now_iso)
-            for job in pending_jobs:
-                job_id = job["id"]
-                # Mark job as running and process in a separate thread
-                db_manager.update_upload_job(job_id, status="running")
-                t = threading.Thread(target=process_upload_job, args=(job_id,))
-                t.daemon = True
-                t.start()
-        except Exception as e:
-            print(f"Error in upload scheduler loop: {e}")
-        time.sleep(10)
-
-def viral_agent_scheduler_loop():
-    """Background thread that runs the auto-generation agent at scheduled times."""
-    print("Starting background viral agent scheduler thread...")
-    while True:
-        try:
-            from viral_agent import load_scheduler_config, save_scheduler_config, run_viral_agent_job
-            config = load_scheduler_config()
-            
-            if config.get("enabled"):
-                now = datetime.now()
-                current_time_str = now.strftime("%H:%M")  # "HH:MM" format
-                current_date_str = now.strftime("%Y-%m-%d") # "YYYY-MM-DD" format
-                
-                time1 = config.get("time1", "10:00")
-                time2 = config.get("time2", "18:00")
-                
-                last_run_date = config.get("last_run_date", "")
-                last_run_slots = config.get("last_run_slots", [])
-                
-                # Reset slots if it's a new day
-                if last_run_date != current_date_str:
-                    last_run_date = current_date_str
-                    last_run_slots = []
-                    config["last_run_date"] = last_run_date
-                    config["last_run_slots"] = last_run_slots
-                    save_scheduler_config(config)
-                
-                # Check Slot 1
-                if current_time_str >= time1 and "slot1" not in last_run_slots:
-                    last_run_slots.append("slot1")
-                    config["last_run_slots"] = last_run_slots
-                    save_scheduler_config(config)
-                    
-                    # Trigger in background thread
-                    t = threading.Thread(target=run_viral_agent_job, args=(f"Slot 1 ({time1})", config))
-                    t.daemon = True
-                    t.start()
-                    
-                # Check Slot 2
-                elif current_time_str >= time2 and "slot2" not in last_run_slots:
-                    last_run_slots.append("slot2")
-                    config["last_run_slots"] = last_run_slots
-                    save_scheduler_config(config)
-                    
-                    # Trigger in background thread
-                    t = threading.Thread(target=run_viral_agent_job, args=(f"Slot 2 ({time2})", config))
-                    t.daemon = True
-                    t.start()
-        except Exception as e:
-            print(f"Error in viral agent scheduler loop: {e}")
-        time.sleep(30)  # Check every 30 seconds
-
-@app.on_event("startup")
-def startup_event():
-    scheduler_thread = threading.Thread(target=upload_scheduler_loop)
-    scheduler_thread.daemon = True
-    scheduler_thread.start()
-    
-    agent_thread = threading.Thread(target=viral_agent_scheduler_loop)
-    agent_thread.daemon = True
-    agent_thread.start()
 
 @app.get("/api/history")
 def api_get_history():
@@ -1978,123 +1849,14 @@ def api_get_history():
 def api_get_upload_queue():
     return db_manager.list_upload_jobs()
 
-# --- Approval gate ---
-@app.get("/api/uploads/pending")
-def api_get_pending_approvals():
-    """Generations held for human review before publishing."""
-    return db_manager.get_upload_jobs_by_status("pending_approval")
-
-@app.post("/api/uploads/{job_id}/approve")
-def api_approve_upload(job_id: str):
-    job = db_manager.get_upload_job(job_id)
-    if not job:
-        raise HTTPException(status_code=404, detail="Upload job not found")
-    if job["status"] != "pending_approval":
-        raise HTTPException(status_code=400, detail=f"Job is not pending approval (status: {job['status']})")
-    # Flip to 'scheduled' with a past time so the upload loop picks it up promptly.
-    db_manager.update_upload_job(
-        job_id, status="scheduled",
-        logs=job.get("logs", []) + ["Approved by user; queued for publishing."]
-    )
-    return {"success": True, "job_id": job_id, "status": "scheduled"}
-
-@app.post("/api/uploads/{job_id}/reject")
-def api_reject_upload(job_id: str):
-    job = db_manager.get_upload_job(job_id)
-    if not job:
-        raise HTTPException(status_code=404, detail="Upload job not found")
-    db_manager.update_upload_job(
-        job_id, status="rejected",
-        logs=job.get("logs", []) + ["Rejected by user; will not be published."]
-    )
-    return {"success": True, "job_id": job_id, "status": "rejected"}
-
-# --- Analytics feedback loop ---
-@app.post("/api/analytics/refresh-youtube")
-def api_refresh_youtube_analytics():
-    from analytics import refresh_youtube_stats, refresh_youtube_analytics
-
-    def _is_scope_error(msg):
-        return "insufficient" in msg.lower() or "scope" in msg.lower() or "not authorized" in msg.lower()
-
-    # Each path needs read scopes the original upload-only token lacks; guard both
-    # independently so a missing grant returns a clear re-auth hint, not a 500.
-    stats_updated, retention_updated = 0, 0
-    errors = {}
-    try:
-        stats_updated = refresh_youtube_stats().get("updated", 0)
-    except Exception as e:
-        errors["stats_error"] = str(e)
-    try:
-        retention_updated = refresh_youtube_analytics().get("updated", 0)
-    except Exception as e:
-        errors["retention_error"] = str(e)
-
-    needs_reauth = any(_is_scope_error(m) for m in errors.values())
-    return {
-        "success": not errors,
-        "stats_updated": stats_updated,
-        "retention_updated": retention_updated,
-        **errors,
-        "needs_reauth": needs_reauth,
-        "hint": ("Re-authenticate YouTube to grant read access (youtube.readonly + "
-                 "yt-analytics.readonly), then retry.") if needs_reauth else None,
-    }
-
-@app.get("/api/analytics/top")
-def api_get_top_performing(limit: int = 5):
-    return db_manager.get_top_performing(limit=limit)
-
-@app.get("/api/analytics/retention-leaders")
-def api_get_retention_leaders(limit: int = 5):
-    return db_manager.get_engagement_leaders(limit=limit)
-
-@app.get("/api/competitor-signals")
-def api_competitor_signals(query: str, max_results: int = 10, refresh: bool = True):
-    """Mine YouTube for what's hot in a niche *right now*, ranked by view velocity.
-
-    Returns the hottest videos plus an LLM-ready hint about winning patterns.
-    Needs the youtube.readonly scope (same re-auth as the analytics loop).
-    """
-    if not query or not query.strip():
-        raise HTTPException(status_code=400, detail="query is required")
-    query = query.strip()
-
-    import competitor_research
-    error = None
-    if refresh:
-        try:
-            competitor_research.store_competitor_videos(query, max_results=max_results)
-        except Exception as e:
-            error = str(e)
-
-    videos = db_manager.get_top_velocity(query, limit=max_results)
-    needs_reauth = bool(error) and ("insufficient" in error.lower() or "scope" in error.lower() or "not authorized" in error.lower())
-    return {
-        "query": query,
-        "videos": videos,
-        "hint": competitor_research.get_competitor_hint(query, limit=max_results),
-        "error": error,
-        "needs_reauth": needs_reauth,
-    }
-
-# --- Cost tracking ---
-@app.get("/api/costs/today")
-def api_get_costs_today():
-    budget = cost_tracker.get_daily_budget()
-    spent = db_manager.get_spend_today("leonardo")
-    return {
-        "service": "leonardo",
-        "spent_today": spent,
-        "daily_budget": budget,
-        "remaining": (budget - spent) if budget is not None else None,
-    }
 
 @app.post("/api/schedule-upload")
 def api_schedule_upload(req: DbUploadRequest):
+    """Upload to YouTube now. Always immediate: the deferred/scheduled-time
+    path and its background polling thread were removed along with the rest
+    of the autonomous scheduler -- this is a one-click publish button."""
     job_id = str(uuid.uuid4())
-    status = "scheduled" if req.scheduled_time else "running"
-    
+
     db_manager.create_upload_job(
         job_id,
         req.video_generation_id,
@@ -2105,18 +1867,14 @@ def api_schedule_upload(req: DbUploadRequest):
             "tags": req.youtube_tags,
             "privacy": req.youtube_privacy
         },
-        {
-            "caption": req.instagram_caption
-        },
-        status=status,
-        scheduled_time=req.scheduled_time
+        {},
+        status="running",
     )
-    
-    if status == "running":
-        t = threading.Thread(target=process_upload_job, args=(job_id,))
-        t.daemon = True
-        t.start()
-        
+
+    t = threading.Thread(target=process_upload_job, args=(job_id,))
+    t.daemon = True
+    t.start()
+
     return {"success": True, "job_id": job_id}
 
 def static_url(path: Optional[str]) -> str:
@@ -2162,53 +1920,6 @@ def api_delete_generation(generation_id: str):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# Backward compatibility endpoints for legacy app.js uploads
-class UploadRequest(BaseModel):
-    video_path: str
-    platforms: List[str]
-    youtube_title: Optional[str] = ""
-    youtube_description: Optional[str] = ""
-    youtube_tags: Optional[List[str]] = []
-    youtube_privacy: Optional[str] = "private"
-    instagram_caption: Optional[str] = ""
-
-@app.post("/api/upload")
-def api_upload(req: UploadRequest):
-    # Find matching generation by final_video_path relative or absolute
-    # If not found, create a placeholder generation
-    generations = db_manager.list_video_generations()
-    matching_gen_id = None
-    for g in generations:
-        if g.get("final_video_path") and (req.video_path in g["final_video_path"] or g["final_video_path"] in req.video_path):
-            matching_gen_id = g["id"]
-            break
-            
-    if not matching_gen_id:
-        matching_gen_id = str(uuid.uuid4())
-        db_manager.create_video_generation(matching_gen_id, "Legacy upload", "Legacy upload", None, None, status="completed")
-        db_manager.update_video_generation(matching_gen_id, final_video_path=req.video_path)
-        
-    job_id = str(uuid.uuid4())
-    db_manager.create_upload_job(
-        job_id,
-        matching_gen_id,
-        req.platforms,
-        {
-            "title": req.youtube_title,
-            "description": req.youtube_description,
-            "tags": req.youtube_tags,
-            "privacy": req.youtube_privacy
-        },
-        {
-            "caption": req.instagram_caption
-        },
-        status="running"
-    )
-    
-    t = threading.Thread(target=process_upload_job, args=(job_id,))
-    t.daemon = True
-    t.start()
-    return {"job_id": job_id}
 
 @app.get("/api/upload-status/{job_id}")
 def get_upload_status(job_id: str):
@@ -2216,192 +1927,6 @@ def get_upload_status(job_id: str):
     if not job:
         raise HTTPException(status_code=404, detail="Upload job not found")
     return job
-
-
-@app.get("/api/trends")
-def get_trends(geo: str = "IN"):
-    import xml.etree.ElementTree as ET
-    url = f"https://trends.google.com/trending/rss?geo={geo.upper()}"
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
-    }
-    try:
-        response = requests.get(url, headers=headers, timeout=10)
-        if response.status_code != 200:
-            raise HTTPException(status_code=response.status_code, detail=f"Failed to fetch Google Trends: HTTP {response.status_code}")
-        
-        root = ET.fromstring(response.text)
-        namespaces = {
-            'ht': 'https://trends.google.com/trending/rss'
-        }
-        
-        items = []
-        for item in root.findall('.//item'):
-            title = item.find('title').text
-            
-            traffic_el = item.find('ht:approx_traffic', namespaces)
-            traffic = traffic_el.text if traffic_el is not None else "Unknown"
-            
-            picture_el = item.find('ht:picture', namespaces)
-            picture_url = picture_el.text if picture_el is not None else ""
-            
-            news_items = []
-            for news in item.findall('ht:news_item', namespaces):
-                news_title = news.find('ht:news_item_title', namespaces)
-                news_snippet = news.find('ht:news_item_snippet', namespaces)
-                news_url = news.find('ht:news_item_url', namespaces)
-                
-                news_items.append({
-                    "title": news_title.text if news_title is not None else "",
-                    "snippet": news_snippet.text if news_snippet is not None else "",
-                    "url": news_url.text if news_url is not None else ""
-                })
-            
-            top_news_title = news_items[0]["title"] if news_items else ""
-            top_news_url = news_items[0]["url"] if news_items else ""
-            top_news_snippet = news_items[0]["snippet"] if news_items else ""
-            
-            items.append({
-                "title": title,
-                "traffic": traffic,
-                "picture_url": picture_url,
-                "news_title": top_news_title,
-                "news_url": top_news_url,
-                "news_snippet": top_news_snippet,
-                "all_news": news_items
-            })
-        return items
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error parsing Google Trends feed: {str(e)}")
-
-
-@app.get("/api/recommend-topics")
-def recommend_topics(geo: str = "US", count: int = 5, model: Optional[str] = None,
-                     focus: str = ""):
-    """Recommend fresh, non-repeating viral topics for a high-RPM market.
-
-    Subject areas are discovered per call rather than drawn from a fixed list,
-    so any subject the model knows about is reachable -- a constant list would
-    cap the topic space the same way the old 31-entry curiosity library did.
-    Grounded in live Google Trends and Wikipedia signals. Novelty is enforced
-    with a hard keyword filter against previously-generated topics, not a
-    prompt instruction: the prompt-only approach let five reworded variants of
-    the same ocean fact into the library.
-
-    ``focus`` optionally constrains every suggestion to one interest (e.g.
-    "cricket", "cooking") for creators working a specific niche.
-
-    Returns {title, rationale, niche, rpm_tier, est_rpm, geo, source}.
-    """
-    # Lazy import: viral_agent imports from backend at module load (circular).
-    from viral_agent import ALLOWED_RPM_GEOS
-    import trend_analyser
-
-    geo = (geo or "US").upper()
-    if geo not in ALLOWED_RPM_GEOS:
-        geo = "US"
-    count = max(1, min(count, 8))
-    # Default to whatever the scheduler is configured to use, so the UI and the
-    # auto-agent stay on the same model instead of this silently pinning a
-    # cloud model that may be out of quota.
-    if not model:
-        try:
-            from viral_agent import load_scheduler_config
-            model = load_scheduler_config().get("model")
-        except Exception:
-            model = None
-        model = model or "qwen2.5:7b-instruct"
-
-    performance_hint = ""
-    exclude_topics = []
-    try:
-        import analytics
-        performance_hint = analytics.get_performance_hint()
-    except Exception as e:
-        print(f"recommend_topics: performance hint unavailable: {e}")
-    try:
-        exclude_topics = db_manager.get_recent_topics(40)
-    except Exception as e:
-        print(f"recommend_topics: recent topics unavailable: {e}")
-
-    try:
-        return trend_analyser.analyse(
-            geo=geo, model=model, count=count,
-            used_topics=exclude_topics,
-            performance_hint=performance_hint,
-            focus=(focus or "").strip(),
-        )
-    except Exception as e:
-        # Surfaced, not swallowed. The old code fell back to raw Google Trends
-        # headlines on any failure, so the UI presented "lindsay clancy trial
-        # live" as a curated recommendation with no sign that ranking had died.
-        raise HTTPException(
-            status_code=502,
-            detail=f"Topic analysis failed ({e}). Check that Ollama is running and "
-                   f"the model '{model}' is available.")
-
-
-# Scheduler Config & Logs API
-class SchedulerConfigUpdate(BaseModel):
-    enabled: bool
-    region: str
-    time1: str
-    time2: str
-    model: str
-    leonardo_model: str
-    voice: str
-    privacy: str
-    enable_captions: bool
-    caption_font: str
-    caption_size: int
-    caption_margin_v: int
-    caption_color: str
-    caption_style: str
-    topic_source: str = "trends"
-    curiosity_category: str = "All"
-    # Optional: constrains every auto-generated topic to one interest. Blank
-    # keeps the fully open-ended behaviour; set it if you want the channel to
-    # reinforce one subject, which research finds builds audience faster than
-    # jumping topic every video.
-    channel_niche: str = ""
-    duration_preset: str = DEFAULT_DURATION_PRESET
-
-@app.get("/api/curiosity-topics")
-def get_curiosity_topics():
-    """Serve the curated curiosity-topic library (single source of truth shared
-    with the auto-agent scheduler) plus the list of categories."""
-    from curiosity_topics import CURIOSITY_TOPICS, get_categories
-    return {"topics": CURIOSITY_TOPICS, "categories": get_categories()}
-
-@app.get("/api/scheduler/config")
-def get_scheduler_config():
-    from viral_agent import load_scheduler_config
-    return load_scheduler_config()
-
-@app.post("/api/scheduler/config")
-def update_scheduler_config(req: SchedulerConfigUpdate):
-    from viral_agent import load_scheduler_config, save_scheduler_config
-    config = load_scheduler_config()
-    config.update(req.dict())
-    save_scheduler_config(config)
-    return {"success": True, "config": config}
-
-@app.get("/api/scheduler/logs")
-def get_scheduler_logs():
-    from viral_agent import load_scheduler_logs
-    return load_scheduler_logs()
-
-@app.delete("/api/scheduler/logs")
-def delete_scheduler_logs():
-    from viral_agent import save_scheduler_logs
-    save_scheduler_logs([])
-    return {"success": True, "message": "Scheduler execution logs cleared."}
-
-@app.post("/api/scheduler/trigger")
-def trigger_scheduler_agent(background_tasks: BackgroundTasks):
-    from viral_agent import run_viral_agent_job
-    background_tasks.add_task(run_viral_agent_job, "Manual Trigger")
-    return {"success": True, "message": "Viral Agent run triggered in background."}
 
 
 if __name__ == "__main__":

@@ -2,22 +2,9 @@ import os
 import json
 import requests
 from dotenv import load_dotenv
+import llm_client
 
 load_dotenv()
-
-OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
-# Measured on this app's actual prompts: the largest realistic call (storyboard
-# generation with full history/grounding context) is ~1000 tokens in, under
-# 700 out -- comfortably inside 4096 with 2x headroom. Ollama's model default
-# is 32768, which on a 16GB Mac allocates a KV cache far bigger than this app
-# ever uses: measured directly, capping it here took one model's resident size
-# from 6.4GB to 4.7GB and its reload time from 4.1s to 0.8s (5x), which matters
-# because keep_alive's default 5-minute idle timeout means a multi-stage
-# pipeline (script, storyboard, topic generation, web grounding) pays that
-# reload tax repeatedly whenever stages are spaced further apart than that by
-# image/TTS/render work. keep_alive is extended here to outlast a full render.
-OLLAMA_NUM_CTX = int(os.getenv("OLLAMA_NUM_CTX", "4096"))
-OLLAMA_KEEP_ALIVE = os.getenv("OLLAMA_KEEP_ALIVE", "30m")
 
 def clean_json_response(resp_text: str) -> str:
     """Strip markdown code fences (like ```json ... ```) from LLM response text."""
@@ -33,8 +20,6 @@ def clean_json_response(resp_text: str) -> str:
 
 def classify_need_for_search(prompt: str, ollama_model: str) -> dict:
     """Ask the local LLM if the given topic needs factual web search grounding."""
-    url = f"{OLLAMA_HOST}/api/generate"
-    
     system_prompt = (
         "You are an expert fact-checking classifier. "
         "Your task is to determine whether the user's video topic requires real-world facts, scientific data, "
@@ -48,47 +33,56 @@ def classify_need_for_search(prompt: str, ollama_model: str) -> dict:
     )
     
     full_prompt = f"System: {system_prompt}\nUser: Topic: {prompt}"
-    
-    payload = {
-        "model": ollama_model,
-        "prompt": full_prompt,
-        "stream": False,
-        "format": "json",
-        "keep_alive": OLLAMA_KEEP_ALIVE,
-        "options": {"num_ctx": OLLAMA_NUM_CTX}
-    }
-    
+
     try:
-        response = requests.post(url, json=payload, timeout=20)
-        if response.status_code == 200:
-            resp_text = response.json().get("response", "").strip()
-            cleaned = clean_json_response(resp_text)
-            data = json.loads(cleaned)
-            if "requires_search" in data:
-                return data
+        resp_text = llm_client.generate(ollama_model, full_prompt, timeout=20, json_mode=True)
+        cleaned = clean_json_response(resp_text)
+        data = json.loads(cleaned)
+        if "requires_search" in data:
+            return data
     except Exception as e:
         print(f"Error checking if search is needed: {e}")
         
     return {"requires_search": False, "search_query": ""}
 
-def search_duckduckgo(query: str, max_results: int = 5) -> str:
-    """Query DuckDuckGo for search snippets using the duckduckgo_search library."""
+def _search_duckduckgo_blocking(query: str, max_results: int) -> str:
+    from duckduckgo_search import DDGS
+    with DDGS() as ddgs:
+        results = list(ddgs.text(query, max_results=max_results))
+        if not results:
+            return ""
+
+        snippets = []
+        for idx, r in enumerate(results):
+            title = r.get("title", "No Title")
+            body = r.get("body", "")
+            snippets.append(f"[{idx+1}] Source: {title}\nContent: {body}")
+        return "\n\n".join(snippets)
+
+
+def search_duckduckgo(query: str, max_results: int = 5, timeout: int = 25) -> str:
+    """Query DuckDuckGo for search snippets using the duckduckgo_search library.
+
+    Run in a worker thread with a hard wall-clock timeout: DDG aggressively
+    rate-limits scraping and the library's own internal retries can then run
+    far longer than its per-request timeout implies. Measured live: one such
+    call blocked the entire autonomous scheduler thread indefinitely, silently
+    freezing every unattended video (the thread stayed alive with 0% CPU, so
+    nothing crashed or logged an error -- it just never produced a video).
+    """
+    from concurrent.futures import ThreadPoolExecutor
+    # Not a context manager: `with` blocks on shutdown(wait=True) until the
+    # submitted task finishes, which would silently reintroduce the same
+    # indefinite hang this function exists to prevent if DDG never returns.
+    pool = ThreadPoolExecutor(max_workers=1)
     try:
-        from duckduckgo_search import DDGS
-        with DDGS() as ddgs:
-            results = list(ddgs.text(query, max_results=max_results))
-            if not results:
-                return ""
-            
-            snippets = []
-            for idx, r in enumerate(results):
-                title = r.get("title", "No Title")
-                body = r.get("body", "")
-                snippets.append(f"[{idx+1}] Source: {title}\nContent: {body}")
-            return "\n\n".join(snippets)
+        future = pool.submit(_search_duckduckgo_blocking, query, max_results)
+        return future.result(timeout=timeout)
     except Exception as e:
         print(f"DuckDuckGo search error: {e}")
         return ""
+    finally:
+        pool.shutdown(wait=False)
 
 def search_tavily(query: str, api_key: str, max_results: int = 5) -> str:
     """Query Tavily API for search snippets."""

@@ -12,15 +12,6 @@ else:
     CLIENT_SECRETS_FILE = os.path.abspath("client_secrets.json")
 TOKEN_FILE = os.path.abspath("token_youtube.json")
 SCOPES = ["https://www.googleapis.com/auth/youtube.upload"]
-# Read access for the analytics feedback loop:
-#  - youtube.readonly         -> read public stats (views/likes) via Data API
-#  - yt-analytics.readonly    -> read retention/watch-time via Analytics API
-ANALYTICS_SCOPES = [
-    "https://www.googleapis.com/auth/youtube.readonly",
-    "https://www.googleapis.com/auth/yt-analytics.readonly",
-]
-# Requested during the consent flow so a single (re-)auth grants upload + reads.
-ALL_SCOPES = SCOPES + ANALYTICS_SCOPES
 
 def get_youtube_credentials():
     """Load cached credentials or return None if re-authentication is required."""
@@ -54,8 +45,8 @@ def get_youtube_service():
                 "from Google Cloud Console, rename it to 'client_secrets.json', and place it in the root folder."
             )
         
-        # Run local server to authenticate the user (grants upload + analytics)
-        flow = InstalledAppFlow.from_client_secrets_file(CLIENT_SECRETS_FILE, ALL_SCOPES)
+        # Run local server to authenticate the user
+        flow = InstalledAppFlow.from_client_secrets_file(CLIENT_SECRETS_FILE, SCOPES)
         creds = flow.run_local_server(port=0)
 
         # Save credentials to cache file
@@ -63,37 +54,6 @@ def get_youtube_service():
             f.write(creds.to_json())
 
     return build("youtube", "v3", credentials=creds)
-
-def get_youtube_analytics_service():
-    """Authenticated YouTube Analytics API v2 service for the retention feedback loop.
-
-    Reuses the cached upload credentials. If they predate the analytics scope
-    (older installs authenticated for upload only), raises a clear error asking
-    the user to re-authenticate — it never launches a browser flow itself, so it
-    is safe to call from inside the FastAPI request handler.
-    """
-    creds = None
-    if os.path.exists(TOKEN_FILE):
-        try:
-            creds = Credentials.from_authorized_user_file(TOKEN_FILE, ALL_SCOPES)
-        except Exception as e:
-            print(f"Error loading youtube token file for analytics: {e}")
-
-    if creds and creds.expired and creds.refresh_token:
-        try:
-            creds.refresh(Request())
-            with open(TOKEN_FILE, "w") as f:
-                f.write(creds.to_json())
-        except Exception as e:
-            print(f"Error refreshing youtube credentials: {e}")
-            creds = None
-
-    if not creds:
-        raise RuntimeError(
-            "YouTube Analytics access not authorized. Re-authenticate YouTube to grant the "
-            "analytics (yt-analytics.readonly) scope, then retry."
-        )
-    return build("youtubeAnalytics", "v2", credentials=creds)
 
 def is_youtube_authenticated() -> bool:
     """Check if YouTube credentials are cached and valid (or refreshable)."""
@@ -104,7 +64,7 @@ def trigger_youtube_auth_flow_url() -> str:
     """Trigger the InstalledAppFlow manually if running headlessly or wanting a direct auth url."""
     if not os.path.exists(CLIENT_SECRETS_FILE):
         raise FileNotFoundError(f"Missing {CLIENT_SECRETS_FILE}")
-    flow = InstalledAppFlow.from_client_secrets_file(CLIENT_SECRETS_FILE, ALL_SCOPES)
+    flow = InstalledAppFlow.from_client_secrets_file(CLIENT_SECRETS_FILE, SCOPES)
     # Port 0 lets OAuth select an open port automatically
     # Standard InstalledAppFlow run_local_server will open browser
     creds = flow.run_local_server(port=0)
