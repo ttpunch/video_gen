@@ -1389,7 +1389,22 @@ def run_viral_shorts_pipeline_new(
                 _log(f"Scene {idx+1}: progress persistence failed: {cb_err}")
 
     # Concatenate segments
-    timestamp = int(time.time())
+    #
+    # Every temp/output path below is keyed off this one value. It used to be
+    # bare `int(time.time())` (second resolution, no collision protection):
+    # reproduced live, two renders resolving to the same second -- easy with
+    # a fast/resumed render, e.g. re-rendering right after tweaking a caption
+    # setting -- landed on the IDENTICAL viral_reel_<ts>.mp4 (and every temp
+    # file, including the subtitles .ass), so the second render's ffmpeg
+    # process silently overwrote the first's mid-write. That's the actual
+    # root cause behind "the caption position slider doesn't seem to do
+    # anything" -- the ASS margin math itself is correct (verified directly),
+    # but the file the user was looking at could be from an unrelated race.
+    # generation_id is already a unique UUID per request, so keying off it
+    # instead removes the collision entirely; the same generation_id being
+    # re-rendered sequentially just replaces its own previous output in
+    # place, which is correct (no concurrent access, so no race).
+    timestamp = generation_id or f"{int(time.time())}-{uuid.uuid4().hex[:8]}"
     merged_video = os.path.abspath(os.path.join("temp", f"merged_video_{timestamp}.mp4"))
     merged_audio = os.path.abspath(os.path.join("temp", f"merged_audio_{timestamp}.wav"))
     
