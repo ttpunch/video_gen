@@ -113,6 +113,11 @@ def test_draft_preserves_the_stock_tags_the_render_depends_on(client, monkeypatc
     drafted through the UI reached the renderer untagged and fell back to image
     generation -- while a hand-tagged storyboard used real footage. Same code,
     opposite result, which is exactly the discrepancy a user noticed.
+
+    /api/draft-script now runs the actual generation as a background task (so
+    a multi-minute local-LLM call doesn't hold the HTTP request open); the
+    TestClient runs background tasks to completion before .post() returns, so
+    the persisted update() call is what carries the real result to assert on.
     """
     monkeypatch.setattr(backend, "generate_validated_script", lambda *a, **k: {
         "topic": "t",
@@ -125,10 +130,15 @@ def test_draft_preserves_the_stock_tags_the_render_depends_on(client, monkeypatc
     })
     monkeypatch.setattr(backend.db_manager, "create_video_generation",
                         lambda *a, **k: None)
+    captured = {}
+    monkeypatch.setattr(backend.db_manager, "update_video_generation",
+                        lambda *a, **k: captured.update(k))
 
-    body = client.post("/api/draft-script",
-                       json={"prompt": "p", "model": "m"}).json()
-    sb = body["storyboard"]
+    resp = client.post("/api/draft-script", json={"prompt": "p", "model": "m"}).json()
+    assert resp["status"] == "drafting"
+    assert resp["generation_id"]
+
+    sb = captured["storyboard"]
     assert sb[0]["visual_source"] == "stock"
     assert sb[0]["stock_query"] == "ocean waves"
     assert sb[1]["visual_source"] == "generate"
@@ -142,8 +152,64 @@ def test_drafted_scenes_still_carry_the_fields_the_editor_needs(client, monkeypa
     })
     monkeypatch.setattr(backend.db_manager, "create_video_generation",
                         lambda *a, **k: None)
-    scene = client.post("/api/draft-script",
-                        json={"prompt": "p", "model": "m"}).json()["storyboard"][0]
+    captured = {}
+    monkeypatch.setattr(backend.db_manager, "update_video_generation",
+                        lambda *a, **k: captured.update(k))
+
+    client.post("/api/draft-script", json={"prompt": "p", "model": "m"})
+    scene = captured["storyboard"][0]
     for key in ("scene", "speaker", "narration", "visual_prompt",
                 "image_url", "image_path", "audio_url", "audio_path", "duration"):
         assert key in scene, f"draft dropped {key}"
+
+
+# --------------------------------------------------------------------------
+# Model list ordering
+# --------------------------------------------------------------------------
+#
+# The UI selects the first entry by default. The list previously force-pinned a
+# cloud model to the front, so an exhausted weekly quota made every manual draft
+# fail on a model the user never chose. Ollama reports cloud models with size 0.
+
+def _tags(models):
+    class R:
+        status_code = 200
+        @staticmethod
+        def json():
+            return {"models": models}
+    return R()
+
+
+def test_local_models_are_offered_before_cloud_models(monkeypatch):
+    monkeypatch.setattr(backend.requests, "get", lambda *a, **k: _tags([
+        {"name": "minimax-m3:cloud", "size": 0},
+        {"name": "qwen2.5:7b-instruct", "size": 4_700_000_000},
+        {"name": "glm-5:cloud", "size": 0},
+    ]))
+    assert backend.get_ollama_models()[0] == "qwen2.5:7b-instruct"
+
+
+def test_largest_local_model_is_the_default(monkeypatch):
+    """Size is the best available proxy for quality on one machine."""
+    monkeypatch.setattr(backend.requests, "get", lambda *a, **k: _tags([
+        {"name": "small:0.8b", "size": 1_000_000_000},
+        {"name": "big:7b", "size": 4_700_000_000},
+    ]))
+    assert backend.get_ollama_models()[0] == "big:7b"
+
+
+def test_embedding_models_are_not_offered(monkeypatch):
+    """An embedding model produces a confusing failure, not a script."""
+    monkeypatch.setattr(backend.requests, "get", lambda *a, **k: _tags([
+        {"name": "nomic-embed-text:latest", "size": 300_000_000},
+        {"name": "qwen2.5:7b-instruct", "size": 4_700_000_000},
+    ]))
+    assert "nomic-embed-text:latest" not in backend.get_ollama_models()
+
+
+def test_cloud_fallbacks_still_available_when_ollama_is_down(monkeypatch):
+    def boom(*a, **k):
+        raise RuntimeError("connection refused")
+    monkeypatch.setattr(backend.requests, "get", boom)
+    models = backend.get_ollama_models()
+    assert "minimax-m3:cloud" in models

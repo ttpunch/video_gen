@@ -1,19 +1,16 @@
 "use client";
 
-import React, { useState, useEffect, useRef } from "react";
-import { 
-  Tv, Sparkles, Sliders, Play, Settings, AlertCircle, FileText, CheckCircle2,
-  Layers, Volume2, Image as ImageIcon, Music, RefreshCw, Subtitles, HelpCircle,
-  Trash2, Film, DollarSign, Lightbulb, Shuffle, ArrowRight, Gauge, Download
+/* eslint-disable @next/next/no-img-element -- Native previews for dynamically generated local media. */
+import React, { useState, useEffect, useRef, useCallback } from "react";
+import {
+  Tv, Sparkles, Settings, AlertCircle, FileText, CheckCircle2,
+  Layers, Image as ImageIcon, RefreshCw, Subtitles,
+  Trash2, Gauge, Download
 } from "lucide-react";
 
-interface StoryboardScene {
-  scene: number;
-  narration: string;
-  image_url: string;
-  audio_url: string;
-  duration: number;
-}
+import { pollUntil } from "../lib/poll";
+import { API_BASE, errorMessage } from "../lib/api";
+import type { StoryboardScene, Generation, UploadJob, ImageProviderStatus, LocalModel, GenerationStatus } from "../lib/studio-types";
 
 interface BackendConfig {
   voices: string[];
@@ -23,6 +20,7 @@ interface BackendConfig {
   satisfying_presets: string[];
   viral_hooks: string[];
   ollama_models: string[];
+  default_model?: string;
   art_styles?: string[];
   visual_modes?: string[];
   quality_presets?: string[];
@@ -30,6 +28,8 @@ interface BackendConfig {
   stock_available?: boolean;
   default_quality?: string;
   motion_styles?: string[];
+  duration_presets?: string[];
+  default_duration_preset?: string;
   delivery?: {
     fps: number;
     resolution: string;
@@ -47,80 +47,18 @@ const COLOR_PRESETS = [
   { name: "White", ass: "&HFFFFFF&", hex: "#FFFFFF" },
 ];
 
-// Evergreen "curiosity-gap" topics — the kind that reliably trend on YouTube
-// Shorts. Each opens a loop the viewer feels compelled to close. One click
-// loads it into the script drafter below.
-interface CuriosityTopic {
-  category: string;
-  emoji: string;
-  title: string;
-  hook: string;
-}
-
-const CURIOSITY_TOPICS: CuriosityTopic[] = [
-  // Space & Cosmos
-  { category: "Space", emoji: "🌌", title: "What's really inside a black hole", hook: "Nothing that falls in ever comes back — and time itself breaks down." },
-  { category: "Space", emoji: "🌌", title: "The hidden ocean beneath Jupiter's moon Europa", hook: "More water than all of Earth's oceans, sealed under miles of ice." },
-  { category: "Space", emoji: "🌌", title: "What you'd see at the edge of the universe", hook: "Spoiler: there may be no edge at all." },
-  { category: "Space", emoji: "🌌", title: "The star so big it makes the Sun look invisible", hook: "UY Scuti could swallow billions of Suns whole." },
-  { category: "Space", emoji: "🌌", title: "Why the Moon is slowly escaping Earth", hook: "It drifts 3.8 cm farther away every single year." },
-
-  // Deep Ocean
-  { category: "Deep Ocean", emoji: "🌊", title: "The creatures at the bottom of the Mariana Trench", hook: "Life thrives seven miles down, where sunlight has never reached." },
-  { category: "Deep Ocean", emoji: "🌊", title: "What's hiding in the ocean's midnight zone", hook: "95% of the ocean has never been seen by human eyes." },
-  { category: "Deep Ocean", emoji: "🌊", title: "The underwater waterfall you can actually see", hook: "Mauritius hides an optical illusion of an ocean falling off a cliff." },
-  { category: "Deep Ocean", emoji: "🌊", title: "Why we've mapped Mars better than our own seafloor", hook: "We know the red planet's surface in sharper detail than Earth's." },
-
-  // Unsolved Mysteries
-  { category: "Mysteries", emoji: "🕵️", title: "The ships that vanished in the Bermuda Triangle", hook: "Decades of disappearances — and not a single wreck ever found." },
-  { category: "Mysteries", emoji: "🕵️", title: "The radio signal from space we still can't explain", hook: "The 'Wow!' signal lasted 72 seconds and never repeated." },
-  { category: "Mysteries", emoji: "🕵️", title: "The ancient computer 2,000 years ahead of its time", hook: "The Antikythera mechanism predicted eclipses before clocks existed." },
-  { category: "Mysteries", emoji: "🕵️", title: "The lost city that might actually be Atlantis", hook: "Real ruins keep dragging the legend back to life." },
-
-  // Human Body & Mind
-  { category: "Body & Mind", emoji: "🧠", title: "What happens in the seconds after you die", hook: "The brain may stay active far longer than anyone believed." },
-  { category: "Body & Mind", emoji: "🧠", title: "Why you forget your dreams within minutes", hook: "Your brain is wired to erase them on purpose." },
-  { category: "Body & Mind", emoji: "🧠", title: "The organ scientists only just discovered inside you", hook: "Hiding in plain sight for centuries until 2018." },
-  { category: "Body & Mind", emoji: "🧠", title: "Why you can't tickle yourself", hook: "Your brain cancels the sensation before it even happens." },
-
-  // Ancient World
-  { category: "Ancient World", emoji: "🏛️", title: "How the pyramids were really built", hook: "New evidence overturns almost everything you were taught." },
-  { category: "Ancient World", emoji: "🏛️", title: "The Roman concrete that heals its own cracks", hook: "Stronger after 2,000 years than the cement we pour today." },
-  { category: "Ancient World", emoji: "🏛️", title: "The 12,000-year-old temple that rewrites history", hook: "Göbekli Tepe was built before farming was even invented." },
-  { category: "Ancient World", emoji: "🏛️", title: "The library that held all of humanity's knowledge", hook: "And the fire that erased it from history forever." },
-
-  // What If
-  { category: "What If", emoji: "⚡", title: "What if the Earth stopped spinning for 5 seconds", hook: "The consequences would be catastrophic and instant." },
-  { category: "What If", emoji: "⚡", title: "What if you fell into a hole through the Earth", hook: "Physics gives a far stranger answer than you'd expect." },
-  { category: "What If", emoji: "⚡", title: "What if the Sun disappeared right now", hook: "You wouldn't even notice for eight whole minutes." },
-  { category: "What If", emoji: "⚡", title: "What if every human jumped at the exact same time", hook: "The Earth barely flinches — here's the math." },
-
-  // Hidden Micro World
-  { category: "Micro World", emoji: "🔬", title: "The animal that can survive in outer space", hook: "Tardigrades are basically impossible to kill." },
-  { category: "Micro World", emoji: "🔬", title: "How many bacteria are living on your phone", hook: "More than you'd find on a public toilet seat." },
-  { category: "Micro World", emoji: "🔬", title: "What a single drop of pond water really contains", hook: "An entire alien-looking universe you can't see." },
-
-  // Future & Tech
-  { category: "Future & Tech", emoji: "🤖", title: "The AI that taught itself to do the impossible", hook: "And the researchers still can't fully explain how." },
-  { category: "Future & Tech", emoji: "🤖", title: "Why scientists want to bring back the woolly mammoth", hook: "De-extinction is far closer than you think." },
-  { category: "Future & Tech", emoji: "🤖", title: "The material thinner than paper, stronger than steel", hook: "Graphene could quietly rebuild the entire world." },
-];
-
-const CURIOSITY_CATEGORIES = ["All", ...Array.from(new Set(CURIOSITY_TOPICS.map((t) => t.category)))];
 
 export default function Home() {
-  const [activeTab, setActiveTab] = useState<"viral" | "library" | "queue" | "scheduler">("viral");
+  const [activeTab, setActiveTab] = useState<"viral" | "library" | "queue">("viral");
   const [config, setConfig] = useState<BackendConfig | null>(null);
   const [backendError, setBackendError] = useState<string | null>(null);
-  const [loading, setLoading] = useState(false);
+  const loading = false;
   const [logs, setLogs] = useState<string[]>([]);
   const [statusText, setStatusText] = useState("");
   
   // Results
   const [finalVideoUrl, setFinalVideoUrl] = useState<string | null>(null);
-  const [presenterImageUrl, setPresenterImageUrl] = useState<string | null>(null);
-  const [voiceAudioUrl, setVoiceAudioUrl] = useState<string | null>(null);
-  const [storyboard, setStoryboard] = useState<any[]>([]);
+  const [storyboard, setStoryboard] = useState<StoryboardScene[]>([]);
   const [generatedTopic, setGeneratedTopic] = useState("");
   const [generationId, setGenerationId] = useState<string | null>(null);
 
@@ -131,36 +69,13 @@ export default function Home() {
   const [regeneratingAssetType, setRegeneratingAssetType] = useState<string | null>(null);
 
   // History & Queue states
-  const [history, setHistory] = useState<any[]>([]);
-  const [uploadQueue, setUploadQueue] = useState<any[]>([]);
-
-  // Auto Agent Scheduler states
-  const [schedulerConfig, setSchedulerConfig] = useState<any>(null);
-  const [curiosityCatOptions, setCuriosityCatOptions] = useState<string[]>(["All"]);
-  const [schedulerLogs, setSchedulerLogs] = useState<any[]>([]);
-  const [triggerLoading, setTriggerLoading] = useState(false);
+  const [history, setHistory] = useState<Generation[]>([]);
+  const [uploadQueue, setUploadQueue] = useState<UploadJob[]>([]);
 
   // Input states: Viral Shorts Studio
   const [viralPrompt, setViralPrompt] = useState("The giant hidden ocean underneath Jupiter's moon Europa");
   const [viralOllamaModel, setViralOllamaModel] = useState("");
   const [enableSearch, setEnableSearch] = useState(false);
-
-  // Curiosity Topics state (curated evergreen library)
-  const [curiosityCategory, setCuriosityCategory] = useState("All");
-
-  // Trending Topics state
-  const [trends, setTrends] = useState<any[]>([]);
-  const [trendsGeo, setTrendsGeo] = useState("IN");
-  const [isFetchingTrends, setIsFetchingTrends] = useState(false);
-  const [trendsError, setTrendsError] = useState("");
-
-  // Revenue-optimized topic recommender state
-  const [recommendations, setRecommendations] = useState<any[]>([]);
-  const [recsFocus, setRecsFocus] = useState("");
-  const [recsGeo, setRecsGeo] = useState("US");
-  const [discoverMode, setDiscoverMode] = useState<"trends" | "ideas">("trends");
-  const [isFetchingRecs, setIsFetchingRecs] = useState(false);
-  const [recsError, setRecsError] = useState("");
   const [viralVoice, setViralVoice] = useState("Sarah (Female - US - Soft)");
   const [viralVoiceSpeed, setViralVoiceSpeed] = useState(1.0);
   const [visualMode, setVisualMode] = useState("Cinematic Slideshow");
@@ -169,9 +84,10 @@ export default function Home() {
   const [musicStyle, setMusicStyle] = useState("Cinematic");
   const [satisfyingBackground, setSatisfyingBackground] = useState("Slime ASMR");
   const [viralHookStyle, setViralHookStyle] = useState("Did You Know? (Fact Hook)");
+  const [durationPreset, setDurationPreset] = useState("Standard (25-35s)");
   const [enableCaptions, setEnableCaptions] = useState(true);
   const [enableTransitionSfx, setEnableTransitionSfx] = useState(false);
-  const [captionFont, setCaptionFont] = useState("Arial");
+  const [captionFont] = useState("Arial");
   const [captionSize, setCaptionSize] = useState(72);
   const [captionMarginV, setCaptionMarginV] = useState(150);
   const [captionColor, setCaptionColor] = useState("&H00FFFF&");
@@ -191,105 +107,113 @@ export default function Home() {
 
   // Social Media Upload States
   const [isYtAuthenticated, setIsYtAuthenticated] = useState(false);
-  const [isIgConfigured, setIsIgConfigured] = useState(false);
-  const [imageProviderStatus, setImageProviderStatus] = useState<any>(null);
-  const [sdModels, setSdModels] = useState<any[]>([]);
+  const [imageProviderStatus, setImageProviderStatus] = useState<ImageProviderStatus | null>(null);
+  const [sdModels, setSdModels] = useState<LocalModel[]>([]);
   const [sdCurrentModel, setSdCurrentModel] = useState<string>("");
   const [switchingModel, setSwitchingModel] = useState(false);
   const [imageProvider, setImageProvider] = useState("");
   const [isCheckingReadiness, setIsCheckingReadiness] = useState(false);
-  const [uploadPlatforms, setUploadPlatforms] = useState({ youtube: false, instagram: false });
   const [uploadTitle, setUploadTitle] = useState("");
   const [uploadDescription, setUploadDescription] = useState("");
   const [uploadTags, setUploadTags] = useState("");
   const [uploadPrivacy, setUploadPrivacy] = useState("private");
-  const [uploadCaption, setUploadCaption] = useState("");
-  const [isUploading, setIsUploading] = useState(false);
-  const [uploadJobId, setUploadJobId] = useState<string | null>(null);
-  const [uploadLogs, setUploadLogs] = useState<string[]>([]);
   const [expandedJobId, setExpandedJobId] = useState<string | null>(null);
-  
+
   // YouTube specific upload states
   const [ytIsUploading, setYtIsUploading] = useState(false);
-  const [ytUploadJobId, setYtUploadJobId] = useState<string | null>(null);
   const [ytUploadLogs, setYtUploadLogs] = useState<string[]>([]);
-  const [ytPublishImmediate, setYtPublishImmediate] = useState(true);
-  const [ytScheduledTime, setYtScheduledTime] = useState("");
-
-  // Instagram specific upload states
-  const [igIsUploading, setIgIsUploading] = useState(false);
-  const [igUploadJobId, setIgUploadJobId] = useState<string | null>(null);
-  const [igUploadLogs, setIgUploadLogs] = useState<string[]>([]);
-  const [igPublishImmediate, setIgPublishImmediate] = useState(true);
-  const [igScheduledTime, setIgScheduledTime] = useState("");
-
-  // Input states: Full talking presenter pipeline
-  const [scriptPrompt, setScriptPrompt] = useState("Write a highly engaging 15-second script about a fascinating science fact.");
-  const [ollamaModel, setOllamaModel] = useState("");
-  const [voice, setVoice] = useState("Sarah (Female - US - Soft)");
-  const [voiceSpeed, setVoiceSpeed] = useState(1.0);
-  const [voiceEffect, setVoiceEffect] = useState("Normal");
-  const [presenterPrompt, setPresenterPrompt] = useState("High quality vertical 9:16 portrait of a friendly talking presenter facing the camera, modern studio background, highly detailed face");
-  const [leonardoModel, setLeonardoModel] = useState("Lucid Realism (High Quality Face)");
-  const [aspectRatio, setAspectRatio] = useState("9:16");
-  const [lipsyncQuality, setLipsyncQuality] = useState("Enhanced");
-  const [wav2lipVersion, setWav2lipVersion] = useState("Wav2Lip_GAN");
-  const [noSmooth, setNoSmooth] = useState(true);
-  const [padU, setPadU] = useState(0);
-  const [padD, setPadD] = useState(10);
-  const [padL, setPadL] = useState(0);
-  const [padR, setPadR] = useState(0);
-  const [bRollUrl, setBRollUrl] = useState("");
-  const [compositeLayout, setCompositeLayout] = useState("None (Presenter Only)");
-
-  // Input states: Manual lipsync
-  const [manualImagePath, setManualImagePath] = useState("");
-  const [manualAudioPath, setManualAudioPath] = useState("");
-  const [manualQuality, setManualQuality] = useState("Enhanced");
-  const [manualVersion, setManualVersion] = useState("Wav2Lip_GAN");
-  const [manualNoSmooth, setManualNoSmooth] = useState(true);
-  const [manualPadU, setManualPadU] = useState(0);
-  const [manualPadD, setManualPadD] = useState(10);
-  const [manualPadL, setManualPadL] = useState(0);
-  const [manualPadR, setManualPadR] = useState(0);
-  const [manualBRollUrl, setManualBRollUrl] = useState("");
-  const [manualLayout, setManualLayout] = useState("None (Presenter Only)");
-
-  // Input states: Landscape Studio
-  const [longPrompt, setLongPrompt] = useState("Mariana Trench exploration and the mysterious creatures living at the bottom of the world");
-  const [longOllamaModel, setLongOllamaModel] = useState("");
-  const [longVoice, setLongVoice] = useState("Sarah (Female - US - Soft)");
-  const [longVoiceSpeed, setLongVoiceSpeed] = useState(1.0);
-  const [longMusicStyle, setLongMusicStyle] = useState("Cinematic");
-  const [pexelsApiKey, setPexelsApiKey] = useState("");
-  const [longCaptionSize, setLongCaptionSize] = useState(36);
-  const [longCaptionMarginV, setLongCaptionMarginV] = useState(80);
-  const [longCaptionColor, setLongCaptionColor] = useState("&H00FFFF&");
-  const [longCaptionFont, setLongCaptionFont] = useState("Arial");
-  const [longEnableTransitionSfx, setLongEnableTransitionSfx] = useState(true);
-  const [longEnableCaptions, setLongEnableCaptions] = useState(true);
 
   const consoleEndRef = useRef<HTMLDivElement>(null);
 
-  const refreshReadiness = async () => {
+  const generationPoll = useRef<AbortController | null>(null);
+  const monitorGeneration = useCallback(async (id: string) => {
+    generationPoll.current?.abort();
+    const controller = new AbortController();
+    generationPoll.current = controller;
+    localStorage.setItem("active-generation", id);
+    setGenerationId(id);
+    try {
+      await pollUntil<GenerationStatus>(`${API_BASE}/api/generation-status/${id}`, (data) => {
+        setLogs(data.logs || []);
+        setStatusText(data.logs?.at(-1) || data.status);
+        if (data.status === "drafting" || data.status === "rendering") {
+          setDrafting(data.status === "drafting");
+          setRendering(data.status === "rendering");
+          return false;
+        }
+        setDrafting(false);
+        setRendering(false);
+        setStoryboard(data.storyboard || []);
+        setGeneratedTopic(data.topic || "");
+        if (data.status === "failed") {
+          setStatusText("Failed — saved scenes are available for retry.");
+          setLogs((prev) => [...prev, data.error_message || "Generation failed."]);
+        } else {
+          setStatusText(data.status === "completed" ? "Finished!" : "Draft ready");
+          setFinalVideoUrl(data.video_url || null);
+          setThumbnailUrl(data.thumbnail_url || null);
+          setUploadTitle(data.youtube_metadata?.title || data.topic || "");
+          setUploadDescription(data.youtube_metadata?.description || "");
+          setUploadTags(data.youtube_metadata?.tags?.join(", ") || "");
+          if (data.validation_warnings?.length) {
+            setLogs((prev) => [...prev, ...data.validation_warnings!]);
+          }
+        }
+        localStorage.removeItem("active-generation");
+        return true;
+      }, controller.signal);
+    } catch (error) {
+      setDrafting(false);
+      setRendering(false);
+      setStatusText(errorMessage(error));
+      setLogs((prev) => [...prev, errorMessage(error)]);
+    }
+  }, []);
+
+  useEffect(() => {
+    const active = localStorage.getItem("active-generation");
+    if (active) void monitorGeneration(active);
+    return () => generationPoll.current?.abort();
+  }, [monitorGeneration]);
+
+  const uploadPoll = useRef<AbortController | null>(null);
+  const monitorUpload = useCallback(async (id: string) => {
+    uploadPoll.current?.abort();
+    const controller = new AbortController();
+    uploadPoll.current = controller;
+    localStorage.setItem("active-upload", id);
+    setYtIsUploading(true);
+    try {
+      await pollUntil<UploadJob>(`${API_BASE}/api/upload-status/${id}`, (data) => {
+        setYtUploadLogs(data.logs || []);
+        if (data.status !== "completed" && data.status !== "failed") return false;
+        localStorage.removeItem("active-upload");
+        setYtIsUploading(false);
+        return true;
+      }, controller.signal);
+    } catch (error) {
+      setYtIsUploading(false);
+      setYtUploadLogs((prev) => [...prev, errorMessage(error)]);
+    }
+  }, []);
+  useEffect(() => {
+    const active = localStorage.getItem("active-upload");
+    if (active) void monitorUpload(active);
+    return () => uploadPoll.current?.abort();
+  }, [monitorUpload]);
+
+  const refreshReadiness = useCallback(async () => {
     setIsCheckingReadiness(true);
     try {
       // Fetch YouTube authentication status
-      const ytAuthRes = await fetch("http://localhost:8000/api/youtube/auth-status");
+      const ytAuthRes = await fetch(`${API_BASE}/api/youtube/auth-status`);
       if (ytAuthRes.ok) {
         const ytAuthData = await ytAuthRes.json();
         setIsYtAuthenticated(ytAuthData.authenticated);
       }
       
-      // Fetch Instagram authentication status
-      const igAuthRes = await fetch("http://localhost:8000/api/instagram/auth-status");
-      if (igAuthRes.ok) {
-        const igAuthData = await igAuthRes.json();
-        setIsIgConfigured(igAuthData.configured);
-      }
-
       // Fetch active image provider + local SD server status
-      const imgRes = await fetch("http://localhost:8000/api/image-provider/status");
+      const imgRes = await fetch(`${API_BASE}/api/image-provider/status`);
       if (imgRes.ok) {
         const data = await imgRes.json();
         setImageProviderStatus(data);
@@ -300,36 +224,30 @@ export default function Home() {
     } finally {
       setIsCheckingReadiness(false);
     }
-  };
+  }, []);
 
   // Fetch config on load
-  const loadConfig = async () => {
+  const loadConfig = useCallback(async () => {
     try {
       setBackendError(null);
-      const res = await fetch("http://localhost:8000/api/config");
+      const res = await fetch(`${API_BASE}/api/config`);
       if (!res.ok) throw new Error("Backend response error");
       const data: BackendConfig = await res.json();
       setConfig(data);
-      if (data.ollama_models.length > 0) {
-        setOllamaModel(data.ollama_models[0]);
-        setViralOllamaModel(data.ollama_models[0]);
-        setLongOllamaModel(data.ollama_models[0]);
+      const defaultModel = data.default_model || data.ollama_models[0];
+      if (defaultModel) {
+        setViralOllamaModel(defaultModel);
       }
-      
+
       await refreshReadiness();
-    } catch (err) {
+    } catch {
       setBackendError("Could not connect to FastAPI backend on http://localhost:8000. Please start the backend server by running `.venv/bin/python backend.py`.");
     }
-  };
+  }, [refreshReadiness]);
 
   useEffect(() => {
     loadConfig();
-    loadSchedulerData();
-    const storedPexelsKey = localStorage.getItem("PEXELS_API_KEY");
-    if (storedPexelsKey) {
-      setPexelsApiKey(storedPexelsKey);
-    }
-  }, []);
+  }, [loadConfig]);
 
   useEffect(() => {
     if (consoleEndRef.current) {
@@ -341,28 +259,10 @@ export default function Home() {
     setLogs((prev) => [...prev, `[${new Date().toLocaleTimeString()}] ${msg}`]);
   };
 
-  const handleFetchTrends = async () => {
-    setIsFetchingTrends(true);
-    setTrendsError("");
-    try {
-      const res = await fetch(`http://localhost:8000/api/trends?geo=${trendsGeo}`);
-      if (res.ok) {
-        const data = await res.json();
-        setTrends(data);
-      } else {
-        setTrendsError(`HTTP error! status: ${res.status}`);
-      }
-    } catch (e: any) {
-      setTrendsError(`Connection failed: ${e.message || e}`);
-    } finally {
-      setIsFetchingTrends(false);
-    }
-  };
-
   const handleChangeImageProvider = async (provider: string) => {
     setImageProvider(provider);
     try {
-      const res = await fetch(`http://localhost:8000/api/image-provider/status?provider=${provider}`);
+      const res = await fetch(`${API_BASE}/api/image-provider/status?provider=${provider}`);
       if (res.ok) setImageProviderStatus(await res.json());
     } catch (err) {
       console.error("Failed to check image provider status:", err);
@@ -371,7 +271,7 @@ export default function Home() {
     // look, so load the catalog as soon as the local engine is selected.
     if (provider === "local") {
       try {
-        const res = await fetch("http://localhost:8000/api/image-provider/models");
+        const res = await fetch(`${API_BASE}/api/image-provider/models`);
         if (res.ok) {
           const data = await res.json();
           setSdModels(data.catalog || []);
@@ -387,7 +287,7 @@ export default function Home() {
     setSwitchingModel(true);
     addLog(`Switching local image model to ${model}...`);
     try {
-      const res = await fetch("http://localhost:8000/api/image-provider/models/select", {
+      const res = await fetch(`${API_BASE}/api/image-provider/models/select`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ model })
@@ -403,61 +303,11 @@ export default function Home() {
         addLog(`First render with this model downloads ~${data.download_gb}GB.`);
       }
       handleChangeImageProvider("local");
-    } catch (err: any) {
-      addLog(`❌ Could not switch model: ${err.message || err}`);
+    } catch (err: unknown) {
+      addLog(`❌ Could not switch model: ${errorMessage(err)}`);
     } finally {
       setSwitchingModel(false);
     }
-  };
-
-  const handleFetchRecommendations = async () => {
-    setIsFetchingRecs(true);
-    setRecsError("");
-    try {
-      const res = await fetch(
-        `http://localhost:8000/api/recommend-topics?geo=${recsGeo}&count=5` +
-        (recsFocus.trim() ? `&focus=${encodeURIComponent(recsFocus.trim())}` : "")
-      );
-      if (res.ok) {
-        const data = await res.json();
-        setRecommendations(data);
-      } else {
-        const detail = await res.json().catch(() => null);
-        setRecsError(detail?.detail || `HTTP error! status: ${res.status}`);
-      }
-    } catch (e: any) {
-      setRecsError(`Connection failed: ${e.message || e}`);
-    } finally {
-      setIsFetchingRecs(false);
-    }
-  };
-
-  const handleUseRecommendedTopic = (rec: any) => {
-    const parts = [`Write a 15-second viral short about: ${rec.title}.`];
-    if (rec.rationale) parts.push(`Angle: ${rec.rationale}`);
-    if (rec.niche) parts.push(`Niche: ${rec.niche} (high-RPM, ${rec.geo || "US"} audience).`);
-    setViralPrompt(parts.join(" "));
-    setEnableSearch(true);
-    const configSection = document.getElementById("viral-config-card");
-    if (configSection) configSection.scrollIntoView({ behavior: "smooth" });
-  };
-
-  const handleUseCuriosityTopic = (topic: CuriosityTopic) => {
-    setViralPrompt(
-      `Write a 15-second viral short about: ${topic.title}. Curiosity angle: ${topic.hook} Open with an irresistible hook, build tension fast, and end on a mind-blowing payoff.`
-    );
-    setEnableSearch(true);
-    const configSection = document.getElementById("viral-config-card");
-    if (configSection) configSection.scrollIntoView({ behavior: "smooth" });
-  };
-
-  const handleSurpriseCuriosityTopic = () => {
-    const pool =
-      curiosityCategory === "All"
-        ? CURIOSITY_TOPICS
-        : CURIOSITY_TOPICS.filter((t) => t.category === curiosityCategory);
-    if (pool.length === 0) return;
-    handleUseCuriosityTopic(pool[Math.floor(Math.random() * pool.length)]);
   };
 
   const handleUpdateSceneNarration = (idx: number, val: string) => {
@@ -484,11 +334,6 @@ export default function Home() {
     });
   };
 
-  const handlePexelsKeyChange = (val: string) => {
-    setPexelsApiKey(val);
-    localStorage.setItem("PEXELS_API_KEY", val);
-  };
-
 
   const handleDraftStoryboard = async () => {
     setDrafting(true);
@@ -497,43 +342,41 @@ export default function Home() {
     setThumbnailUrl(null);
     setStoryboard([]);
     setGenerationId(null);
-    
+
     addLog("📝 Creating Script & Storyboard Draft...");
     addLog(`Topic: "${viralPrompt}"`);
     addLog(`Hook Style: ${viralHookStyle}`);
-    
+    addLog(`Duration: ${durationPreset}`);
+
+    // Drafting runs as a background job on the backend (a multi-minute local
+    // LLM call previously held this fetch open with no way to show progress
+    // or give up cleanly -- reproduced live as a 280s hang with no response).
+    // Poll generation-status instead of awaiting one long request.
     try {
-      const response = await fetch("http://localhost:8000/api/draft-script", {
+      const response = await fetch(`${API_BASE}/api/draft-script`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           prompt: viralPrompt,
-          model: viralOllamaModel || "minimax-m3:cloud",
+          model: viralOllamaModel || "qwen2.5:7b-instruct",
           hook_style: viralHookStyle,
           enable_search: enableSearch,
           voice: viralVoice,
-          art_style: artStyle
+          art_style: artStyle,
+          duration_preset: durationPreset
         })
       });
-      
+
       if (!response.ok) {
         throw new Error(await response.text());
       }
-      
-      const result = await response.json();
-      setGenerationId(result.generation_id);
-      setStoryboard(result.storyboard);
-      setGeneratedTopic(result.topic);
-      
-      // Pre-fill social upload metadata
-      setUploadTitle(result.youtube_metadata?.title || result.topic || "");
-      setUploadDescription(result.youtube_metadata?.description || "");
-      setUploadTags(result.youtube_metadata?.tags?.join(", ") || "");
-      setUploadCaption(result.instagram_metadata?.caption || "");
-      
-      addLog("✅ Script draft generated! Storyboard scenes are now ready for your edits.");
-    } catch (err: any) {
-      addLog(`❌ ERROR drafting script: ${err.message || err}`);
+
+      const { generation_id } = await response.json();
+      setGenerationId(generation_id);
+
+      await monitorGeneration(generation_id);
+    } catch (err: unknown) {
+      addLog(`❌ ERROR drafting script: ${errorMessage(err)}`);
     } finally {
       setDrafting(false);
     }
@@ -553,7 +396,7 @@ export default function Home() {
     addLog(`Caption Style: ${captionStyle}`);
     
     try {
-      const response = await fetch("http://localhost:8000/api/render-storyboard", {
+      const response = await fetch(`${API_BASE}/api/render-storyboard`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -561,6 +404,7 @@ export default function Home() {
           storyboard: storyboard,
           visual_mode: visualMode,
           image_provider: imageProvider,
+          local_image_model: sdCurrentModel,
           leonardo_model: viralLeonardoModel,
           voice: viralVoice,
           speed: viralVoiceSpeed,
@@ -592,43 +436,11 @@ export default function Home() {
       addLog("⏳ Video rendering task queued in the background. Polling render status...");
       setStatusText("Rendering...");
       
-      // Poll rendering status
-      const interval = setInterval(async () => {
-        try {
-          const statusRes = await fetch(`http://localhost:8000/api/generation-status/${generationId}`);
-          if (statusRes.ok) {
-            const data = await statusRes.json();
-            if (data.status === "completed") {
-              setFinalVideoUrl(data.video_url);
-              setThumbnailUrl(data.thumbnail_url || null);
-              setStoryboard(data.storyboard);
-              setStatusText("Finished!");
-              addLog("🎉 Success! Render complete.");
-              clearInterval(interval);
-              setRendering(false);
-              loadHistory(); // refresh library
-            } else if (data.status === "failed") {
-              setStatusText("Failed");
-              addLog("❌ Video rendering failed on the server.");
-              clearInterval(interval);
-              setRendering(false);
-            } else {
-              addLog("Rendering still in progress...");
-            }
-          }
-        } catch (err) {
-          console.error("Error polling render status:", err);
-        }
-      }, 3000);
-      
-      // Auto-clear after 10 minutes
-      setTimeout(() => {
-        clearInterval(interval);
-        setRendering(false);
-      }, 600000);
-      
-    } catch (err: any) {
-      addLog(`❌ ERROR starting render: ${err.message || err}`);
+      await monitorGeneration(generationId);
+      await loadHistory();
+
+    } catch (err: unknown) {
+      addLog(`❌ ERROR starting render: ${errorMessage(err)}`);
       setRendering(false);
     }
   };
@@ -648,10 +460,13 @@ export default function Home() {
         prompt: assetType === "image" ? scene.visual_prompt : scene.narration,
         voice: scene.speaker || viralVoice,
         speed: viralVoiceSpeed,
-        leonardo_model: viralLeonardoModel
+        leonardo_model: viralLeonardoModel,
+        image_provider: imageProvider,
+        local_image_model: sdCurrentModel,
+        visual_source_mode: visualSourceMode
       };
       
-      const response = await fetch("http://localhost:8000/api/regenerate-scene-asset", {
+      const response = await fetch(`${API_BASE}/api/regenerate-scene-asset`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(payload)
@@ -663,11 +478,16 @@ export default function Home() {
       
       const result = await response.json();
       const updatedStoryboard = [...storyboard];
-      updatedStoryboard[sceneIndex] = result.scene;
+      updatedStoryboard[sceneIndex] = {
+        ...result.scene,
+        narration: assetType === "audio" ? result.scene.narration : scene.narration,
+        speaker: assetType === "audio" ? result.scene.speaker : scene.speaker,
+        visual_prompt: assetType === "image" ? result.scene.visual_prompt : scene.visual_prompt,
+      };
       setStoryboard(updatedStoryboard);
       addLog(`✅ Scene ${sceneIndex + 1} ${assetType} regenerated successfully.`);
-    } catch (err: any) {
-      addLog(`❌ ERROR regenerating ${assetType}: ${err.message || err}`);
+    } catch (err: unknown) {
+      addLog(`❌ ERROR regenerating ${assetType}: ${errorMessage(err)}`);
     } finally {
       setRegeneratingSceneIdx(null);
       setRegeneratingAssetType(null);
@@ -676,7 +496,7 @@ export default function Home() {
 
   const loadHistory = async () => {
     try {
-      const res = await fetch("http://localhost:8000/api/history");
+      const res = await fetch(`${API_BASE}/api/history`);
       if (res.ok) {
         setHistory(await res.json());
       }
@@ -691,7 +511,7 @@ export default function Home() {
     }
     
     try {
-      const res = await fetch(`http://localhost:8000/api/generation/${genId}`, {
+      const res = await fetch(`${API_BASE}/api/generation/${genId}`, {
         method: "DELETE",
       });
       if (res.ok) {
@@ -706,7 +526,6 @@ export default function Home() {
           setUploadTitle("");
           setUploadDescription("");
           setUploadTags("");
-          setUploadCaption("");
           addLog(`🧹 Cleared deleted generation from publisher/editor panel.`);
         }
         // Reload history
@@ -715,124 +534,15 @@ export default function Home() {
         const errorData = await res.json();
         alert(`Failed to delete generation: ${errorData.detail || res.statusText}`);
       }
-    } catch (err: any) {
+    } catch (err: unknown) {
       console.error("Failed to delete generation:", err);
-      alert(`Error deleting generation: ${err.message || err}`);
-    }
-  };
-
-  const loadSchedulerData = async () => {
-    try {
-      const resConfig = await fetch("http://localhost:8000/api/scheduler/config");
-      if (resConfig.ok) {
-        setSchedulerConfig(await resConfig.json());
-      }
-      const resLogs = await fetch("http://localhost:8000/api/scheduler/logs");
-      if (resLogs.ok) {
-        setSchedulerLogs(await resLogs.json());
-      }
-      const resCat = await fetch("http://localhost:8000/api/curiosity-topics");
-      if (resCat.ok) {
-        const data = await resCat.json();
-        if (Array.isArray(data.categories)) setCuriosityCatOptions(data.categories);
-      }
-    } catch (err) {
-      console.error("Error loading scheduler data:", err);
-    }
-  };
-
-  const handleClearSchedulerLogs = async () => {
-    if (!window.confirm("Are you sure you want to clear all scheduler execution logs? This action cannot be undone.")) {
-      return;
-    }
-    try {
-      const res = await fetch("http://localhost:8000/api/scheduler/logs", {
-        method: "DELETE"
-      });
-      if (res.ok) {
-        setSchedulerLogs([]);
-        addLog("🗑️ Scheduler execution logs cleared successfully.");
-      } else {
-        alert("Failed to clear scheduler execution logs");
-      }
-    } catch (err) {
-      console.error("Error clearing scheduler logs:", err);
-    }
-  };
-
-  const saveSchedulerConfig = async (updatedConfig: any) => {
-    try {
-      const res = await fetch("http://localhost:8000/api/scheduler/config", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(updatedConfig)
-      });
-      if (res.ok) {
-        setSchedulerConfig(updatedConfig);
-        addLog("💾 Scheduler settings updated successfully.");
-      } else {
-        alert("Failed to save scheduler configuration");
-      }
-    } catch (err) {
-      console.error("Error saving scheduler config:", err);
-      alert("Error saving settings");
-    }
-  };
-
-  const triggerSchedulerAgent = async () => {
-    setTriggerLoading(true);
-    try {
-      const res = await fetch("http://localhost:8000/api/scheduler/trigger", {
-        method: "POST"
-      });
-      if (!res.ok) {
-        alert("Failed to trigger agent");
-        setTriggerLoading(false);
-        return;
-      }
-      addLog("🚀 Manual Agent Run triggered. Generating viral short (this can take a minute)...");
-
-      // The run executes in the background, so poll the logs until the latest
-      // entry leaves the "running" state, keeping the loader live the whole time.
-      const startedAt = Date.now();
-      const poll = async () => {
-        try {
-          const r = await fetch("http://localhost:8000/api/scheduler/logs");
-          if (r.ok) {
-            const logs = await r.json();
-            setSchedulerLogs(logs);
-            const latest = logs?.[0];
-            if (latest && latest.status !== "running") {
-              setTriggerLoading(false);
-              if (latest.status === "success") {
-                addLog("✅ Agent run completed successfully.");
-              } else {
-                const reason = latest.logs?.[latest.logs.length - 1] || "see scheduler logs";
-                addLog(`❌ Agent run failed: ${reason}`);
-              }
-              return;
-            }
-          }
-        } catch (e) {
-          console.error("Error polling scheduler logs:", e);
-        }
-        if (Date.now() - startedAt > 300000) {
-          setTriggerLoading(false);
-          addLog("⌛ Stopped watching the agent run after 5 minutes. Check scheduler logs for the result.");
-          return;
-        }
-        setTimeout(poll, 4000);
-      };
-      setTimeout(poll, 3000);
-    } catch (err) {
-      console.error("Error triggering agent:", err);
-      setTriggerLoading(false);
+      alert(`Error deleting generation: ${errorMessage(err)}`);
     }
   };
 
   const loadUploadQueue = async () => {
     try {
-      const res = await fetch("http://localhost:8000/api/upload-queue");
+      const res = await fetch(`${API_BASE}/api/upload-queue`);
       if (res.ok) {
         setUploadQueue(await res.json());
       }
@@ -841,17 +551,11 @@ export default function Home() {
     }
   };
 
-  const handleGenerateViralShort = async () => {
-    // Wrapper to trigger two-stage flow
-    await handleDraftStoryboard();
-  };
-
-
 
   const handleInitYoutubeAuth = async () => {
     addLog("🔑 Launching YouTube OAuth Authentication flow...");
     try {
-      const res = await fetch("http://localhost:8000/api/youtube/auth-init");
+      const res = await fetch(`${API_BASE}/api/youtube/auth-init`);
       if (!res.ok) {
         const data = await res.json();
         throw new Error(data.detail || "Failed to start auth flow");
@@ -860,7 +564,7 @@ export default function Home() {
       
       const interval = setInterval(async () => {
         try {
-          const statusRes = await fetch("http://localhost:8000/api/youtube/auth-status");
+          const statusRes = await fetch(`${API_BASE}/api/youtube/auth-status`);
           if (statusRes.ok) {
             const statusData = await statusRes.json();
             if (statusData.authenticated) {
@@ -875,8 +579,8 @@ export default function Home() {
       }, 3000);
       
       setTimeout(() => clearInterval(interval), 120000);
-    } catch (err: any) {
-      addLog(`❌ OAuth Error: ${err.message || err}`);
+    } catch (err: unknown) {
+      addLog(`❌ OAuth Error: ${errorMessage(err)}`);
     }
   };
 
@@ -897,11 +601,9 @@ export default function Home() {
         youtube_description: uploadDescription,
         youtube_tags: uploadTags.split(",").map(t => t.trim()).filter(Boolean),
         youtube_privacy: uploadPrivacy,
-        instagram_caption: "",
-        scheduled_time: ytPublishImmediate ? null : (ytScheduledTime ? new Date(ytScheduledTime).toISOString() : null)
       };
 
-      const res = await fetch("http://localhost:8000/api/schedule-upload", {
+      const res = await fetch(`${API_BASE}/api/schedule-upload`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(payload)
@@ -913,109 +615,14 @@ export default function Home() {
       }
 
       const result = await res.json();
-      setYtUploadJobId(result.job_id);
-      
-      const newLog = ytPublishImmediate ? "🚀 YouTube upload job queued immediately!" : `🕒 YouTube upload scheduled for: ${new Date(ytScheduledTime).toLocaleString()}`;
-      setYtUploadLogs(prev => [...prev, newLog]);
+      setYtUploadLogs(prev => [...prev, "🚀 YouTube upload started!"]);
       loadUploadQueue(); // refresh queue list
-      
-      if (ytPublishImmediate) {
-        // Poll job status
-        const interval = setInterval(async () => {
-          try {
-            const statusRes = await fetch(`http://localhost:8000/api/upload-status/${result.job_id}`);
-            if (statusRes.ok) {
-              const statusData = await statusRes.json();
-              setYtUploadLogs(statusData.logs);
-              
-              if (statusData.status === "completed" || statusData.status === "failed") {
-                setYtIsUploading(false);
-                clearInterval(interval);
-                loadUploadQueue();
-              }
-            }
-          } catch (err) {
-            console.error("Error polling YouTube upload status:", err);
-          }
-        }, 1500);
 
-        setTimeout(() => {
-          clearInterval(interval);
-          setYtIsUploading(false);
-        }, 300000);
-      } else {
-        setYtIsUploading(false);
-      }
-    } catch (error: any) {
-      setYtUploadLogs(prev => [...prev, `❌ Error: ${error.message || error}`]);
+      await monitorUpload(result.job_id);
+      await loadUploadQueue();
+    } catch (error: unknown) {
+      setYtUploadLogs(prev => [...prev, `❌ Error: ${errorMessage(error)}`]);
       setYtIsUploading(false);
-    }
-  };
-
-  const handleInstagramUpload = async () => {
-    setIgIsUploading(true);
-    setIgUploadLogs(["Initiating Instagram upload request..."]);
-    
-    try {
-      const payload = {
-        video_generation_id: generationId || "",
-        platforms: ["instagram"],
-        youtube_title: "",
-        youtube_description: "",
-        youtube_tags: [],
-        youtube_privacy: "private",
-        instagram_caption: uploadCaption,
-        scheduled_time: igPublishImmediate ? null : (igScheduledTime ? new Date(igScheduledTime).toISOString() : null)
-      };
-
-      const res = await fetch("http://localhost:8000/api/schedule-upload", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload)
-      });
-
-      if (!res.ok) {
-        const data = await res.json();
-        throw new Error(data.detail || "Instagram upload job queue failed");
-      }
-
-      const result = await res.json();
-      setIgUploadJobId(result.job_id);
-      
-      const newLog = igPublishImmediate ? "🚀 Instagram upload job queued immediately!" : `🕒 Instagram upload scheduled for: ${new Date(igScheduledTime).toLocaleString()}`;
-      setIgUploadLogs(prev => [...prev, newLog]);
-      loadUploadQueue(); // refresh queue list
-      
-      if (igPublishImmediate) {
-        // Poll job status
-        const interval = setInterval(async () => {
-          try {
-            const statusRes = await fetch(`http://localhost:8000/api/upload-status/${result.job_id}`);
-            if (statusRes.ok) {
-              const statusData = await statusRes.json();
-              setIgUploadLogs(statusData.logs);
-              
-              if (statusData.status === "completed" || statusData.status === "failed") {
-                setIgIsUploading(false);
-                clearInterval(interval);
-                loadUploadQueue();
-              }
-            }
-          } catch (err) {
-            console.error("Error polling Instagram upload status:", err);
-          }
-        }, 1500);
-
-        setTimeout(() => {
-          clearInterval(interval);
-          setIgIsUploading(false);
-        }, 300000);
-      } else {
-        setIgIsUploading(false);
-      }
-    } catch (error: any) {
-      setIgUploadLogs(prev => [...prev, `❌ Error: ${error.message || error}`]);
-      setIgIsUploading(false);
     }
   };
 
@@ -1024,7 +631,7 @@ export default function Home() {
       {/* Header */}
       <header className="header">
         <h1 className="title-glow">🎬 ShortsGen AI</h1>
-        <p className="subtitle">AI Shorts &amp; Reels Creator for YouTube and Instagram</p>
+        <p className="subtitle">Type a topic. Get a finished YouTube Short.</p>
       </header>
 
       {/* Backend Status Alert */}
@@ -1061,7 +668,7 @@ export default function Home() {
             <Settings size={20} color="var(--accent)" />
             <div>
               <h3 style={{ fontSize: "16px", fontWeight: 600, color: "var(--text-primary)", margin: 0 }}>Social Publishing Readiness</h3>
-              <p style={{ fontSize: "12px", color: "var(--text-secondary)", margin: "2px 0 0 0" }}>Check authorization status for direct video publishing to YouTube and Instagram.</p>
+              <p style={{ fontSize: "12px", color: "var(--text-secondary)", margin: "2px 0 0 0" }}>Check authorization status for direct video publishing to YouTube.</p>
             </div>
           </div>
 
@@ -1086,20 +693,6 @@ export default function Home() {
                     Authorize
                   </button>
                 </div>
-              )}
-            </div>
-
-            {/* Instagram Readiness */}
-            <div style={{ display: "flex", alignItems: "center", gap: "8px", background: "rgba(255, 255, 255, 0.02)", border: "1px solid rgba(255, 255, 255, 0.05)", padding: "6px 12px", borderRadius: "10px" }}>
-              <span style={{ fontSize: "13px", fontWeight: 500, color: "var(--text-secondary)" }}>Instagram Reels:</span>
-              {isIgConfigured ? (
-                <span style={{ display: "flex", alignItems: "center", gap: "4px", color: "var(--ok)", fontSize: "13px", fontWeight: 600 }}>
-                  <CheckCircle2 size={14} /> Ready
-                </span>
-              ) : (
-                <span style={{ display: "flex", alignItems: "center", gap: "4px", color: "var(--warn)", fontSize: "13px", fontWeight: 600 }} title="Set INSTAGRAM_BUSINESS_ACCOUNT_ID and INSTAGRAM_ACCESS_TOKEN in .env">
-                  <AlertCircle size={14} /> Needs Keys
-                </span>
               )}
             </div>
 
@@ -1149,22 +742,16 @@ export default function Home() {
         >
           <Tv size={18} /> 📚 Video Library
         </button>
-        <button 
-          onClick={() => { setActiveTab("queue"); loadUploadQueue(); }} 
+        <button
+          onClick={() => { setActiveTab("queue"); loadUploadQueue(); }}
           className={`tab-btn ${activeTab === "queue" ? "tab-btn-active" : ""}`}
         >
           <Layers size={18} /> 🕒 Upload Queue
         </button>
-        <button 
-          onClick={() => { setActiveTab("scheduler"); loadSchedulerData(); }} 
-          className={`tab-btn ${activeTab === "scheduler" ? "tab-btn-active" : ""}`}
-        >
-          <Settings size={18} /> 🤖 Auto-Agent Scheduler
-        </button>
       </div>
 
       {/* Main Grid Panels / Full Screens */}
-      {activeTab !== "library" && activeTab !== "queue" && activeTab !== "scheduler" ? (
+      {activeTab !== "library" && activeTab !== "queue" ? (
         <div className="dashboard-grid">
           {/* Left Side: Forms */}
           <div className="form-panel">
@@ -1172,288 +759,6 @@ export default function Home() {
           {/* TAB 1: VIRAL SHORTS STUDIO */}
           {activeTab === "viral" && (
             <>
-              {/* Trending Topics Discoverer */}
-              <div className="glass-card" style={{ marginBottom: "20px" }}>
-                <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: "16px", gap: "12px", flexWrap: "wrap" }}>
-                  <h2 className="card-title" style={{ margin: 0 }}>
-                    <DollarSign /> Discover Topics
-                  </h2>
-                  <div style={{ display: "inline-flex", background: "var(--surface-2)", border: "1px solid var(--border)", borderRadius: "10px", padding: "3px" }}>
-                    <button onClick={() => setDiscoverMode("trends")} style={{ cursor: "pointer", border: "none", width: "auto", padding: "6px 14px", fontSize: "13px", fontWeight: 600, borderRadius: "7px", background: discoverMode === "trends" ? "var(--accent)" : "transparent", color: discoverMode === "trends" ? "var(--accent-ink)" : "var(--text-secondary)" }}>🔥 Trending</button>
-                    <button onClick={() => setDiscoverMode("ideas")} style={{ cursor: "pointer", border: "none", width: "auto", padding: "6px 14px", fontSize: "13px", fontWeight: 600, borderRadius: "7px", background: discoverMode === "ideas" ? "var(--accent)" : "transparent", color: discoverMode === "ideas" ? "var(--accent-ink)" : "var(--text-secondary)" }}>💲 High-RPM</button>
-                  </div>
-                </div>
-
-                {discoverMode === "trends" && (<>
-                <p className="card-subtitle" style={{ color: "var(--text-secondary)", fontSize: "0.9rem", marginBottom: "15px" }}>
-                  Find out what people are searching for right now and instantly generate viral shorts about them.
-                </p>
-
-                <div className="form-row" style={{ alignItems: "flex-end", marginBottom: "20px" }}>
-                  <div className="form-group" style={{ flex: 1 }}>
-                    <label className="form-label">Select Target Region</label>
-                    <select 
-                      className="form-select"
-                      value={trendsGeo}
-                      onChange={(e) => setTrendsGeo(e.target.value)}
-                    >
-                      <option value="IN">India (IN)</option>
-                      <option value="US">United States (US)</option>
-                      <option value="GB">United Kingdom (GB)</option>
-                      <option value="CA">Canada (CA)</option>
-                      <option value="AU">Australia (AU)</option>
-                    </select>
-                  </div>
-                  <button 
-                    className="btn btn-primary" 
-                    onClick={handleFetchTrends}
-                    disabled={isFetchingTrends}
-                    style={{ height: "42px", minWidth: "150px" }}
-                  >
-                    {isFetchingTrends ? "Fetching..." : "Fetch Hot Trends"}
-                  </button>
-                </div>
-
-                {trendsError && (
-                  <p style={{ color: "var(--danger)", fontSize: "0.9rem", marginBottom: "15px" }}>{trendsError}</p>
-                )}
-
-                {trends.length > 0 && (
-                  <div 
-                    style={{ 
-                      display: "grid", 
-                      gridTemplateColumns: "repeat(auto-fill, minmax(220px, 1fr))", 
-                      gap: "15px", 
-                      maxHeight: "350px", 
-                      overflowY: "auto", 
-                      paddingRight: "5px",
-                      marginTop: "10px"
-                    }}
-                  >
-                    {trends.map((t, idx) => (
-                      <div 
-                        key={idx} 
-                        style={{ 
-                          background: "var(--surface-2)", 
-                          borderRadius: "8px", 
-                          padding: "12px", 
-                          border: "1px solid var(--border)", 
-                          display: "flex", 
-                          flexDirection: "column",
-                          justifyContent: "space-between",
-                          transition: "all 0.2s ease"
-                        }}
-                        className="trend-card"
-                      >
-                        <div>
-                          {t.picture_url ? (
-                            <img 
-                              src={t.picture_url} 
-                              alt={t.title} 
-                              style={{ width: "100%", height: "110px", objectFit: "cover", borderRadius: "6px", marginBottom: "10px" }}
-                            />
-                          ) : (
-                            <div style={{ height: "110px", background: "var(--surface-2)", borderRadius: "6px", display: "flex", alignItems: "center", justifyContent: "center", color: "var(--text-muted)", fontSize: "0.85rem", marginBottom: "10px" }}>
-                              No Thumbnail
-                            </div>
-                          )}
-                          <h4 style={{ margin: "0 0 4px 0", color: "var(--text-primary)", fontSize: "1rem" }}>{t.title}</h4>
-                          <span style={{ background: "var(--danger)", color: "#ffffff", fontSize: "0.75rem", padding: "2px 8px", borderRadius: "10px", fontWeight: "bold" }}>
-                            🔥 {t.traffic}
-                          </span>
-                          
-                          {t.news_title && (
-                            <p style={{ fontSize: "0.8rem", color: "var(--text-secondary)", marginTop: "8px", lineHeight: "1.25" }}>
-                              <b>News</b>: <a href={t.news_url} target="_blank" rel="noopener noreferrer" style={{ color: "var(--accent)", textDecoration: "none" }}>{t.news_title}</a>
-                            </p>
-                          )}
-                        </div>
-                        
-                        <button 
-                          className="btn btn-secondary" 
-                          style={{ width: "100%", marginTop: "12px", padding: "6px 0", fontSize: "0.85rem" }}
-                          onClick={() => {
-                            setViralPrompt(`Write a script about: ${t.title}. Context: ${t.news_title || ""}`);
-                            setEnableSearch(true);
-                            const configSection = document.getElementById("viral-config-card");
-                            if (configSection) {
-                              configSection.scrollIntoView({ behavior: "smooth" });
-                            }
-                          }}
-                        >
-                          Create Reel
-                        </button>
-                      </div>
-                    ))}
-                  </div>
-                )}
-                </>)}
-
-                {discoverMode === "ideas" && (<>
-                <p className="card-subtitle" style={{ color: "var(--text-secondary)", fontSize: "0.9rem", marginBottom: "15px" }}>
-                  Fresh topics from any subject &mdash; the subject areas are invented per request,
-                  not picked from a fixed list, and grounded in live Google Trends and Wikipedia activity.
-                  Every suggestion is checked against your history, so you never get a reworded version
-                  of a video you already made. Leave Focus blank to roam anywhere.
-                </p>
-
-                <div className="form-row" style={{ alignItems: "flex-end", marginBottom: "20px" }}>
-                  <div className="form-group" style={{ flex: 1 }}>
-                    <label className="form-label">Target Market (by RPM)</label>
-                    <select
-                      className="form-select"
-                      value={recsGeo}
-                      onChange={(e) => setRecsGeo(e.target.value)}
-                    >
-                      <option value="US">🇺🇸 United States — Highest RPM</option>
-                      <option value="AU">🇦🇺 Australia — Very High RPM</option>
-                      <option value="CA">🇨🇦 Canada — High RPM</option>
-                      <option value="GB">🇬🇧 United Kingdom — High RPM</option>
-                    </select>
-                  </div>
-                  <div className="form-group" style={{ flex: 1 }}>
-                    <label className="form-label">Focus (optional)</label>
-                    <input
-                      className="form-input"
-                      value={recsFocus}
-                      onChange={(e) => setRecsFocus(e.target.value)}
-                      placeholder="anything — cricket, cooking, history…"
-                    />
-                  </div>
-                  <button
-                    className="btn btn-primary"
-                    onClick={handleFetchRecommendations}
-                    disabled={isFetchingRecs}
-                    style={{ height: "42px", minWidth: "190px", background: "linear-gradient(135deg, var(--ok) 0%, var(--ok) 100%)" }}
-                  >
-                    {isFetchingRecs ? "Thinking..." : "Get Topic Ideas"}
-                  </button>
-                </div>
-
-                {recsError && (
-                  <p style={{ color: "var(--danger)", fontSize: "0.9rem", marginBottom: "15px" }}>{recsError}</p>
-                )}
-
-                {recommendations.length > 0 && (
-                  <div
-                    style={{
-                      display: "grid",
-                      gridTemplateColumns: "repeat(auto-fill, minmax(240px, 1fr))",
-                      gap: "15px",
-                      maxHeight: "380px",
-                      overflowY: "auto",
-                      paddingRight: "5px",
-                      marginTop: "10px"
-                    }}
-                  >
-                    {recommendations.map((rec, idx) => {
-                      const tier = String(rec.rpm_tier || "Medium");
-                      const tierColor = tier === "High" ? "var(--ok)" : tier === "Low" ? "var(--text-muted)" : "var(--warn)";
-                      return (
-                        <div
-                          key={idx}
-                          className="trend-card"
-                          style={{
-                            background: "var(--surface-2)",
-                            borderRadius: "8px",
-                            padding: "14px",
-                            border: "1px solid var(--border)",
-                            display: "flex",
-                            flexDirection: "column",
-                            justifyContent: "space-between",
-                            transition: "all 0.2s ease"
-                          }}
-                        >
-                          <div>
-                            <div style={{ display: "flex", gap: "6px", flexWrap: "wrap", marginBottom: "8px" }}>
-                              <span style={{ background: tierColor, color: "var(--accent-ink)", fontSize: "0.72rem", padding: "2px 8px", borderRadius: "10px", fontWeight: "bold" }}>
-                                {tier} RPM
-                              </span>
-                              <span style={{ background: "var(--surface-2)", color: "var(--accent)", fontSize: "0.72rem", padding: "2px 8px", borderRadius: "10px", fontWeight: "bold", textTransform: "capitalize" }}>
-                                {rec.niche || "general"}
-                              </span>
-                              {rec.est_rpm && (
-                                <span style={{ background: "var(--surface-2)", color: "var(--ok)", fontSize: "0.72rem", padding: "2px 8px", borderRadius: "10px", fontWeight: "bold" }}>
-                                  ~{rec.est_rpm} / 1k
-                                </span>
-                              )}
-                            </div>
-                            <h4 style={{ margin: "0 0 6px 0", color: "var(--text-primary)", fontSize: "1rem", lineHeight: "1.3" }}>{rec.title}</h4>
-                            {rec.rationale && (
-                              <p style={{ fontSize: "0.8rem", color: "var(--text-secondary)", marginTop: "4px", lineHeight: "1.3" }}>{rec.rationale}</p>
-                            )}
-                          </div>
-
-                          <button
-                            className="btn btn-secondary"
-                            style={{ width: "100%", marginTop: "12px", padding: "6px 0", fontSize: "0.85rem" }}
-                            onClick={() => handleUseRecommendedTopic(rec)}
-                          >
-                            Use this topic
-                          </button>
-                        </div>
-                      );
-                    })}
-                  </div>
-                )}
-                </>)}
-              </div>
-
-              {/* Curiosity Topics — curated evergreen library that trends on YouTube */}
-              <div className="glass-card curiosity-card-wrap" style={{ marginBottom: "20px" }}>
-                <div className="curiosity-head">
-                  <div>
-                    <h2 className="card-title" style={{ margin: 0 }}>
-                      <Lightbulb /> Curiosity Topics
-                    </h2>
-                    <p className="card-subtitle" style={{ marginTop: "6px" }}>
-                      Hand-picked curiosity-gap ideas built to trend on Shorts. Tap one to load it straight into the drafter.
-                    </p>
-                  </div>
-                  <button
-                    className="curiosity-surprise"
-                    onClick={handleSurpriseCuriosityTopic}
-                    title="Pick a random topic and load it"
-                  >
-                    <Shuffle size={15} /> Surprise me
-                  </button>
-                </div>
-
-                <div className="curiosity-chips">
-                  {CURIOSITY_CATEGORIES.map((cat) => (
-                    <button
-                      key={cat}
-                      onClick={() => setCuriosityCategory(cat)}
-                      className={`curiosity-chip ${curiosityCategory === cat ? "curiosity-chip-active" : ""}`}
-                    >
-                      {cat}
-                    </button>
-                  ))}
-                </div>
-
-                <div className="curiosity-grid">
-                  {CURIOSITY_TOPICS
-                    .filter((t) => curiosityCategory === "All" || t.category === curiosityCategory)
-                    .map((topic, idx) => (
-                      <button
-                        key={`${topic.title}-${idx}`}
-                        className="curiosity-item"
-                        onClick={() => handleUseCuriosityTopic(topic)}
-                      >
-                        <span className="curiosity-item-cat">
-                          <span className="curiosity-item-emoji">{topic.emoji}</span>
-                          {topic.category}
-                        </span>
-                        <span className="curiosity-item-title">{topic.title}</span>
-                        <span className="curiosity-item-hook">{topic.hook}</span>
-                        <span className="curiosity-item-cta">
-                          Use topic <ArrowRight size={13} />
-                        </span>
-                      </button>
-                    ))}
-                </div>
-              </div>
-
               <div className="glass-card" id="viral-config-card">
                 <h2 className="card-title"><Sparkles /> Script Drafting Configuration</h2>
               
@@ -1482,6 +787,22 @@ export default function Home() {
                     </select>
                     <p className="form-label-info">Shapes script opening scenes to maximize hook retention.</p>
                   </div>
+                  <div className="form-group">
+                    <label className="form-label">Target Duration</label>
+                    <select
+                      className="form-select"
+                      value={durationPreset}
+                      onChange={(e) => setDurationPreset(e.target.value)}
+                    >
+                      {(config?.duration_presets ?? ["Quick (15-20s)", "Standard (25-35s)"]).map(d => (
+                        <option key={d} value={d}>{d}</option>
+                      ))}
+                    </select>
+                    <p className="form-label-info">25-35s is the retention sweet spot for most niches; Quick trades depth for a faster loop.</p>
+                  </div>
+                </div>
+
+                <div className="form-row">
                   <div className="form-group">
                     <label className="form-label">Ollama LLM Model</label>
                     <select 
@@ -1559,12 +880,12 @@ export default function Home() {
                           disabled={switchingModel}
                           onChange={(e) => handleSelectSdModel(e.target.value)}
                         >
-                          {sdModels.map((m: any) => (
+                          {sdModels.map((m) => (
                             <option key={m.id} value={m.id}>{m.name}</option>
                           ))}
                         </select>
                         {(() => {
-                          const active = sdModels.find((m: any) => m.id === sdCurrentModel);
+                          const active = sdModels.find((m) => m.id === sdCurrentModel);
                           if (!active) return null;
                           return (
                             <p className="form-label-info">
@@ -2133,272 +1454,96 @@ export default function Home() {
               )}
             </div>
 
-            {/* Social Media Publish Section */}
+            {/* Publish to YouTube */}
             {finalVideoUrl && !loading && (
               <div className="glass-card" style={{ padding: "18px", border: "1px solid rgba(200, 255, 0, 0.2)", marginTop: "15px" }}>
                 <h3 className="card-title" style={{ fontSize: "18px", display: "flex", gap: "8px", alignItems: "center", color: "var(--accent)", margin: "0 0 10px 0" }}>
-                  <Sparkles size={18} /> Publish to Social Media
+                  <Sparkles size={18} /> Publish to YouTube
                 </h3>
-                <p className="form-label-info" style={{ marginBottom: "15px" }}>
-                  Publish this generated short directly to YouTube Shorts and Instagram Reels.
-                </p>
 
-                <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(300px, 1fr))", gap: "15px", marginBottom: 0 }}>
-                  
-                  {/* YouTube Shorts Section */}
-                  <div style={{ background: "rgba(255,255,255,0.02)", padding: "15px", borderRadius: "8px", border: "1px solid rgba(239, 68, 68, 0.15)" }}>
-                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "12px", borderBottom: "1px solid rgba(255,255,255,0.05)", paddingBottom: "8px" }}>
-                      <label className="checkbox-container" style={{ margin: 0, display: "flex", alignItems: "center", cursor: "pointer" }}>
-                        <input 
-                          type="checkbox" 
-                          checked={uploadPlatforms.youtube}
-                          onChange={(e) => setUploadPlatforms({ ...uploadPlatforms, youtube: e.target.checked })}
-                          style={{ marginRight: "8px" }}
-                        />
-                        <span style={{ fontSize: "15px", fontWeight: 600, color: "var(--danger)" }}>YouTube Shorts</span>
-                      </label>
-                      {isYtAuthenticated ? (
-                        <span style={{ fontSize: "11px", color: "var(--ok)", fontWeight: 700 }}>Connected ✅</span>
-                      ) : (
-                        <button 
-                          onClick={handleInitYoutubeAuth}
-                          className="btn btn-secondary" 
-                          style={{ padding: "4px 8px", fontSize: "11px", width: "auto", margin: 0 }}
-                        >
-                          Authorize
-                        </button>
-                      )}
-                    </div>
-
-                    {uploadPlatforms.youtube ? (
-                      <div>
-                        <div className="form-group" style={{ marginBottom: "10px" }}>
-                          <label className="form-label" style={{ fontSize: "12px", marginBottom: "4px" }}>Shorts Title (Catchy, max 100 chars)</label>
-                          <input 
-                            type="text" 
-                            className="form-input" 
-                            maxLength={100}
-                            value={uploadTitle}
-                            onChange={(e) => setUploadTitle(e.target.value)}
-                            placeholder="E.g. Inside the Quantum Physics Realm! 🧪"
-                          />
-                          <span className="form-label-info" style={{ textAlign: "right", display: "block", fontSize: "10px", marginTop: "2px" }}>{uploadTitle.length}/100</span>
-                        </div>
-
-                        <div className="form-group" style={{ marginBottom: "10px" }}>
-                          <label className="form-label" style={{ fontSize: "12px", marginBottom: "4px" }}>Shorts Description</label>
-                          <textarea 
-                            className="form-textarea" 
-                            rows={3}
-                            value={uploadDescription}
-                            onChange={(e) => setUploadDescription(e.target.value)}
-                            placeholder="Tell viewers what your short is about..."
-                          />
-                        </div>
-
-                        <div className="form-row" style={{ gap: "10px", marginBottom: 0 }}>
-                          <div className="form-group" style={{ flex: 1, margin: 0 }}>
-                            <label className="form-label" style={{ fontSize: "12px", marginBottom: "4px" }}>Tags (comma-separated)</label>
-                            <input 
-                              type="text" 
-                              className="form-input" 
-                              value={uploadTags}
-                              onChange={(e) => setUploadTags(e.target.value)}
-                              placeholder="shorts, science, viral"
-                            />
-                          </div>
-                          <div className="form-group" style={{ width: "110px", margin: 0 }}>
-                            <label className="form-label" style={{ fontSize: "12px", marginBottom: "4px" }}>Privacy</label>
-                            <select 
-                              className="form-select"
-                              value={uploadPrivacy}
-                              onChange={(e) => setUploadPrivacy(e.target.value)}
-                              style={{ height: "38px" }}
-                            >
-                              <option value="private">Private</option>
-                              <option value="unlisted">Unlisted</option>
-                              <option value="public">Public</option>
-                            </select>
-                          </div>
-                        </div>
-
-                        {/* Scheduling UI inside YouTube Section */}
-                        <div style={{ background: "rgba(0,0,0,0.15)", padding: "10px", borderRadius: "6px", margin: "12px 0 10px 0", border: "1px solid rgba(255,255,255,0.03)" }}>
-                          <span style={{ color: "var(--danger)", fontSize: "11px", fontWeight: 600, display: "block", marginBottom: "6px", textTransform: "uppercase" }}>Scheduling</span>
-                          <div style={{ display: "flex", gap: "15px", marginBottom: "6px" }}>
-                            <label style={{ display: "flex", alignItems: "center", cursor: "pointer", margin: 0 }}>
-                              <input 
-                                type="radio" 
-                                name="yt_publish_time_opt"
-                                checked={ytPublishImmediate}
-                                onChange={() => setYtPublishImmediate(true)}
-                                style={{ marginRight: "4px" }}
-                              />
-                              <span style={{ fontSize: "12px", color: "var(--text-secondary)" }}>Immediate</span>
-                            </label>
-
-                            <label style={{ display: "flex", alignItems: "center", cursor: "pointer", margin: 0 }}>
-                              <input 
-                                type="radio" 
-                                name="yt_publish_time_opt"
-                                checked={!ytPublishImmediate}
-                                onChange={() => setYtPublishImmediate(false)}
-                                style={{ marginRight: "4px" }}
-                              />
-                              <span style={{ fontSize: "12px", color: "var(--text-secondary)" }}>Later</span>
-                            </label>
-                          </div>
-
-                          {!ytPublishImmediate && (
-                            <input 
-                              type="datetime-local" 
-                              className="form-input" 
-                              value={ytScheduledTime}
-                              onChange={(e) => setYtScheduledTime(e.target.value)}
-                              style={{ height: "32px", fontSize: "12px", padding: "4px 8px", marginTop: "4px", colorScheme: "dark" }}
-                            />
-                          )}
-                        </div>
-
-                        {/* YouTube Publish Button */}
-                        <button 
-                          onClick={handleYoutubeUpload}
-                          disabled={ytIsUploading}
-                          className="btn btn-primary"
-                          style={{ 
-                            background: "linear-gradient(135deg, var(--danger) 0%, var(--danger) 100%)",
-                            boxShadow: "0 4px 12px rgba(239, 68, 68, 0.2)",
-                            marginTop: "5px",
-                            padding: "8px 12px",
-                            fontSize: "13px",
-                            width: "100%"
-                          }}
-                        >
-                          🚀 {ytIsUploading ? "Uploading..." : (ytPublishImmediate ? "Publish to YouTube Now" : "Schedule to YouTube")}
-                        </button>
-
-                        {/* YouTube logs console */}
-                        {(ytIsUploading || ytUploadLogs.length > 0) && (
-                          <div style={{ marginTop: "12px" }}>
-                            <span className="form-label" style={{ fontSize: "10px", textTransform: "uppercase", display: "block", marginBottom: "4px" }}>YouTube Progress Logs</span>
-                            <div className="log-console" style={{ height: "90px", fontSize: "11px", overflowY: "auto", padding: "6px" }}>
-                              {ytUploadLogs.map((log, i) => (
-                                <div key={i} style={{ color: log.startsWith("❌") ? "var(--danger)" : log.startsWith("✅") || log.includes("successful") ? "var(--ok)" : "var(--text-primary)", marginBottom: "2px" }}>{log}</div>
-                              ))}
-                            </div>
-                          </div>
-                        )}
-                      </div>
-                    ) : (
-                      <p style={{ fontSize: "12px", color: "var(--text-muted)", margin: "10px 0 0 0" }}>Check the box above to enable YouTube Shorts publishing configuration.</p>
-                    )}
-                  </div>
-
-                  {/* Instagram Reels Section */}
-                  <div style={{ background: "rgba(255,255,255,0.02)", padding: "15px", borderRadius: "8px", border: "1px solid rgba(236, 72, 153, 0.15)" }}>
-                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "12px", borderBottom: "1px solid rgba(255,255,255,0.05)", paddingBottom: "8px" }}>
-                      <label className="checkbox-container" style={{ margin: 0, display: "flex", alignItems: "center", cursor: "pointer" }}>
-                        <input 
-                          type="checkbox" 
-                          checked={uploadPlatforms.instagram}
-                          onChange={(e) => setUploadPlatforms({ ...uploadPlatforms, instagram: e.target.checked })}
-                          style={{ marginRight: "8px" }}
-                        />
-                        <span style={{ fontSize: "15px", fontWeight: 600, color: "#f472b6" }}>Instagram Reels</span>
-                      </label>
-                      {isIgConfigured ? (
-                        <span style={{ fontSize: "11px", color: "var(--ok)", fontWeight: 700 }}>Ready ✅</span>
-                      ) : (
-                        <span style={{ fontSize: "11px", color: "var(--warn)", fontWeight: 700 }}>Not Configured ⚠️</span>
-                      )}
-                    </div>
-
-                    {uploadPlatforms.instagram ? (
-                      <div>
-                        <div className="form-group" style={{ marginBottom: "10px" }}>
-                          <label className="form-label" style={{ fontSize: "12px", marginBottom: "4px" }}>Reels Caption & Hashtags</label>
-                          <textarea 
-                            className="form-textarea" 
-                            rows={4}
-                            value={uploadCaption}
-                            onChange={(e) => setUploadCaption(e.target.value)}
-                            placeholder="Write caption... #reels #explore"
-                          />
-                        </div>
-
-                        {/* Scheduling UI inside Instagram Section */}
-                        <div style={{ background: "rgba(0,0,0,0.15)", padding: "10px", borderRadius: "6px", margin: "12px 0 10px 0", border: "1px solid rgba(255,255,255,0.03)" }}>
-                          <span style={{ color: "#f472b6", fontSize: "11px", fontWeight: 600, display: "block", marginBottom: "6px", textTransform: "uppercase" }}>Scheduling</span>
-                          <div style={{ display: "flex", gap: "15px", marginBottom: "6px" }}>
-                            <label style={{ display: "flex", alignItems: "center", cursor: "pointer", margin: 0 }}>
-                              <input 
-                                type="radio" 
-                                name="ig_publish_time_opt"
-                                checked={igPublishImmediate}
-                                onChange={() => setIgPublishImmediate(true)}
-                                style={{ marginRight: "4px" }}
-                              />
-                              <span style={{ fontSize: "12px", color: "var(--text-secondary)" }}>Immediate</span>
-                            </label>
-
-                            <label style={{ display: "flex", alignItems: "center", cursor: "pointer", margin: 0 }}>
-                              <input 
-                                type="radio" 
-                                name="ig_publish_time_opt"
-                                checked={!igPublishImmediate}
-                                onChange={() => setIgPublishImmediate(false)}
-                                style={{ marginRight: "4px" }}
-                              />
-                              <span style={{ fontSize: "12px", color: "var(--text-secondary)" }}>Later</span>
-                            </label>
-                          </div>
-
-                          {!igPublishImmediate && (
-                            <input 
-                              type="datetime-local" 
-                              className="form-input" 
-                              value={igScheduledTime}
-                              onChange={(e) => setIgScheduledTime(e.target.value)}
-                              style={{ height: "32px", fontSize: "12px", padding: "4px 8px", marginTop: "4px", colorScheme: "dark" }}
-                            />
-                          )}
-                        </div>
-
-                        {/* Instagram Publish Button */}
-                        <button 
-                          onClick={handleInstagramUpload}
-                          disabled={igIsUploading}
-                          className="btn btn-primary"
-                          style={{ 
-                            background: "linear-gradient(135deg, #ec4899 0%, #db2777 100%)",
-                            boxShadow: "0 4px 12px rgba(236, 72, 153, 0.2)",
-                            marginTop: "5px",
-                            padding: "8px 12px",
-                            fontSize: "13px",
-                            width: "100%"
-                          }}
-                        >
-                          🚀 {igIsUploading ? "Uploading..." : (igPublishImmediate ? "Publish to Instagram Now" : "Schedule to Instagram")}
-                        </button>
-
-                        {/* Instagram logs console */}
-                        {(igIsUploading || igUploadLogs.length > 0) && (
-                          <div style={{ marginTop: "12px" }}>
-                            <span className="form-label" style={{ fontSize: "10px", textTransform: "uppercase", display: "block", marginBottom: "4px" }}>Instagram Progress Logs</span>
-                            <div className="log-console" style={{ height: "90px", fontSize: "11px", overflowY: "auto", padding: "6px" }}>
-                              {igUploadLogs.map((log, i) => (
-                                <div key={i} style={{ color: log.startsWith("❌") ? "var(--danger)" : log.startsWith("✅") || log.includes("successful") ? "var(--ok)" : "var(--text-primary)", marginBottom: "2px" }}>{log}</div>
-                              ))}
-                            </div>
-                          </div>
-                        )}
-                      </div>
-                    ) : (
-                      <p style={{ fontSize: "12px", color: "var(--text-muted)", margin: "10px 0 0 0" }}>Check the box above to enable Instagram Reels publishing configuration.</p>
-                    )}
-                  </div>
-
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "12px" }}>
+                  <span style={{ fontSize: "12px", color: "var(--text-secondary)" }}>YouTube account</span>
+                  {isYtAuthenticated ? (
+                    <span style={{ fontSize: "11px", color: "var(--ok)", fontWeight: 700 }}>Connected ✅</span>
+                  ) : (
+                    <button
+                      onClick={handleInitYoutubeAuth}
+                      className="btn btn-secondary"
+                      style={{ padding: "4px 8px", fontSize: "11px", width: "auto", margin: 0 }}
+                    >
+                      Authorize
+                    </button>
+                  )}
                 </div>
+
+                <div className="form-group" style={{ marginBottom: "10px" }}>
+                  <label className="form-label" style={{ fontSize: "12px", marginBottom: "4px" }}>Title (max 100 chars)</label>
+                  <input
+                    type="text"
+                    className="form-input"
+                    maxLength={100}
+                    value={uploadTitle}
+                    onChange={(e) => setUploadTitle(e.target.value)}
+                    placeholder="E.g. Inside the Quantum Physics Realm! 🧪"
+                  />
+                  <span className="form-label-info" style={{ textAlign: "right", display: "block", fontSize: "10px", marginTop: "2px" }}>{uploadTitle.length}/100</span>
+                </div>
+
+                <div className="form-group" style={{ marginBottom: "10px" }}>
+                  <label className="form-label" style={{ fontSize: "12px", marginBottom: "4px" }}>Description</label>
+                  <textarea
+                    className="form-textarea"
+                    rows={3}
+                    value={uploadDescription}
+                    onChange={(e) => setUploadDescription(e.target.value)}
+                    placeholder="Tell viewers what your short is about..."
+                  />
+                </div>
+
+                <div className="form-row" style={{ gap: "10px", marginBottom: "14px" }}>
+                  <div className="form-group" style={{ flex: 1, margin: 0 }}>
+                    <label className="form-label" style={{ fontSize: "12px", marginBottom: "4px" }}>Tags (comma-separated)</label>
+                    <input
+                      type="text"
+                      className="form-input"
+                      value={uploadTags}
+                      onChange={(e) => setUploadTags(e.target.value)}
+                      placeholder="shorts, science, viral"
+                    />
+                  </div>
+                  <div className="form-group" style={{ width: "110px", margin: 0 }}>
+                    <label className="form-label" style={{ fontSize: "12px", marginBottom: "4px" }}>Privacy</label>
+                    <select
+                      className="form-select"
+                      value={uploadPrivacy}
+                      onChange={(e) => setUploadPrivacy(e.target.value)}
+                      style={{ height: "38px" }}
+                    >
+                      <option value="private">Private</option>
+                      <option value="unlisted">Unlisted</option>
+                      <option value="public">Public</option>
+                    </select>
+                  </div>
+                </div>
+
+                <button
+                  onClick={handleYoutubeUpload}
+                  disabled={ytIsUploading}
+                  className="btn btn-primary"
+                >
+                  🚀 {ytIsUploading ? "Uploading..." : "Upload to YouTube"}
+                </button>
+
+                {(ytIsUploading || ytUploadLogs.length > 0) && (
+                  <div style={{ marginTop: "12px" }}>
+                    <span className="form-label" style={{ fontSize: "10px", textTransform: "uppercase", display: "block", marginBottom: "4px" }}>Upload Progress</span>
+                    <div className="log-console" style={{ height: "90px", fontSize: "11px", overflowY: "auto", padding: "6px" }}>
+                      {ytUploadLogs.map((log, i) => (
+                        <div key={i} style={{ color: log.startsWith("❌") ? "var(--danger)" : log.startsWith("✅") || log.includes("successful") ? "var(--ok)" : "var(--text-primary)", marginBottom: "2px" }}>{log}</div>
+                      ))}
+                    </div>
+                  </div>
+                )}
               </div>
             )}
 
@@ -2431,7 +1576,7 @@ export default function Home() {
                     <Tv /> Video Library History
                   </h2>
                   <p style={{ color: "var(--text-secondary)", fontSize: "13px", marginTop: "4px" }}>
-                    Browse your database of previously generated video shorts, drafts, and talking head presentations.
+                    Browse your database of previously generated video shorts and drafts.
                   </p>
                 </div>
                 <button onClick={loadHistory} className="btn btn-secondary" style={{ width: "auto", margin: 0, padding: "8px 16px" }}>
@@ -2478,7 +1623,7 @@ export default function Home() {
                           </div>
                         )}
                         
-                        {item.status === "draft" && (
+                        {(item.status === "draft" || (item.status === "failed" && item.storyboard?.length > 0)) && (
                           <div style={{ padding: "12px", background: "rgba(255,255,255,0.02)", borderRadius: "8px", border: "1px dashed rgba(255,255,255,0.05)", margin: "10px 0", textAlign: "center", color: "var(--text-secondary)", fontSize: "12px" }}>
                             📝 Storyboard draft ready for editing.
                           </div>
@@ -2503,8 +1648,7 @@ export default function Home() {
                             setUploadTitle(scriptData.youtube_metadata?.title || item.topic || "");
                             setUploadDescription(scriptData.youtube_metadata?.description || "");
                             setUploadTags(scriptData.youtube_metadata?.tags?.join(", ") || "");
-                            setUploadCaption(scriptData.instagram_metadata?.caption || "");
-                            
+
                             setActiveTab("viral");
                             addLog(`📂 Loaded video generation "${item.topic || "Untitled"}" to publisher.`);
                           }}
@@ -2523,7 +1667,7 @@ export default function Home() {
                         </button>
                       )}
 
-                      {item.status === "draft" && (
+                      {(item.status === "draft" || (item.status === "failed" && item.storyboard?.length > 0)) && (
                         <button
                           onClick={() => {
                             setGenerationId(item.id);
@@ -2576,7 +1720,7 @@ export default function Home() {
                     <Layers /> Social Upload Queue
                   </h2>
                   <p style={{ color: "var(--text-secondary)", fontSize: "13px", marginTop: "4px" }}>
-                    Monitor the background social media uploader, track status, and view execution logs for scheduled posts.
+                    Monitor YouTube upload jobs and view their execution logs.
                   </p>
                 </div>
                 <button onClick={loadUploadQueue} className="btn btn-secondary" style={{ width: "auto", margin: 0, padding: "8px 16px" }}>
@@ -2588,15 +1732,13 @@ export default function Home() {
                 {uploadQueue.length === 0 ? (
                   <div style={{ textAlign: "center", padding: "60px 20px", color: "var(--text-muted)" }}>
                     <Layers style={{ marginBottom: "15px", opacity: 0.3 }} size={48} />
-                    <p style={{ fontSize: "15px", fontWeight: 500 }}>No scheduled upload jobs in queue.</p>
-                    <p style={{ fontSize: "12px", color: "var(--text-muted)", marginTop: "4px" }}>Publish or schedule a video from the publisher panel to start.</p>
+                    <p style={{ fontSize: "15px", fontWeight: 500 }}>No upload jobs in queue.</p>
+                    <p style={{ fontSize: "12px", color: "var(--text-muted)", marginTop: "4px" }}>Upload a video to YouTube from the publisher panel to start.</p>
                   </div>
                 ) : (
                   uploadQueue.map((job) => {
                     const isExpanded = expandedJobId === job.id;
-                    const platformsList = job.platforms || [];
-                    const isScheduled = job.status === "scheduled";
-                    
+
                     return (
                       <div key={job.id} className="queue-item">
                         <div className="queue-item-header">
@@ -2609,21 +1751,11 @@ export default function Home() {
                                 {job.status}
                               </span>
                             </div>
-                            
+
                             <div style={{ display: "flex", gap: "12px", marginTop: "6px", fontSize: "12px", color: "var(--text-secondary)" }}>
-                              <span>
-                                📤 Platforms: {platformsList.map((p: string) => p === "youtube" ? "YouTube Shorts" : "Instagram Reels").join(", ")}
-                              </span>
+                              <span>📤 Platform: YouTube</span>
                               <span>•</span>
-                              <span>
-                                {isScheduled ? (
-                                  <span style={{ color: "var(--warn)", fontWeight: 500 }}>
-                                    🕒 Scheduled for: {new Date(job.scheduled_time).toLocaleString()}
-                                  </span>
-                                ) : (
-                                  <span>Created: {new Date(job.created_at).toLocaleString()}</span>
-                                )}
-                              </span>
+                              <span>Created: {new Date(job.created_at).toLocaleString()}</span>
                             </div>
                           </div>
 
@@ -2669,585 +1801,6 @@ export default function Home() {
             </div>
           )}
 
-          {activeTab === "scheduler" && (
-            <div className="glass-card" style={{ padding: "24px" }}>
-              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", borderBottom: "1px solid rgba(255,255,255,0.08)", paddingBottom: "15px", marginBottom: "20px" }}>
-                <div>
-                  <h2 className="card-title" style={{ margin: 0, display: "flex", alignItems: "center", gap: "8px" }}>
-                    🤖 Daily Auto-Agent Scheduler
-                  </h2>
-                  <p style={{ color: "var(--text-secondary)", fontSize: "13px", marginTop: "4px" }}>
-                    Configure the autonomous scheduler agent to dynamically find trends, compose custom music, render videos, and post on YouTube.
-                  </p>
-                </div>
-                <button onClick={loadSchedulerData} className="btn btn-secondary" style={{ width: "auto", margin: 0, padding: "8px 16px" }}>
-                  <RefreshCw size={14} /> Refresh
-                </button>
-              </div>
-
-              {schedulerConfig ? (
-                <div className="scheduler-layout" style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "24px" }}>
-                  {/* Left Side: Settings */}
-                  <div style={{ display: "flex", flexDirection: "column", gap: "16px", background: "rgba(255,255,255,0.02)", padding: "20px", borderRadius: "12px", border: "1px solid rgba(255,255,255,0.05)" }}>
-                    <h3 style={{ margin: "0 0 10px 0", color: "var(--text-primary)", fontSize: "16px", display: "flex", alignItems: "center", gap: "8px" }}>
-                      ⚙️ Scheduler Settings
-                    </h3>
-                    
-                    {/* Enable Toggle */}
-                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", background: "rgba(200, 255, 0, 0.05)", border: "1px solid rgba(200, 255, 0, 0.2)", padding: "12px 16px", borderRadius: "8px" }}>
-                      <div>
-                        <div style={{ fontWeight: 600, color: "var(--text-primary)", fontSize: "14px" }}>Enable Automatic Posting</div>
-                        <div style={{ fontSize: "12px", color: "var(--accent)" }}>
-                          Autonomously publish {2 * (schedulerConfig.videos_per_run || 1)} videos daily
-                          {" "}({schedulerConfig.videos_per_run || 1} per slot × 2 slots)
-                        </div>
-                      </div>
-                      <input 
-                        type="checkbox" 
-                        checked={schedulerConfig.enabled} 
-                        onChange={(e) => {
-                          const updated = { ...schedulerConfig, enabled: e.target.checked };
-                          saveSchedulerConfig(updated);
-                        }}
-                        style={{ width: "20px", height: "20px", cursor: "pointer", accentColor: "var(--accent)" }}
-                      />
-                    </div>
-
-                    <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "12px" }}>
-                      {/* Topic Source */}
-                      <div className="form-group">
-                        <label className="form-label">Topic Source</label>
-                        <select
-                          value={schedulerConfig.topic_source || "trends"}
-                          onChange={(e) => {
-                            const updated = { ...schedulerConfig, topic_source: e.target.value };
-                            saveSchedulerConfig(updated);
-                          }}
-                          className="form-input"
-                        >
-                          <option value="trends">🔥 Live Google Trends</option>
-                          <option value="curiosity">💡 Curiosity Topics (curated)</option>
-                          <option value="mixed">🔀 Mixed (blend both)</option>
-                        </select>
-                        <p className="form-label-info">
-                          {(schedulerConfig.topic_source || "trends") === "trends"
-                            ? "Picks the best safe topic from live trends."
-                            : (schedulerConfig.topic_source === "curiosity")
-                            ? "Pulls evergreen curiosity-gap topics; the hook is fed in as script context."
-                            : "Alternates randomly between live trends and curiosity topics."}
-                        </p>
-                      </div>
-
-                      {/* Curiosity Category (only relevant when curiosity topics are in play) */}
-                      {(schedulerConfig.topic_source === "curiosity" || schedulerConfig.topic_source === "mixed") && (
-                        <div className="form-group">
-                          <label className="form-label">Curiosity Category</label>
-                          <select
-                            value={schedulerConfig.curiosity_category || "All"}
-                            onChange={(e) => {
-                              const updated = { ...schedulerConfig, curiosity_category: e.target.value };
-                              saveSchedulerConfig(updated);
-                            }}
-                            className="form-input"
-                          >
-                            {curiosityCatOptions.map((cat) => (
-                              <option key={cat} value={cat}>{cat === "All" ? "All categories" : cat}</option>
-                            ))}
-                          </select>
-                          <p className="form-label-info">Keep runs on-theme for a niche channel.</p>
-                        </div>
-                      )}
-
-                      {/* Region */}
-                      <div className="form-group">
-                        <label className="form-label">Trending Region</label>
-                        <select
-                          value={schedulerConfig.region}
-                          onChange={(e) => {
-                            const updated = { ...schedulerConfig, region: e.target.value };
-                            saveSchedulerConfig(updated);
-                          }}
-                          className="form-input"
-                        >
-                          <option value="US">United States (US)</option>
-                          <option value="IN">India (IN)</option>
-                          <option value="GB">United Kingdom (GB)</option>
-                          <option value="CA">Canada (CA)</option>
-                          <option value="AU">Australia (AU)</option>
-                        </select>
-                        <p className="form-label-info">Used by the trends source.</p>
-                      </div>
-
-                      {/* YouTube Default Privacy */}
-                      <div className="form-group">
-                        <label className="form-label">YouTube Upload Privacy</label>
-                        <select 
-                          value={schedulerConfig.privacy}
-                          onChange={(e) => {
-                            const updated = { ...schedulerConfig, privacy: e.target.value };
-                            saveSchedulerConfig(updated);
-                          }}
-                          className="form-input"
-                        >
-                          <option value="private">Private (Recommended)</option>
-                          <option value="unlisted">Unlisted</option>
-                          <option value="public">Public (Immediate Post)</option>
-                        </select>
-                      </div>
-
-                      {/* Videos per run (each a different topic) */}
-                      <div className="form-group">
-                        <label className="form-label">Videos Per Run</label>
-                        <select
-                          value={schedulerConfig.videos_per_run || 1}
-                          onChange={(e) => {
-                            const updated = { ...schedulerConfig, videos_per_run: parseInt(e.target.value) };
-                            saveSchedulerConfig(updated);
-                          }}
-                          className="form-input"
-                        >
-                          {[1, 2, 3, 4, 5, 6, 8, 10].map((n) => (
-                            <option key={n} value={n}>{n} video{n > 1 ? "s" : ""} (different topics)</option>
-                          ))}
-                        </select>
-                        <div className="form-label-info">
-                          Each run generates this many videos, every one on a distinct trending topic.
-                        </div>
-                      </div>
-                    </div>
-
-                    {/* Subscribe / channel growth */}
-                    <div className="form-group" style={{ borderTop: "1px solid rgba(255,255,255,0.06)", paddingTop: "14px" }}>
-                      <label className="checkbox-container" style={{ marginBottom: "12px" }}>
-                        <input
-                          type="checkbox"
-                          checked={schedulerConfig.subscribe_overlay !== false}
-                          onChange={(e) => saveSchedulerConfig({ ...schedulerConfig, subscribe_overlay: e.target.checked })}
-                        />
-                        <span className="checkbox-custom"></span>
-                        <span style={{ fontSize: "14px", color: "var(--text-secondary)" }}>Show animated SUBSCRIBE button at the end of each video</span>
-                      </label>
-                      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "12px" }}>
-                        <div>
-                          <label className="form-label">Channel Handle (shown on screen)</label>
-                          <input
-                            type="text"
-                            value={schedulerConfig.channel_handle || ""}
-                            placeholder="@yourchannel"
-                            onChange={(e) => setSchedulerConfig({ ...schedulerConfig, channel_handle: e.target.value })}
-                            onBlur={(e) => saveSchedulerConfig({ ...schedulerConfig, channel_handle: e.target.value })}
-                            className="form-input"
-                          />
-                        </div>
-                        <div>
-                          <label className="form-label">Channel URL (in description)</label>
-                          <input
-                            type="text"
-                            value={schedulerConfig.youtube_channel_url || ""}
-                            placeholder="https://youtube.com/@yourchannel?sub_confirmation=1"
-                            onChange={(e) => setSchedulerConfig({ ...schedulerConfig, youtube_channel_url: e.target.value })}
-                            onBlur={(e) => saveSchedulerConfig({ ...schedulerConfig, youtube_channel_url: e.target.value })}
-                            className="form-input"
-                          />
-                        </div>
-                      </div>
-                    </div>
-
-                    <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "12px" }}>
-                      {/* Time Slot 1 */}
-                      <div className="form-group">
-                        <label className="form-label">Slot 1 Run Time</label>
-                        <input 
-                          type="time" 
-                          value={schedulerConfig.time1}
-                          onChange={(e) => {
-                            const updated = { ...schedulerConfig, time1: e.target.value };
-                            saveSchedulerConfig(updated);
-                          }}
-                          className="form-input"
-                        />
-                      </div>
-
-                      {/* Time Slot 2 */}
-                      <div className="form-group">
-                        <label className="form-label">Slot 2 Run Time</label>
-                        <input 
-                          type="time" 
-                          value={schedulerConfig.time2}
-                          onChange={(e) => {
-                            const updated = { ...schedulerConfig, time2: e.target.value };
-                            saveSchedulerConfig(updated);
-                          }}
-                          className="form-input"
-                        />
-                      </div>
-                    </div>
-
-                    <div className="form-group">
-                      <label className="form-label">Ollama Model (Script/Topic Evaluation)</label>
-                      <select 
-                        value={schedulerConfig.model}
-                        onChange={(e) => {
-                          const updated = { ...schedulerConfig, model: e.target.value };
-                          saveSchedulerConfig(updated);
-                        }}
-                        className="form-input"
-                      >
-                        {config?.ollama_models.map((m: string) => (
-                          <option key={m} value={m}>{m}</option>
-                        ))}
-                      </select>
-                    </div>
-
-                    <div className="form-group">
-                      <label className="form-label">Image Provider</label>
-                      <select
-                        value={schedulerConfig.image_provider || "local"}
-                        onChange={(e) => {
-                          const updated = { ...schedulerConfig, image_provider: e.target.value };
-                          saveSchedulerConfig(updated);
-                        }}
-                        className="form-input"
-                      >
-                        <option value="local">Local (on-device SD · M4 GPU · free)</option>
-                        <option value="pollinations">Pollinations (free hosted · no key)</option>
-                        <option value="leonardo">Leonardo (cloud · needs API tokens)</option>
-                      </select>
-                      <div className="form-label-info">
-                        {(schedulerConfig.image_provider || "local") === "local"
-                          ? "Requires the local SD server running (python sd_server.py)."
-                          : (schedulerConfig.image_provider === "leonardo"
-                            ? "Uses your Leonardo API credits."
-                            : "No setup needed; images generated by a free hosted endpoint.")}
-                      </div>
-                    </div>
-
-                    {(schedulerConfig.image_provider || "local") === "leonardo" && (
-                      <div className="form-group">
-                        <label className="form-label">Leonardo Model (Image Synthesis)</label>
-                        <select
-                          value={schedulerConfig.leonardo_model}
-                          onChange={(e) => {
-                            const updated = { ...schedulerConfig, leonardo_model: e.target.value };
-                            saveSchedulerConfig(updated);
-                          }}
-                          className="form-input"
-                        >
-                          {config?.leonardo_models.map((m: string) => (
-                            <option key={m} value={m}>{m}</option>
-                          ))}
-                        </select>
-                      </div>
-                    )}
-
-                    <div className="form-group">
-                      <label className="form-label">Default Voice Actor</label>
-                      <select 
-                        value={schedulerConfig.voice}
-                        onChange={(e) => {
-                          const updated = { ...schedulerConfig, voice: e.target.value };
-                          saveSchedulerConfig(updated);
-                        }}
-                        className="form-input"
-                      >
-                        {config?.voices.map((v: string) => (
-                          <option key={v} value={v}>{v}</option>
-                        ))}
-                      </select>
-                    </div>
-
-                    {/* Subtitle Settings */}
-                    <div style={{ borderTop: "1px solid rgba(255,255,255,0.08)", paddingTop: "16px", marginTop: "8px" }}>
-                      <h4 style={{ margin: "0 0 12px 0", color: "var(--text-primary)", fontSize: "14px", fontWeight: 600 }}>
-                        📝 Subtitle Customization
-                      </h4>
-                      
-                      <div style={{ display: "flex", flexDirection: "column", gap: "12px" }}>
-                        {/* Enable Subtitles Checkbox */}
-                        <label className="checkbox-container" style={{ margin: 0 }}>
-                          <input 
-                            type="checkbox" 
-                            checked={schedulerConfig.enable_captions}
-                            onChange={(e) => {
-                              const updated = { ...schedulerConfig, enable_captions: e.target.checked };
-                              saveSchedulerConfig(updated);
-                            }}
-                          />
-                          <div className="checkbox-custom"></div>
-                          <span style={{ fontSize: "13px", fontWeight: 600 }}>Burn Centered Subtitles</span>
-                        </label>
-
-                        {/* Font and Style Selector */}
-                        {schedulerConfig.enable_captions && (
-                          <>
-                            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "12px" }}>
-                              <div className="form-group" style={{ margin: 0 }}>
-                                <label className="form-label" style={{ fontSize: "12px" }}>Font Family</label>
-                                <select 
-                                  value={schedulerConfig.caption_font}
-                                  onChange={(e) => {
-                                    const updated = { ...schedulerConfig, caption_font: e.target.value };
-                                    saveSchedulerConfig(updated);
-                                  }}
-                                  className="form-input"
-                                  style={{ padding: "6px 10px", fontSize: "12px" }}
-                                >
-                                  <option value="Arial">Arial</option>
-                                  <option value="Impact">Impact</option>
-                                  <option value="Trebuchet MS">Trebuchet MS</option>
-                                  <option value="Verdana">Verdana</option>
-                                </select>
-                              </div>
-
-                              <div className="form-group" style={{ margin: 0 }}>
-                                <label className="form-label" style={{ fontSize: "12px" }}>Highlight Style</label>
-                                <select 
-                                  value={schedulerConfig.caption_style}
-                                  onChange={(e) => {
-                                    const updated = { ...schedulerConfig, caption_style: e.target.value };
-                                    saveSchedulerConfig(updated);
-                                  }}
-                                  className="form-input"
-                                  style={{ padding: "6px 10px", fontSize: "12px" }}
-                                >
-                                  <option value="Viral Pop">Viral Pop (Pops + Color Highlights)</option>
-                                  <option value="Soft Pill">Soft Pill (Rounded Plate + Highlights)</option>
-                                  <option value="Standard">Standard Bottom Text</option>
-                                </select>
-                              </div>
-                            </div>
-
-                            {/* Size Slider */}
-                            <div className="form-group" style={{ margin: 0 }}>
-                              <label className="form-label" style={{ display: "flex", justifyContent: "space-between", marginBottom: "4px", fontSize: "12px" }}>
-                                <span>Font Size</span>
-                                <span style={{ color: "var(--accent)", fontWeight: 600 }}>{schedulerConfig.caption_size}px</span>
-                              </label>
-                              <div className="slider-group" style={{ gap: "8px" }}>
-                                <input 
-                                  type="range" 
-                                  min="24" 
-                                  max="120" 
-                                  value={schedulerConfig.caption_size} 
-                                  onChange={(e) => {
-                                    const updated = { ...schedulerConfig, caption_size: parseInt(e.target.value) };
-                                    saveSchedulerConfig(updated);
-                                  }}
-                                  style={{ flexGrow: 1, padding: 0, height: "4px", background: "rgba(255,255,255,0.1)", borderRadius: "2px", cursor: "pointer" }}
-                                />
-                              </div>
-                            </div>
-
-                            {/* Margin Slider */}
-                            <div className="form-group" style={{ margin: 0 }}>
-                              <label className="form-label" style={{ display: "flex", justifyContent: "space-between", marginBottom: "4px", fontSize: "12px" }}>
-                                <span>Vertical Margin</span>
-                                <span style={{ color: "var(--accent)", fontWeight: 600 }}>{schedulerConfig.caption_margin_v}px</span>
-                              </label>
-                              <div className="slider-group" style={{ gap: "8px" }}>
-                                <input 
-                                  type="range" 
-                                  min="50" 
-                                  max="800" 
-                                  value={schedulerConfig.caption_margin_v} 
-                                  onChange={(e) => {
-                                    const updated = { ...schedulerConfig, caption_margin_v: parseInt(e.target.value) };
-                                    saveSchedulerConfig(updated);
-                                  }}
-                                  style={{ flexGrow: 1, padding: 0, height: "4px", background: "rgba(255,255,255,0.1)", borderRadius: "2px", cursor: "pointer" }}
-                                />
-                              </div>
-                            </div>
-
-                            {/* Highlight Color */}
-                            <div className="form-group" style={{ margin: 0 }}>
-                              <label className="form-label" style={{ marginBottom: "6px", fontSize: "12px" }}>Highlight Accent Color</label>
-                              <div style={{ display: "flex", gap: "6px", flexWrap: "wrap" }}>
-                                {COLOR_PRESETS.map((preset) => {
-                                  const isSelected = schedulerConfig.caption_color === preset.ass;
-                                  return (
-                                    <button
-                                      key={preset.name}
-                                      type="button"
-                                      onClick={() => {
-                                        const updated = { ...schedulerConfig, caption_color: preset.ass };
-                                        saveSchedulerConfig(updated);
-                                      }}
-                                      style={{
-                                        display: "flex",
-                                        alignItems: "center",
-                                        gap: "4px",
-                                        background: isSelected ? "rgba(200, 255, 0, 0.25)" : "rgba(255,255,255,0.03)",
-                                        border: `1px solid ${isSelected ? "var(--accent)" : "rgba(255,255,255,0.08)"}`,
-                                        borderRadius: "16px",
-                                        padding: "4px 8px",
-                                        cursor: "pointer",
-                                        color: isSelected ? "var(--text-primary)" : "var(--text-secondary)",
-                                        fontSize: "11px",
-                                        fontWeight: 600,
-                                        transition: "all 0.2s ease"
-                                      }}
-                                    >
-                                      <span style={{
-                                        width: "8px",
-                                        height: "8px",
-                                        borderRadius: "50%",
-                                        backgroundColor: preset.hex,
-                                        display: "inline-block"
-                                      }} />
-                                      {preset.name}
-                                    </button>
-                                  );
-                                })}
-                              </div>
-                            </div>
-                          </>
-                        )}
-                      </div>
-                    </div>
-
-                    <div style={{ marginTop: "10px" }}>
-                      <button
-                        onClick={triggerSchedulerAgent}
-                        disabled={triggerLoading}
-                        className="btn btn-secondary"
-                        style={{
-                          width: "100%",
-                          background: "linear-gradient(135deg, var(--accent) 0%, var(--accent-press) 100%)",
-                          border: "none",
-                          color: "var(--accent-ink)",
-                          fontWeight: 600,
-                          padding: "10px 0"
-                        }}
-                      >
-                        {triggerLoading ? "⏳ Agent running… generating video" : "🔥 Trigger Agent Run Now"}
-                      </button>
-                    </div>
-                  </div>
-
-                  {/* Right Side: Logs & Execution History */}
-                  <div style={{ display: "flex", flexDirection: "column", gap: "16px" }}>
-                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-                      <h3 style={{ margin: 0, color: "var(--text-primary)", fontSize: "16px" }}>
-                        📜 Scheduler Execution Logs
-                      </h3>
-                      {schedulerLogs.length > 0 && (
-                        <button
-                          onClick={handleClearSchedulerLogs}
-                          style={{
-                            background: "rgba(239, 68, 68, 0.1)",
-                            border: "1px solid rgba(239, 68, 68, 0.2)",
-                            color: "var(--danger)",
-                            borderRadius: "6px",
-                            padding: "4px 10px",
-                            fontSize: "11px",
-                            fontWeight: 600,
-                            cursor: "pointer",
-                            transition: "all 0.2s"
-                          }}
-                          onMouseEnter={(e) => {
-                            e.currentTarget.style.background = "rgba(239, 68, 68, 0.2)";
-                          }}
-                          onMouseLeave={(e) => {
-                            e.currentTarget.style.background = "rgba(239, 68, 68, 0.1)";
-                          }}
-                        >
-                          🗑️ Clear Logs
-                        </button>
-                      )}
-                    </div>
-                    
-                    <div style={{ 
-                      maxHeight: "530px", 
-                      overflowY: "auto", 
-                      display: "flex", 
-                      flexDirection: "column", 
-                      gap: "12px",
-                      paddingRight: "6px"
-                    }}>
-                      {schedulerLogs.length === 0 ? (
-                        <div style={{ textAlign: "center", padding: "40px", color: "var(--text-muted)" }}>
-                          No execution logs found. Trigger a run or wait for the scheduler to execute.
-                        </div>
-                      ) : (
-                        schedulerLogs.map((log: any, lIdx: number) => (
-                          <div key={log.id || lIdx} style={{ 
-                            background: "rgba(255,255,255,0.02)", 
-                            border: `1px solid ${log.status === "success" ? "rgba(16, 185, 129, 0.15)" : log.status === "failed" ? "rgba(239, 68, 68, 0.15)" : "rgba(200, 255, 0, 0.15)"}`, 
-                            borderRadius: "8px", 
-                            padding: "12px" 
-                          }}>
-                            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "8px" }}>
-                              <span style={{ 
-                                fontSize: "11px", 
-                                fontWeight: 700, 
-                                textTransform: "uppercase", 
-                                padding: "2px 6px", 
-                                borderRadius: "4px",
-                                background: log.status === "success" ? "rgba(16, 185, 129, 0.1)" : log.status === "failed" ? "rgba(239, 68, 68, 0.1)" : "rgba(200, 255, 0, 0.1)",
-                                color: log.status === "success" ? "var(--ok)" : log.status === "failed" ? "var(--danger)" : "var(--accent)"
-                              }}>
-                                {log.status}
-                              </span>
-                              <span style={{ fontSize: "11px", color: "var(--text-muted)" }}>
-                                {new Date(log.timestamp).toLocaleString()}
-                              </span>
-                            </div>
-                            
-                            <div style={{ fontWeight: 600, color: "var(--text-primary)", fontSize: "13px", marginBottom: "4px" }}>
-                              📌 {log.topic}
-                            </div>
-                            <div style={{ fontSize: "11px", color: "var(--text-secondary)", marginBottom: "8px" }}>
-                              🕒 Slot: {log.slot}
-                            </div>
-                            
-                            {/* Expandable step-by-step logs */}
-                            <details style={{ cursor: "pointer" }}>
-                              <summary style={{ fontSize: "11px", color: "var(--accent)", outline: "none", fontWeight: 500 }}>
-                                View Detailed Steps
-                              </summary>
-                              <div style={{ 
-                                background: "var(--bg-2)", 
-                                border: "1px solid rgba(255,255,255,0.05)", 
-                                borderRadius: "6px", 
-                                padding: "8px 12px", 
-                                marginTop: "8px",
-                                fontFamily: "monospace",
-                                fontSize: "11px",
-                                color: "var(--ok)",
-                                overflowX: "auto",
-                                maxHeight: "150px",
-                                whiteSpace: "pre-wrap"
-                              }}>
-                                {log.logs?.join("\n")}
-                              </div>
-                            </details>
-
-                            {log.youtube_id && (
-                              <div style={{ marginTop: "10px", fontSize: "12px" }}>
-                                <a 
-                                  href={`https://youtu.be/${log.youtube_id}`}
-                                  target="_blank" 
-                                  rel="noopener noreferrer" 
-                                  style={{ color: "#ec4899", fontWeight: 600, textDecoration: "none", display: "inline-flex", alignItems: "center", gap: "4px" }}
-                                >
-                                  📺 Watch on YouTube ↗
-                                </a>
-                              </div>
-                            )}
-                          </div>
-                        ))
-                      )}
-                    </div>
-                  </div>
-                </div>
-              ) : (
-                <div style={{ textAlign: "center", padding: "40px", color: "var(--text-muted)" }}>
-                  Loading scheduler configuration...
-                </div>
-              )}
-            </div>
-          )}
         </div>
       )}
 
@@ -3316,7 +1869,9 @@ export default function Home() {
                     
                     {/* Left Column: Visual Asset */}
                     <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: "10px" }}>
-                      {scene.image_url ? (
+                      {scene.clip_url ? (
+                        <video src={scene.clip_url} controls style={{ width: "100%", maxHeight: "240px" }} />
+                      ) : scene.image_url ? (
                         <img
                           src={scene.image_url}
                           alt={`Scene ${idx + 1}`}

@@ -22,7 +22,22 @@ fi
 
 if [[ ! -d frontend/node_modules ]]; then
   echo "Installing frontend dependencies..."
-  (cd frontend && npm install)
+  (cd frontend && npm ci)
+fi
+
+# --- Rotate the backend log before each run ----------------------------------
+# Previously unbounded: a long-lived local backend just kept appending to
+# backend_stdout.log forever. Rotating at startup (rather than continuously,
+# which would mean reopening a live process's stdout mid-write) covers the
+# common case for a personal dev app that gets restarted regularly.
+BACKEND_LOG="backend_stdout.log"
+BACKEND_LOG_MAX_BYTES=$((10 * 1024 * 1024))
+if [[ -f "$BACKEND_LOG" ]]; then
+  size=$(wc -c < "$BACKEND_LOG" 2>/dev/null || echo 0)
+  if (( size > BACKEND_LOG_MAX_BYTES )); then
+    [[ -f "${BACKEND_LOG}.1" ]] && mv -f "${BACKEND_LOG}.1" "${BACKEND_LOG}.2"
+    mv -f "$BACKEND_LOG" "${BACKEND_LOG}.1"
+  fi
 fi
 
 # --- Clean up both processes on exit ----------------------------------------
@@ -38,8 +53,10 @@ cleanup() {
 trap cleanup INT TERM EXIT
 
 # --- Start backend -----------------------------------------------------------
+# Process substitution (not a pipe) so $! below still captures backend.py's
+# own PID for the liveness check / cleanup trap, not tee's.
 echo "Starting backend  -> http://localhost:8000"
-"$PYTHON" backend.py &
+"$PYTHON" backend.py > >(tee -a "$BACKEND_LOG") 2>&1 &
 pids+=($!)
 
 # --- Start frontend ----------------------------------------------------------

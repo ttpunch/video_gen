@@ -9,8 +9,9 @@ import hashlib
 import subprocess
 import soundfile as sf
 import shutil
-import threading
+import asyncio
 from datetime import datetime
+from contextlib import asynccontextmanager
 from typing import Optional, List
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
@@ -24,6 +25,8 @@ load_dotenv()
 # Custom imports for search and uploads
 import db_manager
 import cost_tracker
+import job_queue
+from asset_state import prepare_storyboard
 import image_providers
 import video_quality as vq
 from hailuo import generate_hailuo_video
@@ -31,24 +34,101 @@ from reliability import retry_call, RetryError
 from notifier import notify
 import script_utils
 import stock_footage
+import llm_client
 from script_utils import build_storyboard_from_story, normalize_scene_count
-from script_validator import validate_script, autofix, ART_STYLE_PRESETS
+from script_validator import validate_script, autofix, mechanically_fix_hard_issues, ART_STYLE_PRESETS
 from search_helper import get_web_grounding_context, clean_json_response
 from uploader_youtube import upload_video_to_youtube, is_youtube_authenticated, trigger_youtube_auth_flow_url
-from uploader_instagram import upload_reel_to_instagram, is_instagram_configured
 
 # Global in-memory storage for upload job logs
 upload_jobs = {}
 
 LEONARDO_API_KEY = os.getenv("LEONARDO_API_KEY")
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
+# Measured on this app's actual prompts: the largest realistic call (storyboard
+# generation with full history/grounding context) is ~1000 tokens in, under
+# 700 out -- comfortably inside 4096 with 2x headroom. Ollama's model default
+# is 32768, which on a 16GB Mac allocates a KV cache far bigger than this app
+# ever uses: measured directly, capping it here took one model's resident size
+# from 6.4GB to 4.7GB and its reload time from 4.1s to 0.8s (5x), which matters
+# because keep_alive's default 5-minute idle timeout means a multi-stage
+# pipeline (script, storyboard, topic generation, web grounding) pays that
+# reload tax repeatedly whenever stages are spaced further apart than that by
+# image/TTS/render work. keep_alive is extended here to outlast a full render.
+OLLAMA_NUM_CTX = int(os.getenv("OLLAMA_NUM_CTX", "4096"))
+OLLAMA_KEEP_ALIVE = os.getenv("OLLAMA_KEEP_ALIVE", "30m")
 
-app = FastAPI(title="AI Video Presenter Backend", version="1.0.0")
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "http://localhost:8000").rstrip("/")
+TEMP_DIR = "temp"
+TEMP_FILE_MAX_AGE_HOURS = 48
+
+
+def _temp_paths_still_in_use() -> Optional[set]:
+    """Preserve every saved scene's assets, including failed renders that can
+    resume and completed videos that can be edited. Only unreferenced files age
+    out; generation deletion handles owned scene assets explicitly.
+    """
+    referenced = set()
+    try:
+        for gen in db_manager.list_video_generations():
+            for scene in (gen.get("storyboard") or []):
+                for key in ("image_path", "audio_path", "clip_path"):
+                    p = scene.get(key)
+                    if p:
+                        referenced.add(os.path.abspath(p))
+    except Exception as e:
+        print(f"Temp cleanup: could not read in-progress generations ({e}); skipping this run to be safe.")
+        return None
+    return referenced
+
+
+def cleanup_stale_temp_files(max_age_hours: float = TEMP_FILE_MAX_AGE_HOURS) -> int:
+    """Delete temp/ files older than max_age_hours, except ones a draft or
+    in-progress render still references. Orphaned video_list/audio_list/
+    merged_*/scene_*/voice_raw_* files from failed or abandoned runs
+    otherwise accumulate in temp/ forever. Runs on startup and after each
+    successful render."""
+    if not os.path.isdir(TEMP_DIR):
+        return 0
+    referenced = _temp_paths_still_in_use()
+    if referenced is None:
+        return 0
+
+    cutoff = time.time() - max_age_hours * 3600
+    deleted = 0
+    for name in os.listdir(TEMP_DIR):
+        path = os.path.abspath(os.path.join(TEMP_DIR, name))
+        if path in referenced or not os.path.isfile(path):
+            continue
+        try:
+            if os.path.getmtime(path) < cutoff:
+                os.remove(path)
+                deleted += 1
+        except OSError as e:
+            print(f"Temp cleanup: could not remove {path}: {e}")
+    if deleted:
+        print(f"Temp cleanup: removed {deleted} stale file(s) older than {max_age_hours:.0f}h from {TEMP_DIR}/.")
+    return deleted
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    try:
+        cleanup_stale_temp_files()
+    except Exception as e:
+        print(f"Startup temp cleanup failed (non-fatal): {e}")
+    job_queue.recover_interrupted()
+    worker = asyncio.create_task(asyncio.to_thread(drain_jobs))
+    yield
+    await worker
+
+
+app = FastAPI(title="AI Video Presenter Backend", version="1.0.0", lifespan=lifespan)
 
 # Enable CORS for Next.js app
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], # In development, allow all origins
+    allow_origins=os.getenv("CORS_ORIGINS", "http://localhost:3000,http://127.0.0.1:3000").split(","),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -115,14 +195,20 @@ SATISFYING_PRESETS = {
     "Satisfying Liquid": "https://images.pexels.com/video-files/8564860/8564860-sd_540_960_30fps.mp4"
 }
 
+# The two entries marked NEW fill formulas that 2026 short-form research names
+# as the highest and second-highest performing hook types, not covered by the
+# original five (which cluster around one "did you know / secrets" register).
 VIRAL_HOOKS = {
     "None (Direct Prompt)": "",
     "Did You Know? (Fact Hook)": "Start the script with a mind-blowing 'Did you know...' hook in Scene 1 to grab immediate attention.",
     "3 Shocking Secrets": "Frame the script around '3 shocking secrets they don't want you to know', starting with a high-intensity hook in Scene 1.",
     "I Was Today Years Old": "Start the script with 'I was today years old when I found out this mind-blowing truth...' in Scene 1.",
     "This Changes Everything": "Start with 'This insane discovery changes everything we thought we knew about history...' in Scene 1.",
-    "Banned Facts": "Start with 'These are the banned facts they tried to hide from us...' in Scene 1."
+    "Banned Facts": "Start with 'These are the banned facts they tried to hide from us...' in Scene 1.",
+    "Contrarian Claim (NEW)": "Open by stating the thing most people believe about the topic, then flatly contradict it in the same breath (e.g. 'Everyone thinks X. They're wrong.'). No hedging.",
+    "Mistake Warning (NEW)": "Open by naming a specific, common mistake almost everyone makes related to the topic, framed as a direct warning to the viewer (e.g. 'You've been doing X wrong your whole life.').",
 }
+
 
 # Helpers
 def download_file(url, folder, prefix):
@@ -137,7 +223,7 @@ def download_file(url, folder, prefix):
         ext = url.split('.')[-1].split('?')[0]
         if len(ext) > 4 or not ext.isalnum():
             ext = "mp4"
-        out_path = os.path.abspath(os.path.join(folder, f"{prefix}_{int(time.time())}.{ext}"))
+        out_path = os.path.abspath(os.path.join(folder, f"{prefix}_{uuid.uuid4().hex}.{ext}"))
         response = requests.get(url, headers=headers, stream=True, timeout=45)
         if response.status_code == 200:
             with open(out_path, 'wb') as f:
@@ -225,7 +311,7 @@ def mix_transition_sfx(main_audio_path, output_audio_path, transition_times):
     ]
     
     try:
-        subprocess.run(ffmpeg_cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        vq.run_ffmpeg(ffmpeg_cmd, label="transition SFX mix")
     except Exception as e:
         print(f"Error mixing transition SFX: {e}")
         shutil.copy(main_audio_path, output_audio_path)
@@ -328,68 +414,144 @@ def generate_ass_subtitles(storyboard, output_path, font_name="Arial", font_size
     return True
 
 # Core Pipeline Functions
-def generate_ollama_script(prompt: str, model: str, hook_style: str = "None (Direct Prompt)", enable_search: bool = False, art_style: str = "Photorealistic"):
-    url = f"{OLLAMA_HOST}/api/generate"
-    
+#: Word-count targets per bucket, calibrated against the app's existing 15-20s
+#: baseline (65-85 words there implies ~4.3 spoken words/sec at this TTS voice
+#: speed). "Standard" is the new default: 2026 short-form research puts peak
+#: retention for most niches at 25-35s, not the 15-20s this app previously
+#: hardcoded everywhere.
+DURATION_PRESETS = {
+    "Quick (15-20s)": (65, 85, "15-20"),
+    "Standard (25-35s)": (110, 145, "25-35"),
+}
+DEFAULT_DURATION_PRESET = "Standard (25-35s)"
+
+
+def generate_ollama_script(prompt: str, model: str, hook_style: str = "None (Direct Prompt)",
+                           enable_search: bool = False, art_style: str = "Photorealistic",
+                           duration_preset: str = DEFAULT_DURATION_PRESET, log_callback=None):
+    _log = log_callback or print
     hook_instruction = VIRAL_HOOKS.get(hook_style, "")
-    
+
     # 1. Handle dynamic web search fact checking
     grounding_info = ""
     if enable_search:
+        _log("Searching the web for facts to ground the script...")
         try:
             grounding_data = get_web_grounding_context(prompt, model)
             if grounding_data.get("requires_search") and grounding_data.get("context"):
                 grounding_info = f"\nVERIFIED INTERNET SEARCH FACTS:\n{grounding_data['context']}\n"
-                print(f"RAG Grounding: Query used: '{grounding_data['search_query']}'. Injected search context successfully.")
+                _log(f"RAG Grounding: Query used: '{grounding_data['search_query']}'. Injected search context successfully.")
         except Exception as e:
-            print(f"Failed to perform web search grounding: {e}")
+            _log(f"Failed to perform web search grounding: {e}")
             
+    min_words, max_words, seconds_label = DURATION_PRESETS.get(
+        duration_preset, DURATION_PRESETS[DEFAULT_DURATION_PRESET])
+
     # Stage 1: Creative Story / Script Writer (Free-form text)
+    # Smaller local models satisfice on a short, well-formed hook/escalate/
+    # payoff/CTA arc and stop, ignoring an abstract total-word target stated
+    # only once. Measured live: qwen2.5:7b-instruct returned 23-55 words
+    # against a 110-145 word target on 9 straight attempts (3 outer retries x
+    # 3 internal retries), never once landing in range. Giving it a concrete
+    # SENTENCE COUNT (models track "have I written N sentences yet" far more
+    # reliably than "have I written N words yet") and restating the
+    # requirement at both the top and bottom of the prompt is the fix.
+    # Smaller local models undershoot a stated RANGE, not just an abstract
+    # total: measured live even after adding a sentence-count target below,
+    # qwen2.5:7b-instruct landed at 67, 104, and 78 words against 110-145 --
+    # three straight misses, all under, none over. A range reads as "anywhere
+    # in here is fine" and the model anchors low; asking for the ceiling with
+    # the floor framed as a hard minimum (not a midpoint to aim near) shifts
+    # the whole distribution up instead of retrying the same coin flip.
+    target_sentences = max(6, round(max_words / 9))
+    min_sentences = max(4, round(min_words / 9))
     storyteller_system = (
         "You are a world-class short-form video scriptwriter for YouTube Shorts, Instagram Reels "
-        "and TikTok whose videos routinely go viral. Write a punchy ~15-second voiceover script "
-        "about the given topic.\n"
+        f"and TikTok whose videos routinely go viral. Write a punchy ~{seconds_label}-second voiceover "
+        "script about the given topic.\n"
+        f"HARD LENGTH REQUIREMENT: write {target_sentences} sentences, aiming for {max_words} words. "
+        f"{min_words} words is the ABSOLUTE FLOOR, not a target -- landing near it is a FAILURE. "
+        "A short, complete-sounding script that ends early is a FAILURE even if it has a hook, escalation, "
+        "and payoff -- if you're tempted to stop before hitting the sentence count, add another specific "
+        "fact, angle, or twist first. Undershooting is a failure; overshooting slightly is fine.\n"
         "VIRAL RULES (follow all):\n"
-        "- HOOK FIRST: The opening sentence (first ~3 seconds) must stop the scroll. Use a bold claim, "
-        "a shocking/surprising fact, or a curiosity gap. Never open with 'In this video', 'Today', or a slow intro.\n"
+        "- HOOK FIRST: The opening sentence is the single highest-leverage line in the whole script -- "
+        "most viewers decide to keep watching or swipe away within the first 1-3 seconds. It must be "
+        "EXACTLY 8-14 words (a viewer reads/hears this in under 3 seconds; longer and you've already "
+        "lost the swipe decision). Use a bold contrarian claim, a specific common mistake, a shocking "
+        "fact, or a curiosity gap. Never open with 'In this video', 'Today', or a slow intro.\n"
         "- OPEN LOOP: Tease something the viewer only fully understands at the end, so they keep watching.\n"
         "- PACING: Short, punchy, spoken-style sentences (each about 6-12 words) that read cleanly as "
         "on-screen captions. One idea per sentence.\n"
-        "- ESCALATE: Each sentence should raise curiosity, tension, or stakes more than the last.\n"
+        "- ESCALATE: Each sentence should raise curiosity, tension, or stakes more than the last. Cover "
+        f"MULTIPLE distinct facts or angles about the topic (aim for {target_sentences} of them, not fewer) "
+        "-- this is what fills the required length without padding or repetition.\n"
         "- PAYOFF + CTA: Land a satisfying payoff, then end with a punchy call to action that tells the "
         "viewer to SUBSCRIBE for more (e.g. 'Subscribe so you never miss one').\n"
         "- Be specific and accurate about the topic; no vague filler or repetition.\n"
         "- Do NOT repeat any sentence or phrase; every line must add new information.\n"
-        "Total length about 65-85 words (about 15-20 seconds spoken). "
-        "Output ONLY the raw narration text - no scene numbers, brackets, speaker names, emojis, or stage directions."
+        f"Before you finish, count your sentences. If you have fewer than {target_sentences}, keep going -- "
+        f"do not stop at {min_sentences}.\n"
+        f"HARD LENGTH REQUIREMENT (again): write {target_sentences} sentences, aiming for {max_words} words. "
+        f"{min_words} words is the absolute floor. Output ONLY the raw narration text - no scene numbers, "
+        "brackets, speaker names, emojis, or stage directions."
     )
     
-    storyteller_prompt = f"System: {storyteller_system}\n{grounding_info}\nUser: Write a 15-second viral story about: {prompt}."
+    storyteller_prompt = (
+        f"System: {storyteller_system}\n{grounding_info}\n"
+        f"User: Write a {seconds_label}-second viral story about: {prompt}."
+    )
     if hook_instruction:
         storyteller_prompt += f" Hook Instruction: {hook_instruction}"
         
-    payload1 = {
-        "model": model,
-        "prompt": storyteller_prompt,
-        "stream": False
-    }
+    # This floor used to be a flat 30 words regardless of duration preset --
+    # left over from before DURATION_PRESETS existed, when every video targeted
+    # ~15-20s (~55-80 words). "Standard" now targets 110-145 words, so a
+    # 30-word story passed this check, burned a full storyboard generation, and
+    # only then got rejected by validate_script's real min_words floor -- a
+    # wasted retry cycle every time, observed live with qwen2.5:7b-instruct.
+    # Scaling with min_words catches it here instead, one stage earlier.
+    story_word_floor = max(30, int(min_words * 0.7))
+
+    def _extend_story(text: str, words_needed: int) -> str:
+        # Hitting an exact word count cold is hard for a small model; continuing
+        # existing text by a specific amount is a much easier, more reliable
+        # task -- measured live, qwen2.5:7b-instruct oscillated between ~45 and
+        # ~103 words against a 110 floor even with an explicit sentence-count
+        # target baked into the main prompt, never reliably crossing it from
+        # scratch. This is the "add more" pass instead of another cold retry.
+        extra_sentences = max(2, round(words_needed / 9))
+        extend_prompt = (
+            "System: You are extending a short-form video voiceover script that came in too short. "
+            f"Add {extra_sentences} more sentences (short, punchy, spoken-style, 6-12 words each) that "
+            "introduce NEW specific facts or angles about the topic -- never repeat anything already said. "
+            "Insert them before the final subscribe call-to-action line so the payoff still lands last. "
+            "Return the COMPLETE script (the original text plus your additions merged in, in order), not "
+            "just the new part. Output ONLY the raw narration text - no labels, headers, or explanation.\n"
+            f"User: Topic: {prompt}\nCurrent script:\n{text}"
+        )
+        return llm_client.generate(model, extend_prompt, timeout=90).strip()
 
     def _attempt_story():
         # Generous timeout for cloud models; they are slow but usually succeed on retry.
-        r = requests.post(url, json=payload1, timeout=90)
-        if r.status_code != 200:
-            raise RuntimeError(f"Ollama HTTP {r.status_code}: {r.text[:150]}")
-        t = (r.json().get("response", "") or "").strip()
-        # A real ~15-20s script is ~55-80 words. Reject short/empty output so we
-        # NEVER fall back to narrating the bare topic title (which caused the
-        # 7-second, fragmented, repeating-caption video).
-        if len(t.split()) < 30:
-            raise RuntimeError(f"story too short ({len(t.split())} words)")
+        t = llm_client.generate(model, storyteller_prompt, timeout=150)
+        wc = len(t.split())
+        if wc < story_word_floor:
+            raise RuntimeError(f"story too short ({wc} words; need >= {story_word_floor})")
+        if wc < min_words:
+            try:
+                extended = _extend_story(t, min_words - wc)
+                if len(extended.split()) > wc:
+                    t = extended
+            except Exception as e:
+                print(f"Story extension failed ({e}); using original {wc}-word story.")
         return t
 
+    _log(f"Generating story (up to 3 attempts) with {model}...")
     try:
         story_text = retry_call(_attempt_story, attempts=3, base_delay=2.0,
-                                label="story text", logger=print)
+                                label="story text", logger=_log)
+        _log("Story generated.")
         print(f"--- Generated Cohesive Story ---\n{story_text}\n---------------------------------")
     except Exception as e:
         raise RuntimeError(
@@ -410,7 +572,11 @@ def generate_ollama_script(prompt: str, model: str, hook_style: str = "None (Dir
         "black kit with padded gloves'). Never use a generic placeholder unrelated to the topic.\n"
         "3. 'background_music_style': choose ONE of Cinematic, Upbeat, Mysterious, Ambient that best fits the mood.\n"
         "For each scene:\n"
-        "1. 'narration': extract a short, caption-friendly segment of the story (about 6-12 words). Keep the story's exact wording and order; do not invent new facts.\n"
+        "1. 'narration': a LITERAL split of the story's own sentences into 7 groups, in order -- copy the "
+        "story's exact wording, do not summarize, paraphrase, shorten, or compress it. The 7 narration "
+        "fields, concatenated in order, must reproduce the ENTIRE story text with nothing lost and no words "
+        f"dropped: if the story is {min_words}+ words, your 7 narration fields combined must also total "
+        f"{min_words}+ words. Do not invent new facts, and do not omit any sentence from the story.\n"
         "2. 'speaker': pick one consistent name from: Sarah, Bella, Nicole, Sky, Alloy, Kore, River, Adam, Michael, Fenrir, Puck, Echo, Liam, Onyx, Emma, Isabella, George, Lewis (use the SAME speaker for the whole video unless the story has distinct characters).\n"
         "3. 'visual_prompt': a vivid, specific scene description - the action, emotion, pose, or setting for THIS line, "
         "with a clear focal subject and sense of motion/energy so the zoom and cut land well. It is combined with the "
@@ -469,29 +635,25 @@ def generate_ollama_script(prompt: str, model: str, hook_style: str = "None (Dir
 
     storyboarder_prompt = f"System: {storyboarder_system}{style_directive}\nStory to segment:\n{story_text}"
 
-    payload2 = {
-        "model": model,
-        "prompt": storyboarder_prompt,
-        "stream": False,
-        "format": "json"
-    }
-
     # Stage 2 is the flaky step (cloud models time out / return slightly-off JSON).
     # Retry it, accept a reasonable scene count, and normalize to exactly 7.
     def _attempt_storyboard():
-        # Generous timeout: cloud models are slow at large JSON generations.
-        r = requests.post(url, json=payload2, timeout=120)
-        if r.status_code != 200:
-            raise RuntimeError(f"Ollama HTTP {r.status_code}: {r.text[:150]}")
-        data = json.loads(clean_json_response(r.json().get("response", "").strip()))
+        # Measured live: OpenRouter's z-ai/glm-5.3-flash took 253s for this
+        # exact 7-scene JSON storyboard call -- a 120s timeout guaranteed
+        # failure on every attempt (and, before the hard-deadline fix in
+        # llm_client.generate, hung indefinitely past that instead of raising).
+        # 280s gives a real chance to succeed rather than always falling back.
+        text = llm_client.generate(model, storyboarder_prompt, timeout=280, json_mode=True)
+        data = json.loads(clean_json_response(text))
         scenes = data.get("scenes")
         if not isinstance(scenes, list) or len(scenes) < 4:
             raise RuntimeError(f"invalid storyboard (got {len(scenes) if isinstance(scenes, list) else 'no'} scenes)")
         return data
 
+    _log("Segmenting story into a 7-scene storyboard...")
     try:
         data = retry_call(_attempt_storyboard, attempts=2, base_delay=2.0,
-                          label="storyboard JSON", logger=print)
+                          label="storyboard JSON", logger=_log)
         data["scenes"] = normalize_scene_count(data["scenes"], story_text, 7)
         # Make sure the global anchors exist and are tied to the actual topic.
         if not data.get("global_subject_focus"):
@@ -510,30 +672,72 @@ def generate_ollama_script(prompt: str, model: str, hook_style: str = "None (Dir
 
 
 def generate_validated_script(prompt, model, hook_style="None (Direct Prompt)",
-                              enable_search=False, attempts=2, log=print,
-                              art_style="Photorealistic"):
+                              enable_search=False, attempts=3, log=print,
+                              art_style="Photorealistic",
+                              duration_preset=DEFAULT_DURATION_PRESET,
+                              max_seconds=360.0):
     """Generate a script and run it through the deterministic viral checker.
 
-    Regenerates on HARD failures (off-topic, repeats, wrong length, fallback...),
-    auto-fixes SOFT issues (missing CTA, non-realistic style), and raises if it
-    still cannot produce a valid script - so a broken video never reaches render.
+    Regenerates on HARD failures (off-topic, repeats, wrong length, fallback,
+    a hook that runs long...), auto-fixes SOFT issues (missing CTA, non-realistic
+    style), and raises if it still cannot produce a valid script - so a broken
+    video never reaches render.
+
+    Two things keep a bad first attempt from costing a full second LLM round
+    trip: ``mechanically_fix_hard_issues`` corrects an over-length hook or a
+    duplicated CTA line in place (the only two hard issues that don't need the
+    LLM's judgment to fix), and ``max_seconds`` caps the total wall-clock spend
+    -- 3 attempts x a multi-stage local-7B generation can exceed 6 minutes, so
+    once the deadline passes this returns the least-bad attempt seen so far
+    (autofixed, with its remaining issues attached as a warning) instead of
+    leaving the caller waiting through a full 3rd attempt for a result that
+    then still gets thrown away.
     """
+    min_words, max_words, _label = DURATION_PRESETS.get(
+        duration_preset, DURATION_PRESETS[DEFAULT_DURATION_PRESET])
     last_hard = ["unknown error"]
+    best_data, best_hard = None, None
+    start = time.time()
+
     for attempt in range(1, attempts + 1):
+        if attempt > 1 and time.time() - start > max_seconds:
+            log(f"[validator] {time.time() - start:.0f}s elapsed, over the {max_seconds:.0f}s "
+                f"budget; stopping after attempt {attempt - 1} instead of trying again.")
+            break
+
+        log(f"Drafting script (attempt {attempt}/{attempts})...")
         try:
-            data = generate_ollama_script(prompt, model, hook_style, enable_search=enable_search, art_style=art_style)
+            data = generate_ollama_script(prompt, model, hook_style, enable_search=enable_search,
+                                          art_style=art_style, duration_preset=duration_preset,
+                                          log_callback=log)
         except Exception as e:
             last_hard = [f"generation error: {e}"]
             log(f"[validator] attempt {attempt}/{attempts}: {last_hard[0]}")
             continue
 
-        hard, soft = validate_script(data, prompt, art_style=art_style)
+        hard, soft = validate_script(data, prompt, art_style=art_style,
+                                     min_words=min_words, max_words=max_words)
+        if hard:
+            data, hard = mechanically_fix_hard_issues(data, hard, min_words=min_words)
+            if hard:
+                log(f"[validator] mechanical fixes left {len(hard)} issue(s) unresolved: {hard}")
+            else:
+                log("[validator] fixed hard issues in place (hook trim / CTA dedupe) -- no regeneration needed.")
+
         if not hard:
             if soft:
                 log(f"[validator] auto-fixing soft issues: {soft}")
             return autofix(data, art_style=art_style)  # enforce style + ensure CTA
+
+        if best_hard is None or len(hard) < len(best_hard):
+            best_data, best_hard = data, hard
         last_hard = hard
         log(f"[validator] attempt {attempt}/{attempts} rejected (regenerating): {hard}")
+
+    if best_data is not None:
+        log(f"[validator] returning the least-bad attempt with unresolved issues: {best_hard}")
+        best_data["_validation_warnings"] = best_hard
+        return autofix(best_data, art_style=art_style)
 
     raise RuntimeError(
         f"Script failed viral validation after {attempts} attempts for '{prompt}': {last_hard}"
@@ -551,7 +755,7 @@ def trim_audio_silence(input_path: str) -> str:
         trimmed_path
     ]
     try:
-        subprocess.run(ffmpeg_cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        vq.run_ffmpeg(ffmpeg_cmd, label="silence trim")
         if os.path.exists(trimmed_path) and os.path.getsize(trimmed_path) > 0:
             try:
                 os.remove(input_path)
@@ -576,14 +780,14 @@ def generate_speech_audio(text: str, voice_key: str, speed: float = 1.0, effect:
         kokoro = Kokoro(onnx_path, voices_path)
         samples, sample_rate = kokoro.create(text, voice=voice, speed=speed, lang="en-us")
         
-        raw_output_path = os.path.abspath(os.path.join("temp", f"voice_raw_{int(time.time())}.wav"))
+        raw_output_path = os.path.abspath(os.path.join("temp", f"voice_raw_{uuid.uuid4().hex}.wav"))
         sf.write(raw_output_path, samples, sample_rate)
         
         audio_path = raw_output_path
         if effect == "Kid (High Pitch)":
-            pitch_output_path = os.path.abspath(os.path.join("temp", f"voice_kid_{int(time.time())}.wav"))
+            pitch_output_path = os.path.abspath(os.path.join("temp", f"voice_kid_{uuid.uuid4().hex}.wav"))
             ffmpeg_cmd = ["ffmpeg", "-y", "-i", raw_output_path, "-af", "asetrate=24000*1.3,atempo=1/1.3", pitch_output_path]
-            subprocess.run(ffmpeg_cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            vq.run_ffmpeg(ffmpeg_cmd, label="kid-pitch voice effect")
             try:
                 os.remove(raw_output_path)
             except Exception:
@@ -591,9 +795,9 @@ def generate_speech_audio(text: str, voice_key: str, speed: float = 1.0, effect:
             audio_path = pitch_output_path
             
         elif effect == "Deep (Low Pitch)":
-            pitch_output_path = os.path.abspath(os.path.join("temp", f"voice_deep_{int(time.time())}.wav"))
+            pitch_output_path = os.path.abspath(os.path.join("temp", f"voice_deep_{uuid.uuid4().hex}.wav"))
             ffmpeg_cmd = ["ffmpeg", "-y", "-i", raw_output_path, "-af", "asetrate=24000*0.82,atempo=1/0.82", pitch_output_path]
-            subprocess.run(ffmpeg_cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            vq.run_ffmpeg(ffmpeg_cmd, label="deep-pitch voice effect")
             try:
                 os.remove(raw_output_path)
             except Exception:
@@ -697,7 +901,7 @@ def generate_leonardo_motion(image_id: str, prompt: str):
                 if videos:
                     video_url = videos[0].get("url")
                     vid_data = requests.get(video_url).content
-                    out_path = os.path.abspath(os.path.join("temp", f"motion_{int(time.time())}.mp4"))
+                    out_path = os.path.abspath(os.path.join("temp", f"motion_{uuid.uuid4().hex}.mp4"))
                     with open(out_path, "wb") as f:
                         f.write(vid_data)
                     return out_path
@@ -705,12 +909,6 @@ def generate_leonardo_motion(image_id: str, prompt: str):
             elif status == "FAILED":
                 raise RuntimeError("Leonardo motion reported status FAILED.")
     raise RuntimeError("Leonardo motion generation timed out while polling.")
-
-class ScriptRequest(BaseModel):
-    prompt: str
-    model: str
-    hook_style: str = "None (Direct Prompt)"
-    enable_search: bool = False
 
 class SpeechRequest(BaseModel):
     text: str
@@ -763,37 +961,53 @@ class ShortRequest(QualityOptions):
     enable_search: bool = False
     enable_transition_sfx: bool = False   # off by default: the stock whoosh reads as noise, not a transition
 
-class UploadRequest(BaseModel):
-    video_path: str
-    platforms: List[str]  # e.g. ["youtube", "instagram"]
-    youtube_title: Optional[str] = ""
-    youtube_description: Optional[str] = ""
-    youtube_tags: Optional[List[str]] = []
-    youtube_privacy: Optional[str] = "private"
-    instagram_caption: Optional[str] = ""
+#: Models that only run generation, not embeddings -- an embedding model in the
+#: dropdown produces a confusing failure rather than a script.
+_NON_GENERATIVE = ("embed",)
 
 
 def get_ollama_models():
-    """Dynamically fetch available models from local Ollama service."""
-    ollama_models = []
+    """Available Ollama models, locally-runnable ones first.
+
+    Ordering matters because the UI selects the first entry by default. This
+    previously force-pinned a *cloud* model to the front, so a exhausted weekly
+    quota made every manual draft fail on a model the user never chose. Ollama
+    reports cloud models with size 0, which is what separates the two.
+    """
+    entries = []
     try:
         r = requests.get(f"{OLLAMA_HOST}/api/tags", timeout=3)
         if r.status_code == 200:
-            ollama_models = [m['name'] for m in r.json().get("models", [])]
+            entries = r.json().get("models", [])
     except Exception:
         pass
-    
-    # Ensure minimax-m3:cloud is at the front of the list
-    if "minimax-m3:cloud" in ollama_models:
-        ollama_models.remove("minimax-m3:cloud")
-    ollama_models.insert(0, "minimax-m3:cloud")
-    
-    # Add other fallbacks if not present
-    for fallback in ["deepseek-v4-pro:cloud", "gemma4:31b-cloud", "qwen3.5:0.8b", "gpt-oss:120b-cloud"]:
-        if fallback not in ollama_models:
-            ollama_models.append(fallback)
-            
-    return ollama_models
+
+    local, cloud = [], []
+    for m in entries:
+        name = m.get("name", "")
+        if not name or any(x in name.lower() for x in _NON_GENERATIVE):
+            continue
+        (local if (m.get("size") or 0) > 0 else cloud).append(name)
+
+    # Largest local model first: on a single machine, size is the best available
+    # proxy for output quality, and the default should be the best that works
+    # without a network round-trip or a quota.
+    local.sort(key=lambda n: next(
+        (e.get("size", 0) for e in entries if e.get("name") == n), 0), reverse=True)
+
+    models = local + cloud
+    for fallback in ["minimax-m3:cloud", "deepseek-v4-pro:cloud",
+                     "gemma4:31b-cloud", "gpt-oss:120b-cloud"]:
+        if fallback not in models:
+            models.append(fallback)
+    # OpenRouter models only show up once a key is configured -- picking one
+    # from this same dropdown is the only opt-in `llm_client` needs, since it
+    # routes by the "/" in the model id rather than a separate provider field.
+    if llm_client.OPENROUTER_API_KEY:
+        for m in llm_client.OPENROUTER_MODELS:
+            if m not in models:
+                models.append(m)
+    return models
 
 # API Endpoints
 @app.get("/api/config")
@@ -807,7 +1021,16 @@ def get_config():
         "music_presets": ["None", "Procedural Ambient"] + list(MUSIC_PRESETS.keys()),
         "satisfying_presets": ["None"] + list(SATISFYING_PRESETS.keys()),
         "viral_hooks": list(VIRAL_HOOKS.keys()),
+        "duration_presets": list(DURATION_PRESETS.keys()),
+        "default_duration_preset": DEFAULT_DURATION_PRESET,
         "ollama_models": ollama_models,
+        # Local Ollama stays the default even when an OpenRouter key is
+        # configured: measured live, OpenRouter's z-ai/glm-5.3-flash took 253s
+        # for the storyboard JSON stage alone (vs. ~50-65s total for the local
+        # model) -- correct and eventually-successful, but far slower than the
+        # thing OpenRouter was added to fix. It's still one dropdown pick away
+        # for when local Ollama is unavailable or its cloud quota is exhausted.
+        "default_model": (ollama_models[0] if ollama_models else ""),
         "art_styles": list(ART_STYLE_PRESETS.keys()),
         "visual_modes": ["Cinematic Slideshow", "Leonardo Motion Video", "Hailuo Animated Video"],
         "quality_presets": list(vq.QUALITY_PRESETS.keys()),
@@ -822,10 +1045,6 @@ def get_config():
         },
     }
 
-@app.post("/api/generate-script")
-def api_generate_script(req: ScriptRequest):
-    return generate_ollama_script(req.prompt, req.model, req.hook_style)
-
 @app.post("/api/generate-speech")
 def api_generate_speech(req: SpeechRequest):
     path, msg = generate_speech_audio(req.text, req.voice, req.speed, req.effect)
@@ -834,7 +1053,7 @@ def api_generate_speech(req: SpeechRequest):
     
     # Return relative URL path
     rel_path = os.path.relpath(path, os.path.abspath(os.path.curdir))
-    return {"path": path, "url": f"http://localhost:8000/{rel_path.replace(os.path.sep, '/')}"}
+    return {"path": path, "url": f"{PUBLIC_BASE_URL}/{rel_path.replace(os.path.sep, '/')}"}
 
 #: How each scene's visuals are sourced.
 VISUAL_SOURCE_MODES = ("Smart Mix", "Real Footage Only", "AI Only")
@@ -860,6 +1079,32 @@ def use_stock_for_scene(scene: dict, mode: str) -> bool:
     if tag in ("generate", "generated", "ai"):
         return False
     return bool(scene.get("stock_query"))
+
+
+def concat_with_fallback(list_path: str, output_path: str, label: str) -> None:
+    """Stream-copy concat is the fast path; fall back to a re-encoding concat
+    when it fails. Stock Pexels clips, Hailuo motion clips, and Ken Burns
+    slideshow segments are each produced by a different code path, and despite
+    sharing vq.intermediate_encode_args() can still end up differing enough
+    (container-level details -c copy is sensitive to) that -c copy concat
+    rejects them -- surfaced live as ffmpeg exit 183 with the real reason
+    thrown away by the old stderr=DEVNULL call."""
+    try:
+        vq.run_ffmpeg(
+            ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", list_path,
+             "-c", "copy", output_path],
+            label=f"{label} concat (stream copy)",
+        )
+    except RuntimeError as e:
+        print(f"{label} concat via stream copy failed ({e}); re-encoding instead.")
+        is_audio = output_path.lower().endswith(".wav")
+        reencode_args = (["-c:a", "pcm_s16le"] if is_audio else
+                         ["-c:v", "libx264", "-pix_fmt", "yuv420p", "-r", str(vq.FPS)])
+        vq.run_ffmpeg(
+            ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", list_path]
+            + reencode_args + [output_path],
+            label=f"{label} concat (re-encode fallback)",
+        )
 
 
 def run_viral_shorts_pipeline_new(
@@ -932,8 +1177,13 @@ def run_viral_shorts_pipeline_new(
         1 for s in scenes
         if not (s.get("image_path") and os.path.exists(s.get("image_path", "")))
     )
-    est_cost = cost_tracker.estimate_render_cost(scenes_needing_image, visual_mode)
-    cost_tracker.assert_within_budget(est_cost)
+    provider = image_providers.resolve_provider(image_provider)
+    motion_scenes = sum(1 for scene in scenes if not scene.get("clip_path")
+                        and (provider == "leonardo" or scene.get("image_id")))
+    est_cost = cost_tracker.estimate_render_cost(scenes_needing_image, visual_mode,
+                                                provider=provider, motion_scenes=motion_scenes)
+    if est_cost > 0:
+        cost_tracker.assert_within_budget(est_cost)
 
     scene_videos = []
     scene_audios = []
@@ -955,7 +1205,9 @@ def run_viral_shorts_pipeline_new(
         if generation_id else None
     )
 
+    render_token = uuid.uuid4().hex
     for idx, scene in enumerate(scenes):
+        _log(f"Scene {idx+1}/{len(scenes)}: preparing assets.")
         sc_text = scene["narration"]
         sc_visual_prompt = scene["visual_prompt"]
         
@@ -967,6 +1219,7 @@ def run_viral_shorts_pipeline_new(
         
         # Pick speaker voice
         if not custom_storyboard and not custom_script_data:
+            sc_speaker = voice
             sc_voice_key = voice
         else:
             sc_speaker = scene.get("speaker", voice)
@@ -1031,7 +1284,8 @@ def run_viral_shorts_pipeline_new(
             def _dispatch_image(p):
                 prov = image_providers.resolve_provider(image_provider)
                 if prov == "leonardo":
-                    return generate_leonardo_image(p, leonardo_model, "9:16")
+                    return cost_tracker.run_paid(generation_id, "image",
+                        lambda: generate_leonardo_image(p, leonardo_model, "9:16"))
                 # Ask for the delivery frame size. Each provider generates at
                 # whatever it can actually do well and upscales from there, so
                 # the Ken Burns stage never has to blow up a tiny frame.
@@ -1044,12 +1298,10 @@ def run_viral_shorts_pipeline_new(
                 label=f"image scene {idx+1}", logger=_log
             )
             sc_img, image_id = img_res
-            if image_providers.resolve_provider(image_provider) == "leonardo":
-                cost_tracker.record(generation_id, "image")
         else:
             _log(f"Scene {idx+1}: reusing existing image (resume).")
 
-        scene_video_path = os.path.abspath(os.path.join("temp", f"scene_vid_{int(time.time())}_{idx}.mp4"))
+        scene_video_path = os.path.abspath(os.path.join("temp", f"scene_vid_{render_token}_{idx}.mp4"))
 
         # Make video segment (slideshow with zoompan or motion video)
         motion_vid_path = None
@@ -1057,12 +1309,11 @@ def run_viral_shorts_pipeline_new(
             # Motion is best-effort: retry, but fall back to slideshow if it never succeeds.
             try:
                 motion_vid_path = retry_call(
-                    lambda: generate_leonardo_motion(image_id, final_visual_prompt),
+                    lambda: cost_tracker.run_paid(generation_id, "motion",
+                        lambda: generate_leonardo_motion(image_id, final_visual_prompt)),
                     attempts=2, base_delay=4.0,
                     label=f"motion scene {idx+1}", logger=_log
                 )
-                if motion_vid_path:
-                    cost_tracker.record(generation_id, "motion")
             except RetryError:
                 _log(f"Scene {idx+1}: motion generation failed; falling back to slideshow.")
                 motion_vid_path = None
@@ -1071,12 +1322,11 @@ def run_viral_shorts_pipeline_new(
             # Best-effort: retry, then fall back to slideshow if it never succeeds.
             try:
                 motion_vid_path = retry_call(
-                    lambda: generate_hailuo_video(final_visual_prompt, first_frame_path=sc_img),
+                    lambda: cost_tracker.run_paid(generation_id, "motion",
+                        lambda: generate_hailuo_video(final_visual_prompt, first_frame_path=sc_img), service="hailuo"),
                     attempts=2, base_delay=5.0,
                     label=f"hailuo scene {idx+1}", logger=_log
                 )
-                if motion_vid_path:
-                    cost_tracker.record(generation_id, "motion")
             except RetryError:
                 _log(f"Scene {idx+1}: Hailuo generation failed; falling back to slideshow.")
                 motion_vid_path = None
@@ -1108,12 +1358,13 @@ def run_viral_shorts_pipeline_new(
         
         aud_rel = os.path.relpath(sc_audio, os.path.abspath(os.path.curdir))
         scene_entry = {
+            **scene,
             "scene": idx + 1,
             "speaker": sc_speaker,
             "narration": sc_text,
-            "visual_prompt": final_visual_prompt,
+            "visual_prompt": sc_visual_prompt,
             "image_id": image_id,
-            "audio_url": f"http://localhost:8000/{aud_rel.replace(os.path.sep, '/')}",
+            "audio_url": f"{PUBLIC_BASE_URL}/{aud_rel.replace(os.path.sep, '/')}",
             "audio_path": sc_audio,
             "duration": sc_duration,
             "visual_source": "stock" if sc_clip else "generated",
@@ -1123,11 +1374,11 @@ def run_viral_shorts_pipeline_new(
         if sc_clip:
             clip_rel = os.path.relpath(sc_clip, os.path.abspath(os.path.curdir))
             scene_entry["clip_path"] = sc_clip
-            scene_entry["clip_url"] = f"http://localhost:8000/{clip_rel.replace(os.path.sep, '/')}"
+            scene_entry["clip_url"] = f"{PUBLIC_BASE_URL}/{clip_rel.replace(os.path.sep, '/')}"
         if sc_img:
             img_rel = os.path.relpath(sc_img, os.path.abspath(os.path.curdir))
             scene_entry["image_path"] = sc_img
-            scene_entry["image_url"] = f"http://localhost:8000/{img_rel.replace(os.path.sep, '/')}"
+            scene_entry["image_url"] = f"{PUBLIC_BASE_URL}/{img_rel.replace(os.path.sep, '/')}"
         storyboard.append(scene_entry)
 
         # Write asset paths back into the source scene so a re-run resumes.
@@ -1146,23 +1397,57 @@ def run_viral_shorts_pipeline_new(
                 _log(f"Scene {idx+1}: progress persistence failed: {cb_err}")
 
     # Concatenate segments
-    timestamp = int(time.time())
+    #
+    # Every temp/output path below is keyed off this one value. It used to be
+    # bare `int(time.time())` (second resolution, no collision protection):
+    # reproduced live, two renders resolving to the same second -- easy with
+    # a fast/resumed render, e.g. re-rendering right after tweaking a caption
+    # setting -- landed on the IDENTICAL viral_reel_<ts>.mp4 (and every temp
+    # file, including the subtitles .ass), so the second render's ffmpeg
+    # process silently overwrote the first's mid-write. That's the actual
+    # root cause behind "the caption position slider doesn't seem to do
+    # anything" -- the ASS margin math itself is correct (verified directly),
+    # but the file the user was looking at could be from an unrelated race.
+    # generation_id is already a unique UUID per request, so keying off it
+    # instead removes the collision entirely; the same generation_id being
+    # re-rendered sequentially just replaces its own previous output in
+    # place, which is correct (no concurrent access, so no race).
+    timestamp = generation_id or f"{int(time.time())}-{uuid.uuid4().hex[:8]}"
     merged_video = os.path.abspath(os.path.join("temp", f"merged_video_{timestamp}.mp4"))
     merged_audio = os.path.abspath(os.path.join("temp", f"merged_audio_{timestamp}.wav"))
     
+    # A concat list built from an empty or partially-missing scene set fails at
+    # ffmpeg with an opaque, unhelpful exit code (183) and no indication the
+    # real problem was upstream (e.g. an empty storyboard reaching the
+    # renderer). Fail loudly here instead, naming exactly what's missing.
+    if not scene_videos or not scene_audios:
+        raise RuntimeError(
+            f"No scene segments to render: got {len(scene_videos)} video and "
+            f"{len(scene_audios)} audio segment(s) for {len(scenes)} scene(s) "
+            "in the storyboard. The storyboard sent to the renderer is empty "
+            "or scene processing produced nothing -- check the caller."
+        )
+    missing_video = [p for p in scene_videos if not os.path.exists(p)]
+    missing_audio = [p for p in scene_audios if not os.path.exists(p)]
+    if missing_video or missing_audio:
+        raise RuntimeError(
+            "Scene segment file(s) went missing before concat -- "
+            f"video: {missing_video or 'none missing'}, audio: {missing_audio or 'none missing'}"
+        )
+
     video_list_path = os.path.abspath(os.path.join("temp", f"video_list_{timestamp}.txt"))
     audio_list_path = os.path.abspath(os.path.join("temp", f"audio_list_{timestamp}.txt"))
-    
+
     with open(video_list_path, "w") as vf:
         for p in scene_videos:
             vf.write(f"file '{p}'\n")
     with open(audio_list_path, "w") as af:
         for p in scene_audios:
             af.write(f"file '{p}'\n")
-            
-    subprocess.run(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", video_list_path, "-c", "copy", merged_video], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    subprocess.run(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", audio_list_path, "-c", "copy", merged_audio], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    
+
+    concat_with_fallback(video_list_path, merged_video, "video")
+    concat_with_fallback(audio_list_path, merged_audio, "audio")
+
     try:
         os.remove(video_list_path)
         os.remove(audio_list_path)
@@ -1327,8 +1612,10 @@ class DraftRequest(BaseModel):
     enable_search: bool = False
     voice: Optional[str] = "Sarah (Female - US - Soft)"
     art_style: str = "Photorealistic"
+    duration_preset: str = DEFAULT_DURATION_PRESET
 
 class RenderRequest(QualityOptions):
+    local_image_model: Optional[str] = None
     generation_id: str
     storyboard: List[dict]
     visual_mode: str = "Cinematic Slideshow"
@@ -1354,6 +1641,9 @@ class SingleAssetRegenRequest(BaseModel):
     voice: Optional[str] = None
     speed: Optional[float] = 1.0
     leonardo_model: Optional[str] = None
+    image_provider: Optional[str] = None
+    local_image_model: Optional[str] = None
+    visual_source_mode: str = "Smart Mix"
 
 class DbUploadRequest(BaseModel):
     video_generation_id: str
@@ -1362,14 +1652,29 @@ class DbUploadRequest(BaseModel):
     youtube_description: Optional[str] = ""
     youtube_tags: Optional[List[str]] = []
     youtube_privacy: Optional[str] = "private"
-    instagram_caption: Optional[str] = ""
-    scheduled_time: Optional[str] = None
 
-@app.post("/api/draft-script")
-def api_draft_script(req: DraftRequest):
+def run_draft_task(gen_id: str, req: "DraftRequest") -> None:
+    """Background counterpart of api_draft_script.
+
+    A synchronous /api/draft-script held one HTTP request open for the whole
+    script+storyboard generation -- reproduced live: a request with a local
+    7B model and web search enabled produced no response in 280s (the client
+    gave up; the endpoint had no way to report progress or an intermediate
+    timeout). Running this as a background job lets the client return
+    immediately with a generation_id and poll /api/generation-status for
+    progress, matching the pattern already used for rendering.
+    """
+    logs: list = []
+
+    def _log(msg: str) -> None:
+        logs.append(msg)
+        print(msg)
+        db_manager.update_video_generation(gen_id, logs=logs)
+
     try:
-        gen_id = str(uuid.uuid4())
-        script_data = generate_validated_script(req.prompt, req.model, req.hook_style, enable_search=req.enable_search, art_style=req.art_style)
+        script_data = generate_validated_script(req.prompt, req.model, req.hook_style,
+                                                 enable_search=req.enable_search, art_style=req.art_style,
+                                                 duration_preset=req.duration_preset, log=_log)
         scenes = script_data.get("scenes", [])
 
         # Build initial storyboard structure.
@@ -1395,23 +1700,43 @@ def api_draft_script(req: DraftRequest):
                 "duration": 0.0
             })
             storyboard.append(entry)
-            
-        db_manager.create_video_generation(
-            gen_id, req.prompt, script_data.get("topic", req.prompt), script_data, storyboard, status="draft"
+
+        if script_data.get("_validation_warnings"):
+            _log(f"Draft ready with unresolved issues (used the least-bad attempt): "
+                 f"{script_data['_validation_warnings']}")
+
+        db_manager.update_video_generation(
+            gen_id, topic=script_data.get("topic", req.prompt),
+            script_data=script_data, storyboard=storyboard, status="draft",
         )
-        return {
-            "success": True,
-            "generation_id": gen_id,
-            "topic": script_data.get("topic", req.prompt),
-            "storyboard": storyboard,
-            "youtube_metadata": script_data.get("youtube_metadata"),
-            "instagram_metadata": script_data.get("instagram_metadata")
-        }
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        _log(f"Draft failed: {e}")
+        db_manager.update_video_generation(gen_id, status="failed", error_message=str(e))
+        notify("Draft script failed", f"Draft for '{req.prompt}' failed: {e}",
+              context={"generation_id": gen_id})
+        raise
+
+
+@app.post("/api/draft-script")
+def api_draft_script(req: DraftRequest, background_tasks: BackgroundTasks):
+    gen_id = str(uuid.uuid4())
+    db_manager.create_video_generation(
+        gen_id, req.prompt, req.prompt, None, None, status="drafting"
+    )
+    job_queue.enqueue("draft", gen_id, {**req.model_dump(), "generation_id": gen_id})
+    background_tasks.add_task(drain_jobs)
+    return {"success": True, "generation_id": gen_id, "status": "drafting"}
 
 @app.post("/api/regenerate-scene-asset")
 def api_regenerate_scene_asset(req: SingleAssetRegenRequest):
+    try:
+        with job_queue.resource_guard(req.generation_id):
+            return regenerate_scene_asset(req)
+    except job_queue.JobConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+
+
+def regenerate_scene_asset(req: SingleAssetRegenRequest):
     gen = db_manager.get_video_generation(req.generation_id)
     if not gen:
         raise HTTPException(status_code=404, detail="Video generation not found")
@@ -1426,15 +1751,31 @@ def api_regenerate_scene_asset(req: SingleAssetRegenRequest):
         if req.asset_type == "image":
             prompt = req.prompt or scene.get("visual_prompt")
             model = req.leonardo_model or "Lucid Realism (High Quality Face)"
-            path, image_id = generate_leonardo_image(prompt, model, "9:16")
+            provider = image_providers.resolve_provider(req.image_provider)
+            script = gen.get("script_data") or {}
+            composed = script_utils.compose_image_prompt(
+                subject=script.get("global_subject_focus", ""), scene=prompt,
+                style=script.get("global_visual_style", ""))
+            if provider == "leonardo":
+                path, image_id = cost_tracker.run_paid(req.generation_id, "image",
+                    lambda: generate_leonardo_image(composed, model, "9:16"))
+            else:
+                path, image_id = image_providers.generate_image(
+                    provider, composed, image_providers.DELIVERY_W, image_providers.DELIVERY_H)
             if not path:
-                raise ValueError("Leonardo image generation failed")
+                raise ValueError("Image generation failed")
                 
             rel_path = os.path.relpath(path, os.path.abspath(os.path.curdir))
             scene["image_path"] = path
-            scene["image_url"] = f"http://localhost:8000/{rel_path.replace(os.path.sep, '/')}"
+            scene["image_url"] = f"{PUBLIC_BASE_URL}/{rel_path.replace(os.path.sep, '/')}"
             scene["image_id"] = image_id
             scene["visual_prompt"] = prompt
+            scene["image_provider"] = provider
+            scene["image_model"] = model
+            scene.pop("clip_path", None)
+            scene.pop("clip_url", None)
+            scene["visual_source"] = "generated"
+            scene.pop("visual_fingerprint", None)
             
         elif req.asset_type == "audio":
             text = req.prompt or scene.get("narration")
@@ -1447,35 +1788,38 @@ def api_regenerate_scene_asset(req: SingleAssetRegenRequest):
             duration = info.duration
             rel_path = os.path.relpath(path, os.path.abspath(os.path.curdir))
             scene["audio_path"] = path
-            scene["audio_url"] = f"http://localhost:8000/{rel_path.replace(os.path.sep, '/')}"
+            scene["audio_url"] = f"{PUBLIC_BASE_URL}/{rel_path.replace(os.path.sep, '/')}"
             scene["duration"] = duration
             scene["narration"] = text
             scene["speaker"] = voice
+            scene["audio_speed"] = req.speed or 1.0
+            scene.pop("audio_fingerprint", None)
             
         else:
             raise HTTPException(status_code=400, detail="Invalid asset type")
             
+        options = RenderRequest(generation_id=req.generation_id, storyboard=storyboard,
+            image_provider=req.image_provider, local_image_model=req.local_image_model,
+            leonardo_model=req.leonardo_model or "Lucid Realism (High Quality Face)",
+            visual_source_mode=req.visual_source_mode, speed=req.speed or 1.0)
+        prepared = prepare_storyboard(options, gen)[req.scene_index]
+        key = "visual_fingerprint" if req.asset_type == "image" else "audio_fingerprint"
+        scene[key] = prepared[key]
         db_manager.update_video_generation(req.generation_id, storyboard=storyboard)
         return {
             "success": True,
             "scene": scene
         }
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 def run_render_task(generation_id: str, req: RenderRequest):
-    # Resume: prefer the storyboard persisted in the DB (it may already carry
-    # asset paths from a previous partial run) over the request payload.
-    storyboard_in = req.storyboard
     existing = db_manager.get_video_generation(generation_id)
-    if existing and existing.get("storyboard"):
-        persisted = {s.get("scene"): s for s in existing["storyboard"]}
-        for sc in storyboard_in:
-            prev = persisted.get(sc.get("scene"))
-            if prev and not sc.get("image_path"):
-                sc["image_path"] = prev.get("image_path")
-                sc["image_id"] = prev.get("image_id")
-                sc["audio_path"] = prev.get("audio_path")
+    if not existing:
+        raise ValueError("Generation no longer exists.")
+    storyboard_in = prepare_storyboard(req, existing or {})
 
     # Preserve the global visual anchors (style + recurring subject) saved at
     # draft time so the chosen art style (e.g. stickman) survives to render.
@@ -1484,11 +1828,20 @@ def run_render_task(generation_id: str, req: RenderRequest):
     render_script_data = dict(persisted_script)
     render_script_data["scenes"] = storyboard_in
 
+    logs = []
+    def _log(message):
+        logs.append(message)
+        db_manager.update_video_generation(generation_id, logs=logs[-500:])
+
     def _persist_progress(sb):
-        db_manager.update_video_generation(generation_id, storyboard=sb)
+        # Preserve scenes that have not rendered yet, including their edits.
+        merged = list(storyboard_in)
+        merged[:len(sb)] = sb
+        db_manager.update_video_generation(generation_id, storyboard=merged)
 
     try:
-        db_manager.update_video_generation(generation_id, status="rendering")
+        db_manager.update_video_generation(generation_id, status="rendering", error_message="",
+                                           logs=[], storyboard=storyboard_in)
 
         final_video, storyboard, topic, script_data = run_viral_shorts_pipeline_new(
             prompt="",
@@ -1509,6 +1862,7 @@ def run_render_task(generation_id: str, req: RenderRequest):
             enable_transition_sfx=req.enable_transition_sfx,
             custom_script_data=render_script_data,
             on_scene_complete=_persist_progress,
+            log_callback=_log,
             generation_id=generation_id,
             **quality_kwargs(req)
         )
@@ -1516,70 +1870,30 @@ def run_render_task(generation_id: str, req: RenderRequest):
         db_manager.update_video_generation(
             generation_id, storyboard=storyboard, final_video_path=final_video, status="completed"
         )
+        try:
+            cleanup_stale_temp_files()
+        except Exception as e:
+            print(f"Post-render temp cleanup failed (non-fatal): {e}")
     except Exception as e:
         print(f"Rendering failed: {e}")
-        db_manager.update_video_generation(generation_id, status="failed")
+        db_manager.update_video_generation(generation_id, status="failed", error_message=str(e))
         notify(
             "Storyboard render failed",
             f"Render task for generation {generation_id} failed: {e}",
             context={"generation_id": generation_id, "topic": (existing or {}).get("topic")}
         )
+        raise
 
 @app.post("/api/render-storyboard")
 def api_render_storyboard(req: RenderRequest, background_tasks: BackgroundTasks):
-    background_tasks.add_task(run_render_task, req.generation_id, req)
-    return {"success": True, "generation_id": req.generation_id}
-
-@app.post("/api/generate-short")
-def api_generate_short(req: ShortRequest):
-    """
-    Automated pipeline endpoint. Logs the resulting video generation directly to DB.
-    """
+    if not db_manager.get_video_generation(req.generation_id):
+        raise HTTPException(status_code=404, detail="Generation not found")
     try:
-        gen_id = str(uuid.uuid4())
-        # Log initial draft status
-        db_manager.create_video_generation(gen_id, req.prompt, req.prompt, None, None, status="rendering")
-        
-        final_video, storyboard, topic, script_data = run_viral_shorts_pipeline_new(
-            prompt=req.prompt,
-            model=req.model,
-            hook_style=req.hook_style,
-            visual_mode=req.visual_mode,
-            art_style=req.art_style,
-            leonardo_model=req.leonardo_model,
-            voice=req.voice,
-            speed=req.speed,
-            music_style=req.music_style,
-            satisfying_background=req.satisfying_background,
-            enable_captions=req.enable_captions,
-            caption_font=req.caption_font,
-            caption_size=req.caption_size,
-            caption_margin_v=req.caption_margin_v,
-            caption_color=req.caption_color,
-            enable_search=req.enable_search,
-            caption_style="Viral Pop",
-            enable_transition_sfx=req.enable_transition_sfx,
-            generation_id=gen_id,
-            **quality_kwargs(req)
-        )
-        rel_out = os.path.relpath(final_video, os.path.abspath(os.path.curdir))
-        
-        db_manager.update_video_generation(
-            gen_id, topic=topic, script_data=script_data, storyboard=storyboard, final_video_path=final_video, status="completed"
-        )
-        
-        return {
-            "success": True,
-            "video_url": f"http://localhost:8000/{rel_out.replace(os.path.sep, '/')}",
-            "thumbnail_url": static_url(script_data.get("thumbnail_path")),
-            "storyboard": storyboard,
-            "topic": topic,
-            "youtube_metadata": script_data.get("youtube_metadata"),
-            "instagram_metadata": script_data.get("instagram_metadata"),
-            "generation_id": gen_id
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        job_queue.enqueue("render", req.generation_id, req.model_dump())
+    except job_queue.JobConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    background_tasks.add_task(drain_jobs)
+    return {"success": True, "generation_id": req.generation_id}
 
 @app.get("/api/youtube/auth-status")
 def get_youtube_auth_status():
@@ -1592,10 +1906,6 @@ def init_youtube_auth():
         return {"success": True, "message": msg}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
-@app.get("/api/instagram/auth-status")
-def get_instagram_auth_status():
-    return {"configured": is_instagram_configured()}
 
 @app.get("/api/image-provider/status")
 def get_image_provider_status(provider: Optional[str] = None):
@@ -1689,6 +1999,20 @@ def select_local_sd_model(req: SelectImageModelRequest):
         raise HTTPException(status_code=r.status_code, detail=r.text[:300])
     return r.json()
 
+def video_used_synthetic_media(storyboard) -> bool:
+    """True if any scene's visuals came from image generation rather than real
+    stock footage -- the trigger for YouTube's "Altered or Synthetic Content"
+    disclosure (``status.containsSyntheticMedia``), in full enforcement since
+    January 2026. A storyboard with no ``visual_source`` tags at all (older
+    generations, predating that field) is treated conservatively as synthetic,
+    since the pipeline's only non-stock path was AI image generation.
+    """
+    scenes = storyboard or []
+    if not scenes:
+        return False
+    return any(s.get("visual_source", "generate") == "generate" for s in scenes)
+
+
 def process_upload_job(job_id: str):
     """Executes upload processes for direct API uploads (persisted in DB)."""
     job = db_manager.get_upload_job(job_id)
@@ -1741,35 +2065,19 @@ def process_upload_job(job_id: str):
                         logs.append(f"YouTube upload progress: {pct}%")
                     db_manager.update_upload_job(job_id, logs=logs)
 
+                if not db_manager.reserve_platform_upload(gen_id, "youtube"):
+                    raise ValueError("An earlier upload may have reached YouTube. Check your channel before retrying; the upload reservation has been retained.")
                 vid_id = upload_video_to_youtube(
                     video_file,
                     yt_meta.get("title", "AI Generated Short"),
                     yt_meta.get("description", ""),
                     yt_meta.get("tags", []),
                     yt_meta.get("privacy", "private"),
-                    progress_callback=yt_progress
+                    progress_callback=yt_progress,
+                    contains_synthetic_media=video_used_synthetic_media(video_gen.get("storyboard")),
                 )
                 db_manager.record_platform_upload(gen_id, "youtube", vid_id)
                 log_message(f"YouTube upload successful! Video URL: https://youtu.be/{vid_id}")
-
-        if "instagram" in job["platforms"]:
-            if db_manager.is_platform_uploaded(gen_id, "instagram"):
-                prev = db_manager.get_platform_upload(gen_id, "instagram")
-                log_message(f"Instagram: already published (media id {prev['external_id']}); skipping to avoid duplicate.")
-            else:
-                log_message("Instagram Reels upload starting...")
-                ig_meta = job.get("instagram_metadata") or {}
-
-                def ig_progress(msg):
-                    log_message(msg)
-
-                media_id = upload_reel_to_instagram(
-                    video_file,
-                    ig_meta.get("caption", ""),
-                    progress_callback=ig_progress
-                )
-                db_manager.record_platform_upload(gen_id, "instagram", media_id)
-                log_message(f"Instagram upload successful! Media ID: {media_id}")
 
         log_message("Upload process complete!")
         db_manager.update_upload_job(job_id, status="completed", logs=logs)
@@ -1781,87 +2089,7 @@ def process_upload_job(job_id: str):
             f"Upload job {job_id} failed: {e}",
             context={"job_id": job_id, "platforms": job.get("platforms")}
         )
-
-def upload_scheduler_loop():
-    """Background polling thread for scheduled uploads."""
-    print("Starting background upload scheduler thread...")
-    while True:
-        try:
-            # Query db for scheduled jobs
-            now_iso = datetime.utcnow().isoformat() + "Z"
-            pending_jobs = db_manager.get_pending_scheduled_jobs(now_iso)
-            for job in pending_jobs:
-                job_id = job["id"]
-                # Mark job as running and process in a separate thread
-                db_manager.update_upload_job(job_id, status="running")
-                t = threading.Thread(target=process_upload_job, args=(job_id,))
-                t.daemon = True
-                t.start()
-        except Exception as e:
-            print(f"Error in upload scheduler loop: {e}")
-        time.sleep(10)
-
-def viral_agent_scheduler_loop():
-    """Background thread that runs the auto-generation agent at scheduled times."""
-    print("Starting background viral agent scheduler thread...")
-    while True:
-        try:
-            from viral_agent import load_scheduler_config, save_scheduler_config, run_viral_agent_job
-            config = load_scheduler_config()
-            
-            if config.get("enabled"):
-                now = datetime.now()
-                current_time_str = now.strftime("%H:%M")  # "HH:MM" format
-                current_date_str = now.strftime("%Y-%m-%d") # "YYYY-MM-DD" format
-                
-                time1 = config.get("time1", "10:00")
-                time2 = config.get("time2", "18:00")
-                
-                last_run_date = config.get("last_run_date", "")
-                last_run_slots = config.get("last_run_slots", [])
-                
-                # Reset slots if it's a new day
-                if last_run_date != current_date_str:
-                    last_run_date = current_date_str
-                    last_run_slots = []
-                    config["last_run_date"] = last_run_date
-                    config["last_run_slots"] = last_run_slots
-                    save_scheduler_config(config)
-                
-                # Check Slot 1
-                if current_time_str >= time1 and "slot1" not in last_run_slots:
-                    last_run_slots.append("slot1")
-                    config["last_run_slots"] = last_run_slots
-                    save_scheduler_config(config)
-                    
-                    # Trigger in background thread
-                    t = threading.Thread(target=run_viral_agent_job, args=(f"Slot 1 ({time1})", config))
-                    t.daemon = True
-                    t.start()
-                    
-                # Check Slot 2
-                elif current_time_str >= time2 and "slot2" not in last_run_slots:
-                    last_run_slots.append("slot2")
-                    config["last_run_slots"] = last_run_slots
-                    save_scheduler_config(config)
-                    
-                    # Trigger in background thread
-                    t = threading.Thread(target=run_viral_agent_job, args=(f"Slot 2 ({time2})", config))
-                    t.daemon = True
-                    t.start()
-        except Exception as e:
-            print(f"Error in viral agent scheduler loop: {e}")
-        time.sleep(30)  # Check every 30 seconds
-
-@app.on_event("startup")
-def startup_event():
-    scheduler_thread = threading.Thread(target=upload_scheduler_loop)
-    scheduler_thread.daemon = True
-    scheduler_thread.start()
-    
-    agent_thread = threading.Thread(target=viral_agent_scheduler_loop)
-    agent_thread.daemon = True
-    agent_thread.start()
+        raise
 
 @app.get("/api/history")
 def api_get_history():
@@ -1869,7 +2097,7 @@ def api_get_history():
     for row in rows:
         if row.get("final_video_path"):
             rel = os.path.relpath(row["final_video_path"], os.path.abspath(os.path.curdir))
-            row["video_url"] = f"http://localhost:8000/{rel.replace(os.path.sep, '/')}"
+            row["video_url"] = f"{PUBLIC_BASE_URL}/{rel.replace(os.path.sep, '/')}"
         else:
             row["video_url"] = ""
     return rows
@@ -1878,123 +2106,22 @@ def api_get_history():
 def api_get_upload_queue():
     return db_manager.list_upload_jobs()
 
-# --- Approval gate ---
-@app.get("/api/uploads/pending")
-def api_get_pending_approvals():
-    """Generations held for human review before publishing."""
-    return db_manager.get_upload_jobs_by_status("pending_approval")
-
-@app.post("/api/uploads/{job_id}/approve")
-def api_approve_upload(job_id: str):
-    job = db_manager.get_upload_job(job_id)
-    if not job:
-        raise HTTPException(status_code=404, detail="Upload job not found")
-    if job["status"] != "pending_approval":
-        raise HTTPException(status_code=400, detail=f"Job is not pending approval (status: {job['status']})")
-    # Flip to 'scheduled' with a past time so the upload loop picks it up promptly.
-    db_manager.update_upload_job(
-        job_id, status="scheduled",
-        logs=job.get("logs", []) + ["Approved by user; queued for publishing."]
-    )
-    return {"success": True, "job_id": job_id, "status": "scheduled"}
-
-@app.post("/api/uploads/{job_id}/reject")
-def api_reject_upload(job_id: str):
-    job = db_manager.get_upload_job(job_id)
-    if not job:
-        raise HTTPException(status_code=404, detail="Upload job not found")
-    db_manager.update_upload_job(
-        job_id, status="rejected",
-        logs=job.get("logs", []) + ["Rejected by user; will not be published."]
-    )
-    return {"success": True, "job_id": job_id, "status": "rejected"}
-
-# --- Analytics feedback loop ---
-@app.post("/api/analytics/refresh-youtube")
-def api_refresh_youtube_analytics():
-    from analytics import refresh_youtube_stats, refresh_youtube_analytics
-
-    def _is_scope_error(msg):
-        return "insufficient" in msg.lower() or "scope" in msg.lower() or "not authorized" in msg.lower()
-
-    # Each path needs read scopes the original upload-only token lacks; guard both
-    # independently so a missing grant returns a clear re-auth hint, not a 500.
-    stats_updated, retention_updated = 0, 0
-    errors = {}
-    try:
-        stats_updated = refresh_youtube_stats().get("updated", 0)
-    except Exception as e:
-        errors["stats_error"] = str(e)
-    try:
-        retention_updated = refresh_youtube_analytics().get("updated", 0)
-    except Exception as e:
-        errors["retention_error"] = str(e)
-
-    needs_reauth = any(_is_scope_error(m) for m in errors.values())
-    return {
-        "success": not errors,
-        "stats_updated": stats_updated,
-        "retention_updated": retention_updated,
-        **errors,
-        "needs_reauth": needs_reauth,
-        "hint": ("Re-authenticate YouTube to grant read access (youtube.readonly + "
-                 "yt-analytics.readonly), then retry.") if needs_reauth else None,
-    }
-
-@app.get("/api/analytics/top")
-def api_get_top_performing(limit: int = 5):
-    return db_manager.get_top_performing(limit=limit)
-
-@app.get("/api/analytics/retention-leaders")
-def api_get_retention_leaders(limit: int = 5):
-    return db_manager.get_engagement_leaders(limit=limit)
-
-@app.get("/api/competitor-signals")
-def api_competitor_signals(query: str, max_results: int = 10, refresh: bool = True):
-    """Mine YouTube for what's hot in a niche *right now*, ranked by view velocity.
-
-    Returns the hottest videos plus an LLM-ready hint about winning patterns.
-    Needs the youtube.readonly scope (same re-auth as the analytics loop).
-    """
-    if not query or not query.strip():
-        raise HTTPException(status_code=400, detail="query is required")
-    query = query.strip()
-
-    import competitor_research
-    error = None
-    if refresh:
-        try:
-            competitor_research.store_competitor_videos(query, max_results=max_results)
-        except Exception as e:
-            error = str(e)
-
-    videos = db_manager.get_top_velocity(query, limit=max_results)
-    needs_reauth = bool(error) and ("insufficient" in error.lower() or "scope" in error.lower() or "not authorized" in error.lower())
-    return {
-        "query": query,
-        "videos": videos,
-        "hint": competitor_research.get_competitor_hint(query, limit=max_results),
-        "error": error,
-        "needs_reauth": needs_reauth,
-    }
-
-# --- Cost tracking ---
-@app.get("/api/costs/today")
-def api_get_costs_today():
-    budget = cost_tracker.get_daily_budget()
-    spent = db_manager.get_spend_today("leonardo")
-    return {
-        "service": "leonardo",
-        "spent_today": spent,
-        "daily_budget": budget,
-        "remaining": (budget - spent) if budget is not None else None,
-    }
 
 @app.post("/api/schedule-upload")
-def api_schedule_upload(req: DbUploadRequest):
+def api_schedule_upload(req: DbUploadRequest, background_tasks: BackgroundTasks):
+    """Upload to YouTube now. Always immediate: the deferred/scheduled-time
+    path and its background polling thread were removed along with the rest
+    of the autonomous scheduler -- this is a one-click publish button."""
+    generation = db_manager.get_video_generation(req.video_generation_id)
+    if not generation or generation.get("status") != "completed" or not generation.get("final_video_path"):
+        raise HTTPException(status_code=400, detail="Render this video successfully before uploading.")
+    if req.platforms != ["youtube"] or req.youtube_privacy not in ("private", "unlisted", "public"):
+        raise HTTPException(status_code=422, detail="Choose YouTube and a valid privacy setting.")
+    previous = db_manager.get_platform_upload(req.video_generation_id, "youtube")
+    if previous:
+        raise HTTPException(status_code=409, detail="This video has already been uploaded or has an upload requiring review.")
     job_id = str(uuid.uuid4())
-    status = "scheduled" if req.scheduled_time else "running"
-    
+
     db_manager.create_upload_job(
         job_id,
         req.video_generation_id,
@@ -2005,18 +2132,20 @@ def api_schedule_upload(req: DbUploadRequest):
             "tags": req.youtube_tags,
             "privacy": req.youtube_privacy
         },
-        {
-            "caption": req.instagram_caption
-        },
-        status=status,
-        scheduled_time=req.scheduled_time
+        {},
+        status="queued",
     )
-    
-    if status == "running":
-        t = threading.Thread(target=process_upload_job, args=(job_id,))
-        t.daemon = True
-        t.start()
-        
+
+    try:
+        job_queue.enqueue("upload", req.video_generation_id, {"job_id": job_id})
+    except job_queue.JobConflict as exc:
+        with db_manager.get_db_connection() as conn:
+            conn.execute("DELETE FROM upload_jobs WHERE id = ?", (job_id,))
+        conn.close()
+        raise HTTPException(status_code=409, detail=str(exc))
+
+    background_tasks.add_task(drain_jobs)
+
     return {"success": True, "job_id": job_id}
 
 def static_url(path: Optional[str]) -> str:
@@ -2024,7 +2153,7 @@ def static_url(path: Optional[str]) -> str:
     if not path or not os.path.exists(path):
         return ""
     rel = os.path.relpath(path, os.path.abspath(os.path.curdir))
-    return f"http://localhost:8000/{rel.replace(os.path.sep, '/')}"
+    return f"{PUBLIC_BASE_URL}/{rel.replace(os.path.sep, '/')}"
 
 
 def thumbnail_url_for(video_path: Optional[str]) -> str:
@@ -2045,70 +2174,37 @@ def api_generation_status(generation_id: str):
         raise HTTPException(status_code=404, detail="Generation not found")
 
     video_path = gen.get("final_video_path")
+    script_data = gen.get("script_data") or {}
     return {
         "status": gen["status"],
+        # Progress stages while status == 'drafting' or 'rendering' (e.g.
+        # "generating story (attempt 2/3)"), so the frontend can poll this
+        # instead of holding one HTTP request open for a multi-minute
+        # local-LLM script generation.
+        "logs": gen.get("logs") or [],
+        "error_message": gen.get("error_message"),
+        "topic": gen.get("topic"),
         "video_url": static_url(video_path),
         "thumbnail_url": thumbnail_url_for(video_path),
         "storyboard": gen["storyboard"],
-        "youtube_metadata": gen.get("script_data", {}).get("youtube_metadata") if gen.get("script_data") else None,
-        "instagram_metadata": gen.get("script_data", {}).get("instagram_metadata") if gen.get("script_data") else None,
+        "youtube_metadata": script_data.get("youtube_metadata"),
+        "instagram_metadata": script_data.get("instagram_metadata"),
+        "validation_warnings": script_data.get("_validation_warnings"),
     }
 
 @app.delete("/api/generation/{generation_id}")
 def api_delete_generation(generation_id: str):
     try:
-        db_manager.delete_video_generation(generation_id)
+        with job_queue.resource_guard(generation_id):
+            db_manager.delete_video_generation(generation_id)
         return {"success": True}
+    except HTTPException:
+        raise
+    except ValueError as e:
+        raise HTTPException(status_code=409, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# Backward compatibility endpoints for legacy app.js uploads
-class UploadRequest(BaseModel):
-    video_path: str
-    platforms: List[str]
-    youtube_title: Optional[str] = ""
-    youtube_description: Optional[str] = ""
-    youtube_tags: Optional[List[str]] = []
-    youtube_privacy: Optional[str] = "private"
-    instagram_caption: Optional[str] = ""
-
-@app.post("/api/upload")
-def api_upload(req: UploadRequest):
-    # Find matching generation by final_video_path relative or absolute
-    # If not found, create a placeholder generation
-    generations = db_manager.list_video_generations()
-    matching_gen_id = None
-    for g in generations:
-        if g.get("final_video_path") and (req.video_path in g["final_video_path"] or g["final_video_path"] in req.video_path):
-            matching_gen_id = g["id"]
-            break
-            
-    if not matching_gen_id:
-        matching_gen_id = str(uuid.uuid4())
-        db_manager.create_video_generation(matching_gen_id, "Legacy upload", "Legacy upload", None, None, status="completed")
-        db_manager.update_video_generation(matching_gen_id, final_video_path=req.video_path)
-        
-    job_id = str(uuid.uuid4())
-    db_manager.create_upload_job(
-        job_id,
-        matching_gen_id,
-        req.platforms,
-        {
-            "title": req.youtube_title,
-            "description": req.youtube_description,
-            "tags": req.youtube_tags,
-            "privacy": req.youtube_privacy
-        },
-        {
-            "caption": req.instagram_caption
-        },
-        status="running"
-    )
-    
-    t = threading.Thread(target=process_upload_job, args=(job_id,))
-    t.daemon = True
-    t.start()
-    return {"job_id": job_id}
 
 @app.get("/api/upload-status/{job_id}")
 def get_upload_status(job_id: str):
@@ -2118,186 +2214,15 @@ def get_upload_status(job_id: str):
     return job
 
 
-@app.get("/api/trends")
-def get_trends(geo: str = "IN"):
-    import xml.etree.ElementTree as ET
-    url = f"https://trends.google.com/trending/rss?geo={geo.upper()}"
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
-    }
-    try:
-        response = requests.get(url, headers=headers, timeout=10)
-        if response.status_code != 200:
-            raise HTTPException(status_code=response.status_code, detail=f"Failed to fetch Google Trends: HTTP {response.status_code}")
-        
-        root = ET.fromstring(response.text)
-        namespaces = {
-            'ht': 'https://trends.google.com/trending/rss'
-        }
-        
-        items = []
-        for item in root.findall('.//item'):
-            title = item.find('title').text
-            
-            traffic_el = item.find('ht:approx_traffic', namespaces)
-            traffic = traffic_el.text if traffic_el is not None else "Unknown"
-            
-            picture_el = item.find('ht:picture', namespaces)
-            picture_url = picture_el.text if picture_el is not None else ""
-            
-            news_items = []
-            for news in item.findall('ht:news_item', namespaces):
-                news_title = news.find('ht:news_item_title', namespaces)
-                news_snippet = news.find('ht:news_item_snippet', namespaces)
-                news_url = news.find('ht:news_item_url', namespaces)
-                
-                news_items.append({
-                    "title": news_title.text if news_title is not None else "",
-                    "snippet": news_snippet.text if news_snippet is not None else "",
-                    "url": news_url.text if news_url is not None else ""
-                })
-            
-            top_news_title = news_items[0]["title"] if news_items else ""
-            top_news_url = news_items[0]["url"] if news_items else ""
-            top_news_snippet = news_items[0]["snippet"] if news_items else ""
-            
-            items.append({
-                "title": title,
-                "traffic": traffic,
-                "picture_url": picture_url,
-                "news_title": top_news_title,
-                "news_url": top_news_url,
-                "news_snippet": top_news_snippet,
-                "all_news": news_items
-            })
-        return items
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error parsing Google Trends feed: {str(e)}")
 
-
-@app.get("/api/recommend-topics")
-def recommend_topics(geo: str = "US", count: int = 5, model: Optional[str] = None,
-                     focus: str = ""):
-    """Recommend fresh, non-repeating viral topics for a high-RPM market.
-
-    Subject areas are discovered per call rather than drawn from a fixed list,
-    so any subject the model knows about is reachable -- a constant list would
-    cap the topic space the same way the old 31-entry curiosity library did.
-    Grounded in live Google Trends and Wikipedia signals. Novelty is enforced
-    with a hard keyword filter against previously-generated topics, not a
-    prompt instruction: the prompt-only approach let five reworded variants of
-    the same ocean fact into the library.
-
-    ``focus`` optionally constrains every suggestion to one interest (e.g.
-    "cricket", "cooking") for creators working a specific niche.
-
-    Returns {title, rationale, niche, rpm_tier, est_rpm, geo, source}.
-    """
-    # Lazy import: viral_agent imports from backend at module load (circular).
-    from viral_agent import ALLOWED_RPM_GEOS
-    import trend_analyser
-
-    geo = (geo or "US").upper()
-    if geo not in ALLOWED_RPM_GEOS:
-        geo = "US"
-    count = max(1, min(count, 8))
-    # Default to whatever the scheduler is configured to use, so the UI and the
-    # auto-agent stay on the same model instead of this silently pinning a
-    # cloud model that may be out of quota.
-    if not model:
-        try:
-            from viral_agent import load_scheduler_config
-            model = load_scheduler_config().get("model")
-        except Exception:
-            model = None
-        model = model or "qwen2.5:7b-instruct"
-
-    performance_hint = ""
-    exclude_topics = []
-    try:
-        import analytics
-        performance_hint = analytics.get_performance_hint()
-    except Exception as e:
-        print(f"recommend_topics: performance hint unavailable: {e}")
-    try:
-        exclude_topics = db_manager.get_recent_topics(40)
-    except Exception as e:
-        print(f"recommend_topics: recent topics unavailable: {e}")
-
-    try:
-        return trend_analyser.analyse(
-            geo=geo, model=model, count=count,
-            used_topics=exclude_topics,
-            performance_hint=performance_hint,
-            focus=(focus or "").strip(),
-        )
-    except Exception as e:
-        # Surfaced, not swallowed. The old code fell back to raw Google Trends
-        # headlines on any failure, so the UI presented "lindsay clancy trial
-        # live" as a curated recommendation with no sign that ranking had died.
-        raise HTTPException(
-            status_code=502,
-            detail=f"Topic analysis failed ({e}). Check that Ollama is running and "
-                   f"the model '{model}' is available.")
-
-
-# Scheduler Config & Logs API
-class SchedulerConfigUpdate(BaseModel):
-    enabled: bool
-    region: str
-    time1: str
-    time2: str
-    model: str
-    leonardo_model: str
-    voice: str
-    privacy: str
-    enable_captions: bool
-    caption_font: str
-    caption_size: int
-    caption_margin_v: int
-    caption_color: str
-    caption_style: str
-    topic_source: str = "trends"
-    curiosity_category: str = "All"
-
-@app.get("/api/curiosity-topics")
-def get_curiosity_topics():
-    """Serve the curated curiosity-topic library (single source of truth shared
-    with the auto-agent scheduler) plus the list of categories."""
-    from curiosity_topics import CURIOSITY_TOPICS, get_categories
-    return {"topics": CURIOSITY_TOPICS, "categories": get_categories()}
-
-@app.get("/api/scheduler/config")
-def get_scheduler_config():
-    from viral_agent import load_scheduler_config
-    return load_scheduler_config()
-
-@app.post("/api/scheduler/config")
-def update_scheduler_config(req: SchedulerConfigUpdate):
-    from viral_agent import load_scheduler_config, save_scheduler_config
-    config = load_scheduler_config()
-    config.update(req.dict())
-    save_scheduler_config(config)
-    return {"success": True, "config": config}
-
-@app.get("/api/scheduler/logs")
-def get_scheduler_logs():
-    from viral_agent import load_scheduler_logs
-    return load_scheduler_logs()
-
-@app.delete("/api/scheduler/logs")
-def delete_scheduler_logs():
-    from viral_agent import save_scheduler_logs
-    save_scheduler_logs([])
-    return {"success": True, "message": "Scheduler execution logs cleared."}
-
-@app.post("/api/scheduler/trigger")
-def trigger_scheduler_agent(background_tasks: BackgroundTasks):
-    from viral_agent import run_viral_agent_job
-    background_tasks.add_task(run_viral_agent_job, "Manual Trigger")
-    return {"success": True, "message": "Viral Agent run triggered in background."}
+def drain_jobs():
+    job_queue.drain({
+        "draft": lambda payload: run_draft_task(payload.pop("generation_id"), DraftRequest(**payload)),
+        "render": lambda payload: run_render_task(payload["generation_id"], RenderRequest(**payload)),
+        "upload": lambda payload: process_upload_job(payload["job_id"]),
+    })
 
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("backend:app", host="0.0.0.0", port=8000, reload=False)
+    uvicorn.run("backend:app", host=os.getenv("BACKEND_HOST", "127.0.0.1"), port=8000, reload=False)

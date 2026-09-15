@@ -145,3 +145,57 @@ def test_scene_durations_survive_into_the_final_file(render):
     expected = sum(s["duration"] for s in storyboard)
     actual = vq.probe(video)["duration"]
     assert abs(actual - expected) < 0.5, f"expected ~{expected:.2f}s, got {actual:.2f}s"
+
+
+def test_two_renders_with_different_generation_ids_never_collide(render):
+    """Reproduced live: output/temp filenames were keyed off a bare
+    int(time.time()) with second resolution. Two renders that resolved to the
+    same second -- easy with a fast/resumed render, e.g. re-rendering right
+    after tweaking a caption setting -- landed on the IDENTICAL
+    viral_reel_<ts>.mp4, so the second silently overwrote the first mid-write.
+    That's the real root cause behind "the caption slider doesn't do
+    anything" -- not the caption math itself (verified separately), but the
+    file being looked at could be from an unrelated race.
+    """
+    video_a, *_ = render(generation_id="gen-aaaa")
+    video_b, *_ = render(generation_id="gen-bbbb")
+
+    assert video_a != video_b
+    assert os.path.exists(video_a)
+    assert os.path.exists(video_b)
+
+
+def test_rerendering_the_same_generation_id_replaces_its_own_output(render):
+    """Not a bug: re-rendering the SAME generation (e.g. after tweaking a
+    setting) should deterministically replace that generation's own previous
+    file -- there's no concurrent access, so no race, and the caller expects
+    the latest render to be what's there."""
+    video_1, *_ = render(generation_id="gen-cccc")
+    video_2, *_ = render(generation_id="gen-cccc")
+
+    assert video_1 == video_2
+    assert os.path.exists(video_2)
+
+
+def test_two_renders_with_no_generation_id_still_never_collide(render):
+    """The fallback path (generation_id=None) must stay collision-safe too --
+    a bare timestamp isn't enough on its own, since two fast/resumed renders
+    can share the same second."""
+    video_a, *_ = render(generation_id=None)
+    video_b, *_ = render(generation_id=None)
+
+    assert video_a != video_b
+    assert os.path.exists(video_a)
+    assert os.path.exists(video_b)
+
+
+def test_empty_storyboard_fails_loudly_before_reaching_ffmpeg(render):
+    """Reproduced live: /api/render-storyboard was called with an empty
+    storyboard (a caller bug -- passing `storyboard: []` instead of the
+    drafted scenes). That flows into custom_script_data={"scenes": []}, which
+    takes priority over custom_storyboard, so scenes ends up empty and a
+    0-byte concat list reached ffmpeg as an opaque `exit 183` with no
+    indication the real problem was upstream. It must fail with a clear
+    message instead of ever reaching ffmpeg."""
+    with pytest.raises(RuntimeError, match="No scene segments to render"):
+        render(custom_script_data={"scenes": []})
