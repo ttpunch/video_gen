@@ -1,19 +1,16 @@
 "use client";
 
-import React, { useState, useEffect, useRef } from "react";
+/* eslint-disable @next/next/no-img-element -- Native previews for dynamically generated local media. */
+import React, { useState, useEffect, useRef, useCallback } from "react";
 import {
   Tv, Sparkles, Settings, AlertCircle, FileText, CheckCircle2,
   Layers, Image as ImageIcon, RefreshCw, Subtitles,
   Trash2, Gauge, Download
 } from "lucide-react";
 
-interface StoryboardScene {
-  scene: number;
-  narration: string;
-  image_url: string;
-  audio_url: string;
-  duration: number;
-}
+import { pollUntil } from "../lib/poll";
+import { API_BASE, errorMessage } from "../lib/api";
+import type { StoryboardScene, Generation, UploadJob, ImageProviderStatus, LocalModel, GenerationStatus } from "../lib/studio-types";
 
 interface BackendConfig {
   voices: string[];
@@ -55,15 +52,13 @@ export default function Home() {
   const [activeTab, setActiveTab] = useState<"viral" | "library" | "queue">("viral");
   const [config, setConfig] = useState<BackendConfig | null>(null);
   const [backendError, setBackendError] = useState<string | null>(null);
-  const [loading, setLoading] = useState(false);
+  const loading = false;
   const [logs, setLogs] = useState<string[]>([]);
   const [statusText, setStatusText] = useState("");
   
   // Results
   const [finalVideoUrl, setFinalVideoUrl] = useState<string | null>(null);
-  const [presenterImageUrl, setPresenterImageUrl] = useState<string | null>(null);
-  const [voiceAudioUrl, setVoiceAudioUrl] = useState<string | null>(null);
-  const [storyboard, setStoryboard] = useState<any[]>([]);
+  const [storyboard, setStoryboard] = useState<StoryboardScene[]>([]);
   const [generatedTopic, setGeneratedTopic] = useState("");
   const [generationId, setGenerationId] = useState<string | null>(null);
 
@@ -74,8 +69,8 @@ export default function Home() {
   const [regeneratingAssetType, setRegeneratingAssetType] = useState<string | null>(null);
 
   // History & Queue states
-  const [history, setHistory] = useState<any[]>([]);
-  const [uploadQueue, setUploadQueue] = useState<any[]>([]);
+  const [history, setHistory] = useState<Generation[]>([]);
+  const [uploadQueue, setUploadQueue] = useState<UploadJob[]>([]);
 
   // Input states: Viral Shorts Studio
   const [viralPrompt, setViralPrompt] = useState("The giant hidden ocean underneath Jupiter's moon Europa");
@@ -92,7 +87,7 @@ export default function Home() {
   const [durationPreset, setDurationPreset] = useState("Standard (25-35s)");
   const [enableCaptions, setEnableCaptions] = useState(true);
   const [enableTransitionSfx, setEnableTransitionSfx] = useState(false);
-  const [captionFont, setCaptionFont] = useState("Arial");
+  const [captionFont] = useState("Arial");
   const [captionSize, setCaptionSize] = useState(72);
   const [captionMarginV, setCaptionMarginV] = useState(150);
   const [captionColor, setCaptionColor] = useState("&H00FFFF&");
@@ -112,8 +107,8 @@ export default function Home() {
 
   // Social Media Upload States
   const [isYtAuthenticated, setIsYtAuthenticated] = useState(false);
-  const [imageProviderStatus, setImageProviderStatus] = useState<any>(null);
-  const [sdModels, setSdModels] = useState<any[]>([]);
+  const [imageProviderStatus, setImageProviderStatus] = useState<ImageProviderStatus | null>(null);
+  const [sdModels, setSdModels] = useState<LocalModel[]>([]);
   const [sdCurrentModel, setSdCurrentModel] = useState<string>("");
   const [switchingModel, setSwitchingModel] = useState(false);
   const [imageProvider, setImageProvider] = useState("");
@@ -126,23 +121,99 @@ export default function Home() {
 
   // YouTube specific upload states
   const [ytIsUploading, setYtIsUploading] = useState(false);
-  const [ytUploadJobId, setYtUploadJobId] = useState<string | null>(null);
   const [ytUploadLogs, setYtUploadLogs] = useState<string[]>([]);
 
   const consoleEndRef = useRef<HTMLDivElement>(null);
 
-  const refreshReadiness = async () => {
+  const generationPoll = useRef<AbortController | null>(null);
+  const monitorGeneration = useCallback(async (id: string) => {
+    generationPoll.current?.abort();
+    const controller = new AbortController();
+    generationPoll.current = controller;
+    localStorage.setItem("active-generation", id);
+    setGenerationId(id);
+    try {
+      await pollUntil<GenerationStatus>(`${API_BASE}/api/generation-status/${id}`, (data) => {
+        setLogs(data.logs || []);
+        setStatusText(data.logs?.at(-1) || data.status);
+        if (data.status === "drafting" || data.status === "rendering") {
+          setDrafting(data.status === "drafting");
+          setRendering(data.status === "rendering");
+          return false;
+        }
+        setDrafting(false);
+        setRendering(false);
+        setStoryboard(data.storyboard || []);
+        setGeneratedTopic(data.topic || "");
+        if (data.status === "failed") {
+          setStatusText("Failed — saved scenes are available for retry.");
+          setLogs((prev) => [...prev, data.error_message || "Generation failed."]);
+        } else {
+          setStatusText(data.status === "completed" ? "Finished!" : "Draft ready");
+          setFinalVideoUrl(data.video_url || null);
+          setThumbnailUrl(data.thumbnail_url || null);
+          setUploadTitle(data.youtube_metadata?.title || data.topic || "");
+          setUploadDescription(data.youtube_metadata?.description || "");
+          setUploadTags(data.youtube_metadata?.tags?.join(", ") || "");
+          if (data.validation_warnings?.length) {
+            setLogs((prev) => [...prev, ...data.validation_warnings!]);
+          }
+        }
+        localStorage.removeItem("active-generation");
+        return true;
+      }, controller.signal);
+    } catch (error) {
+      setDrafting(false);
+      setRendering(false);
+      setStatusText(errorMessage(error));
+      setLogs((prev) => [...prev, errorMessage(error)]);
+    }
+  }, []);
+
+  useEffect(() => {
+    const active = localStorage.getItem("active-generation");
+    if (active) void monitorGeneration(active);
+    return () => generationPoll.current?.abort();
+  }, [monitorGeneration]);
+
+  const uploadPoll = useRef<AbortController | null>(null);
+  const monitorUpload = useCallback(async (id: string) => {
+    uploadPoll.current?.abort();
+    const controller = new AbortController();
+    uploadPoll.current = controller;
+    localStorage.setItem("active-upload", id);
+    setYtIsUploading(true);
+    try {
+      await pollUntil<UploadJob>(`${API_BASE}/api/upload-status/${id}`, (data) => {
+        setYtUploadLogs(data.logs || []);
+        if (data.status !== "completed" && data.status !== "failed") return false;
+        localStorage.removeItem("active-upload");
+        setYtIsUploading(false);
+        return true;
+      }, controller.signal);
+    } catch (error) {
+      setYtIsUploading(false);
+      setYtUploadLogs((prev) => [...prev, errorMessage(error)]);
+    }
+  }, []);
+  useEffect(() => {
+    const active = localStorage.getItem("active-upload");
+    if (active) void monitorUpload(active);
+    return () => uploadPoll.current?.abort();
+  }, [monitorUpload]);
+
+  const refreshReadiness = useCallback(async () => {
     setIsCheckingReadiness(true);
     try {
       // Fetch YouTube authentication status
-      const ytAuthRes = await fetch("http://localhost:8000/api/youtube/auth-status");
+      const ytAuthRes = await fetch(`${API_BASE}/api/youtube/auth-status`);
       if (ytAuthRes.ok) {
         const ytAuthData = await ytAuthRes.json();
         setIsYtAuthenticated(ytAuthData.authenticated);
       }
       
       // Fetch active image provider + local SD server status
-      const imgRes = await fetch("http://localhost:8000/api/image-provider/status");
+      const imgRes = await fetch(`${API_BASE}/api/image-provider/status`);
       if (imgRes.ok) {
         const data = await imgRes.json();
         setImageProviderStatus(data);
@@ -153,13 +224,13 @@ export default function Home() {
     } finally {
       setIsCheckingReadiness(false);
     }
-  };
+  }, []);
 
   // Fetch config on load
-  const loadConfig = async () => {
+  const loadConfig = useCallback(async () => {
     try {
       setBackendError(null);
-      const res = await fetch("http://localhost:8000/api/config");
+      const res = await fetch(`${API_BASE}/api/config`);
       if (!res.ok) throw new Error("Backend response error");
       const data: BackendConfig = await res.json();
       setConfig(data);
@@ -169,14 +240,14 @@ export default function Home() {
       }
 
       await refreshReadiness();
-    } catch (err) {
+    } catch {
       setBackendError("Could not connect to FastAPI backend on http://localhost:8000. Please start the backend server by running `.venv/bin/python backend.py`.");
     }
-  };
+  }, [refreshReadiness]);
 
   useEffect(() => {
     loadConfig();
-  }, []);
+  }, [loadConfig]);
 
   useEffect(() => {
     if (consoleEndRef.current) {
@@ -191,7 +262,7 @@ export default function Home() {
   const handleChangeImageProvider = async (provider: string) => {
     setImageProvider(provider);
     try {
-      const res = await fetch(`http://localhost:8000/api/image-provider/status?provider=${provider}`);
+      const res = await fetch(`${API_BASE}/api/image-provider/status?provider=${provider}`);
       if (res.ok) setImageProviderStatus(await res.json());
     } catch (err) {
       console.error("Failed to check image provider status:", err);
@@ -200,7 +271,7 @@ export default function Home() {
     // look, so load the catalog as soon as the local engine is selected.
     if (provider === "local") {
       try {
-        const res = await fetch("http://localhost:8000/api/image-provider/models");
+        const res = await fetch(`${API_BASE}/api/image-provider/models`);
         if (res.ok) {
           const data = await res.json();
           setSdModels(data.catalog || []);
@@ -216,7 +287,7 @@ export default function Home() {
     setSwitchingModel(true);
     addLog(`Switching local image model to ${model}...`);
     try {
-      const res = await fetch("http://localhost:8000/api/image-provider/models/select", {
+      const res = await fetch(`${API_BASE}/api/image-provider/models/select`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ model })
@@ -232,8 +303,8 @@ export default function Home() {
         addLog(`First render with this model downloads ~${data.download_gb}GB.`);
       }
       handleChangeImageProvider("local");
-    } catch (err: any) {
-      addLog(`❌ Could not switch model: ${err.message || err}`);
+    } catch (err: unknown) {
+      addLog(`❌ Could not switch model: ${errorMessage(err)}`);
     } finally {
       setSwitchingModel(false);
     }
@@ -281,9 +352,8 @@ export default function Home() {
     // LLM call previously held this fetch open with no way to show progress
     // or give up cleanly -- reproduced live as a 280s hang with no response).
     // Poll generation-status instead of awaiting one long request.
-    let seenLogCount = 0;
     try {
-      const response = await fetch("http://localhost:8000/api/draft-script", {
+      const response = await fetch(`${API_BASE}/api/draft-script`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -304,50 +374,9 @@ export default function Home() {
       const { generation_id } = await response.json();
       setGenerationId(generation_id);
 
-      await new Promise<void>((resolve, reject) => {
-        const interval = setInterval(async () => {
-          try {
-            const res = await fetch(`http://localhost:8000/api/generation-status/${generation_id}`);
-            if (!res.ok) return;
-            const status = await res.json();
-
-            const newLogs: string[] = (status.logs || []).slice(seenLogCount);
-            newLogs.forEach((line: string) => addLog(line));
-            seenLogCount = (status.logs || []).length;
-
-            if (status.status === "draft") {
-              clearInterval(interval);
-              clearTimeout(timeout);
-              setStoryboard(status.storyboard || []);
-              setGeneratedTopic(status.topic || "");
-              setUploadTitle(status.youtube_metadata?.title || status.topic || "");
-              setUploadDescription(status.youtube_metadata?.description || "");
-              setUploadTags(status.youtube_metadata?.tags?.join(", ") || "");
-              if (status.validation_warnings?.length) {
-                addLog(`⚠️ Draft used the least-bad attempt: ${status.validation_warnings.join("; ")}`);
-              }
-              addLog("✅ Script draft generated! Storyboard scenes are now ready for your edits.");
-              resolve();
-            } else if (status.status === "failed") {
-              clearInterval(interval);
-              clearTimeout(timeout);
-              reject(new Error(status.error_message || "Draft generation failed"));
-            }
-          } catch (pollErr) {
-            console.error("Error polling draft status:", pollErr);
-          }
-        }, 2000);
-
-        // Local 7B models can legitimately take several minutes across
-        // retries; give up client-side well past that rather than polling
-        // forever if the backend itself never reaches a terminal status.
-        const timeout = setTimeout(() => {
-          clearInterval(interval);
-          reject(new Error("Drafting timed out after 8 minutes with no result."));
-        }, 8 * 60 * 1000);
-      });
-    } catch (err: any) {
-      addLog(`❌ ERROR drafting script: ${err.message || err}`);
+      await monitorGeneration(generation_id);
+    } catch (err: unknown) {
+      addLog(`❌ ERROR drafting script: ${errorMessage(err)}`);
     } finally {
       setDrafting(false);
     }
@@ -367,7 +396,7 @@ export default function Home() {
     addLog(`Caption Style: ${captionStyle}`);
     
     try {
-      const response = await fetch("http://localhost:8000/api/render-storyboard", {
+      const response = await fetch(`${API_BASE}/api/render-storyboard`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -375,6 +404,7 @@ export default function Home() {
           storyboard: storyboard,
           visual_mode: visualMode,
           image_provider: imageProvider,
+          local_image_model: sdCurrentModel,
           leonardo_model: viralLeonardoModel,
           voice: viralVoice,
           speed: viralVoiceSpeed,
@@ -406,43 +436,11 @@ export default function Home() {
       addLog("⏳ Video rendering task queued in the background. Polling render status...");
       setStatusText("Rendering...");
       
-      // Poll rendering status
-      const interval = setInterval(async () => {
-        try {
-          const statusRes = await fetch(`http://localhost:8000/api/generation-status/${generationId}`);
-          if (statusRes.ok) {
-            const data = await statusRes.json();
-            if (data.status === "completed") {
-              setFinalVideoUrl(data.video_url);
-              setThumbnailUrl(data.thumbnail_url || null);
-              setStoryboard(data.storyboard);
-              setStatusText("Finished!");
-              addLog("🎉 Success! Render complete.");
-              clearInterval(interval);
-              setRendering(false);
-              loadHistory(); // refresh library
-            } else if (data.status === "failed") {
-              setStatusText("Failed");
-              addLog("❌ Video rendering failed on the server.");
-              clearInterval(interval);
-              setRendering(false);
-            } else {
-              addLog("Rendering still in progress...");
-            }
-          }
-        } catch (err) {
-          console.error("Error polling render status:", err);
-        }
-      }, 3000);
-      
-      // Auto-clear after 10 minutes
-      setTimeout(() => {
-        clearInterval(interval);
-        setRendering(false);
-      }, 600000);
-      
-    } catch (err: any) {
-      addLog(`❌ ERROR starting render: ${err.message || err}`);
+      await monitorGeneration(generationId);
+      await loadHistory();
+
+    } catch (err: unknown) {
+      addLog(`❌ ERROR starting render: ${errorMessage(err)}`);
       setRendering(false);
     }
   };
@@ -462,10 +460,13 @@ export default function Home() {
         prompt: assetType === "image" ? scene.visual_prompt : scene.narration,
         voice: scene.speaker || viralVoice,
         speed: viralVoiceSpeed,
-        leonardo_model: viralLeonardoModel
+        leonardo_model: viralLeonardoModel,
+        image_provider: imageProvider,
+        local_image_model: sdCurrentModel,
+        visual_source_mode: visualSourceMode
       };
       
-      const response = await fetch("http://localhost:8000/api/regenerate-scene-asset", {
+      const response = await fetch(`${API_BASE}/api/regenerate-scene-asset`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(payload)
@@ -477,11 +478,16 @@ export default function Home() {
       
       const result = await response.json();
       const updatedStoryboard = [...storyboard];
-      updatedStoryboard[sceneIndex] = result.scene;
+      updatedStoryboard[sceneIndex] = {
+        ...result.scene,
+        narration: assetType === "audio" ? result.scene.narration : scene.narration,
+        speaker: assetType === "audio" ? result.scene.speaker : scene.speaker,
+        visual_prompt: assetType === "image" ? result.scene.visual_prompt : scene.visual_prompt,
+      };
       setStoryboard(updatedStoryboard);
       addLog(`✅ Scene ${sceneIndex + 1} ${assetType} regenerated successfully.`);
-    } catch (err: any) {
-      addLog(`❌ ERROR regenerating ${assetType}: ${err.message || err}`);
+    } catch (err: unknown) {
+      addLog(`❌ ERROR regenerating ${assetType}: ${errorMessage(err)}`);
     } finally {
       setRegeneratingSceneIdx(null);
       setRegeneratingAssetType(null);
@@ -490,7 +496,7 @@ export default function Home() {
 
   const loadHistory = async () => {
     try {
-      const res = await fetch("http://localhost:8000/api/history");
+      const res = await fetch(`${API_BASE}/api/history`);
       if (res.ok) {
         setHistory(await res.json());
       }
@@ -505,7 +511,7 @@ export default function Home() {
     }
     
     try {
-      const res = await fetch(`http://localhost:8000/api/generation/${genId}`, {
+      const res = await fetch(`${API_BASE}/api/generation/${genId}`, {
         method: "DELETE",
       });
       if (res.ok) {
@@ -528,15 +534,15 @@ export default function Home() {
         const errorData = await res.json();
         alert(`Failed to delete generation: ${errorData.detail || res.statusText}`);
       }
-    } catch (err: any) {
+    } catch (err: unknown) {
       console.error("Failed to delete generation:", err);
-      alert(`Error deleting generation: ${err.message || err}`);
+      alert(`Error deleting generation: ${errorMessage(err)}`);
     }
   };
 
   const loadUploadQueue = async () => {
     try {
-      const res = await fetch("http://localhost:8000/api/upload-queue");
+      const res = await fetch(`${API_BASE}/api/upload-queue`);
       if (res.ok) {
         setUploadQueue(await res.json());
       }
@@ -545,17 +551,11 @@ export default function Home() {
     }
   };
 
-  const handleGenerateViralShort = async () => {
-    // Wrapper to trigger two-stage flow
-    await handleDraftStoryboard();
-  };
-
-
 
   const handleInitYoutubeAuth = async () => {
     addLog("🔑 Launching YouTube OAuth Authentication flow...");
     try {
-      const res = await fetch("http://localhost:8000/api/youtube/auth-init");
+      const res = await fetch(`${API_BASE}/api/youtube/auth-init`);
       if (!res.ok) {
         const data = await res.json();
         throw new Error(data.detail || "Failed to start auth flow");
@@ -564,7 +564,7 @@ export default function Home() {
       
       const interval = setInterval(async () => {
         try {
-          const statusRes = await fetch("http://localhost:8000/api/youtube/auth-status");
+          const statusRes = await fetch(`${API_BASE}/api/youtube/auth-status`);
           if (statusRes.ok) {
             const statusData = await statusRes.json();
             if (statusData.authenticated) {
@@ -579,8 +579,8 @@ export default function Home() {
       }, 3000);
       
       setTimeout(() => clearInterval(interval), 120000);
-    } catch (err: any) {
-      addLog(`❌ OAuth Error: ${err.message || err}`);
+    } catch (err: unknown) {
+      addLog(`❌ OAuth Error: ${errorMessage(err)}`);
     }
   };
 
@@ -603,7 +603,7 @@ export default function Home() {
         youtube_privacy: uploadPrivacy,
       };
 
-      const res = await fetch("http://localhost:8000/api/schedule-upload", {
+      const res = await fetch(`${API_BASE}/api/schedule-upload`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(payload)
@@ -615,35 +615,13 @@ export default function Home() {
       }
 
       const result = await res.json();
-      setYtUploadJobId(result.job_id);
       setYtUploadLogs(prev => [...prev, "🚀 YouTube upload started!"]);
       loadUploadQueue(); // refresh queue list
 
-      // Poll job status
-      const interval = setInterval(async () => {
-        try {
-          const statusRes = await fetch(`http://localhost:8000/api/upload-status/${result.job_id}`);
-          if (statusRes.ok) {
-            const statusData = await statusRes.json();
-            setYtUploadLogs(statusData.logs);
-
-            if (statusData.status === "completed" || statusData.status === "failed") {
-              setYtIsUploading(false);
-              clearInterval(interval);
-              loadUploadQueue();
-            }
-          }
-        } catch (err) {
-          console.error("Error polling YouTube upload status:", err);
-        }
-      }, 1500);
-
-      setTimeout(() => {
-        clearInterval(interval);
-        setYtIsUploading(false);
-      }, 300000);
-    } catch (error: any) {
-      setYtUploadLogs(prev => [...prev, `❌ Error: ${error.message || error}`]);
+      await monitorUpload(result.job_id);
+      await loadUploadQueue();
+    } catch (error: unknown) {
+      setYtUploadLogs(prev => [...prev, `❌ Error: ${errorMessage(error)}`]);
       setYtIsUploading(false);
     }
   };
@@ -902,12 +880,12 @@ export default function Home() {
                           disabled={switchingModel}
                           onChange={(e) => handleSelectSdModel(e.target.value)}
                         >
-                          {sdModels.map((m: any) => (
+                          {sdModels.map((m) => (
                             <option key={m.id} value={m.id}>{m.name}</option>
                           ))}
                         </select>
                         {(() => {
-                          const active = sdModels.find((m: any) => m.id === sdCurrentModel);
+                          const active = sdModels.find((m) => m.id === sdCurrentModel);
                           if (!active) return null;
                           return (
                             <p className="form-label-info">
@@ -1645,7 +1623,7 @@ export default function Home() {
                           </div>
                         )}
                         
-                        {item.status === "draft" && (
+                        {(item.status === "draft" || (item.status === "failed" && item.storyboard?.length > 0)) && (
                           <div style={{ padding: "12px", background: "rgba(255,255,255,0.02)", borderRadius: "8px", border: "1px dashed rgba(255,255,255,0.05)", margin: "10px 0", textAlign: "center", color: "var(--text-secondary)", fontSize: "12px" }}>
                             📝 Storyboard draft ready for editing.
                           </div>
@@ -1689,7 +1667,7 @@ export default function Home() {
                         </button>
                       )}
 
-                      {item.status === "draft" && (
+                      {(item.status === "draft" || (item.status === "failed" && item.storyboard?.length > 0)) && (
                         <button
                           onClick={() => {
                             setGenerationId(item.id);
@@ -1891,7 +1869,9 @@ export default function Home() {
                     
                     {/* Left Column: Visual Asset */}
                     <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: "10px" }}>
-                      {scene.image_url ? (
+                      {scene.clip_url ? (
+                        <video src={scene.clip_url} controls style={{ width: "100%", maxHeight: "240px" }} />
+                      ) : scene.image_url ? (
                         <img
                           src={scene.image_url}
                           alt={`Scene ${idx + 1}`}

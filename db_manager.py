@@ -10,7 +10,7 @@ DB_PATH = os.environ.get("VIDEO_STUDIO_DB") or os.path.abspath(
 )
 
 def get_db_connection():
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=30)
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -653,101 +653,69 @@ def get_pending_scheduled_jobs(now_iso):
     return results
 
 def delete_video_generation(gen_id):
-    """Deletes a video generation from DB and also removes its video file and storyboard assets."""
+    """Delete only explicitly referenced, app-owned, unshared media.
+
+    Legacy filenames contain timestamps, which are not ownership identifiers.
+    Never infer ownership from a time window or follow paths outside media roots.
+    """
+    from pathlib import Path
+
     conn = get_db_connection()
-    cursor = conn.cursor()
-    
-    # 1. Fetch info before deletion to get file paths
-    cursor.execute("SELECT storyboard, final_video_path FROM video_generations WHERE id = ?", (gen_id,))
-    row = cursor.fetchone()
-    
-    if row:
-        storyboard_json, final_video_path = row
-        
-        # A. Collect all timestamps associated with this generation to clean up the temp folder
-        timestamps = set()
-        import re
-        
-        def extract_timestamps(path_str):
-            if path_str:
-                # Find all sequences of 9-10 digits (Unix timestamps)
-                for match in re.findall(r'\d{9,10}', os.path.basename(path_str)):
-                    timestamps.add(int(match))
-        
-        extract_timestamps(final_video_path)
-        if storyboard_json:
-            try:
-                storyboard = json.loads(storyboard_json)
-                for scene in storyboard:
-                    extract_timestamps(scene.get("image_path"))
-                    extract_timestamps(scene.get("audio_path"))
-            except Exception:
-                pass
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute("SELECT * FROM video_generations WHERE id = ?", (gen_id,)).fetchone()
+        if not row:
+            return
+        if row["status"] in ("drafting", "rendering"):
+            raise ValueError("Wait for this generation to finish before deleting it.")
+        active = conn.execute(
+            "SELECT 1 FROM upload_jobs WHERE video_generation_id = ? AND status IN ('running', 'queued', 'scheduled')",
+            (gen_id,),
+        ).fetchone()
+        if active:
+            raise ValueError("Wait for this upload to finish before deleting its video.")
 
-        # B. Delete final video file
-        if final_video_path and os.path.exists(final_video_path):
-            try:
-                os.remove(final_video_path)
-            except Exception as e:
-                print(f"Error removing final video file {final_video_path}: {e}")
-                
-        # C. Delete storyboard asset files (like generated scene images and narration audio clips)
-        if storyboard_json:
-            try:
-                storyboard = json.loads(storyboard_json)
-                for scene in storyboard:
-                    # Delete scene image
-                    img_path = scene.get("image_path")
-                    if img_path and os.path.exists(img_path):
-                        try:
-                            os.remove(img_path)
-                        except Exception as e:
-                            print(f"Error removing image: {img_path}, error: {e}")
-                            
-                    # Delete scene voice audio
-                    audio_path = scene.get("audio_path")
-                    if audio_path and os.path.exists(audio_path):
-                        try:
-                            os.remove(audio_path)
-                        except Exception as e:
-                            print(f"Error removing audio: {audio_path}, error: {e}")
-            except Exception as e:
-                print(f"Error parsing storyboard during deletion for generation {gen_id}: {e}")
+        def assets(record):
+            paths = set()
+            for scene in json.loads(record["storyboard"] or "[]"):
+                for key in ("image_path", "audio_path", "clip_path"):
+                    if scene.get(key):
+                        paths.add(Path(scene[key]).resolve())
+            if record["final_video_path"]:
+                video = Path(record["final_video_path"]).resolve()
+                paths.update((video, video.with_name(video.stem + "_thumb.jpg")))
+            return paths
 
-        # D. Scan the temp folder and delete any file whose timestamp is in range of the collected timestamps
-        if timestamps:
-            min_ts = min(timestamps)
-            max_ts = max(timestamps)
-            # Expand range to capture files generated slightly before or after (within 60 seconds)
-            min_range = min_ts - 60
-            max_range = max_ts + 60
-            
-            temp_dir = os.path.abspath("temp")
-            if os.path.exists(temp_dir):
-                try:
-                    for item in os.listdir(temp_dir):
-                        item_path = os.path.join(temp_dir, item)
-                        if os.path.isfile(item_path):
-                            # Extract any 9-10 digit number from the filename
-                            matches = re.findall(r'\d{9,10}', item)
-                            for match_str in matches:
-                                ts_val = int(match_str)
-                                if min_range <= ts_val <= max_range:
-                                    try:
-                                        os.remove(item_path)
-                                    except Exception as e:
-                                        print(f"Error removing temp file {item_path}: {e}")
-                                    break
-                except Exception as e:
-                    print(f"Error scanning temp directory for cleanup: {e}")
-                    
-    # 2. Delete dependent upload jobs first
-    cursor.execute("DELETE FROM upload_jobs WHERE video_generation_id = ?", (gen_id,))
-    
-    # 3. Delete the generation row
-    cursor.execute("DELETE FROM video_generations WHERE id = ?", (gen_id,))
-    conn.commit()
+        candidates = assets(row)
+        for other in conn.execute("SELECT * FROM video_generations WHERE id != ?", (gen_id,)):
+            candidates.difference_update(assets(other))
+        roots = [Path("temp").resolve(), Path("outputs").resolve()]
+        for path in candidates:
+            if any(path.is_relative_to(root) for root in roots) and path.is_file():
+                path.unlink(missing_ok=True)
+        conn.execute("DELETE FROM upload_jobs WHERE video_generation_id = ?", (gen_id,))
+        conn.execute("DELETE FROM video_generations WHERE id = ?", (gen_id,))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def reserve_platform_upload(video_generation_id, platform):
+    """Claim publishing before contacting the remote service.
+
+    A running reservation is intentionally retained after an ambiguous failure:
+    retrying an upload whose remote result is unknown could publish twice.
+    """
+    with get_db_connection() as conn:
+        changed = conn.execute(
+            "INSERT OR IGNORE INTO platform_uploads "
+            "(id, video_generation_id, platform, external_id, status, created_at) "
+            "VALUES (?, ?, ?, '', 'running', ?)",
+            (str(uuid.uuid4()), video_generation_id, platform, datetime.utcnow().isoformat() + "Z"),
+        ).rowcount
     conn.close()
+    return bool(changed)
+
 
 # Initialize on import
 init_db()

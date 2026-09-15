@@ -9,7 +9,7 @@ import hashlib
 import subprocess
 import soundfile as sf
 import shutil
-import threading
+import asyncio
 from datetime import datetime
 from contextlib import asynccontextmanager
 from typing import Optional, List
@@ -25,6 +25,8 @@ load_dotenv()
 # Custom imports for search and uploads
 import db_manager
 import cost_tracker
+import job_queue
+from asset_state import prepare_storyboard
 import image_providers
 import video_quality as vq
 from hailuo import generate_hailuo_video
@@ -56,22 +58,19 @@ OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
 OLLAMA_NUM_CTX = int(os.getenv("OLLAMA_NUM_CTX", "4096"))
 OLLAMA_KEEP_ALIVE = os.getenv("OLLAMA_KEEP_ALIVE", "30m")
 
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "http://localhost:8000").rstrip("/")
 TEMP_DIR = "temp"
 TEMP_FILE_MAX_AGE_HOURS = 48
 
 
 def _temp_paths_still_in_use() -> Optional[set]:
-    """Every temp/ file path referenced by a generation still in 'draft' or
-    'rendering' status -- these must survive cleanup no matter how old, since
-    a paused local generation (or one a user is still editing scene-by-scene)
-    can legitimately sit for a while. Returns None if the DB can't be read,
-    so the caller skips cleanup entirely rather than risk deleting something
-    still in use."""
+    """Preserve every saved scene's assets, including failed renders that can
+    resume and completed videos that can be edited. Only unreferenced files age
+    out; generation deletion handles owned scene assets explicitly.
+    """
     referenced = set()
     try:
         for gen in db_manager.list_video_generations():
-            if gen.get("status") not in ("draft", "drafting", "rendering"):
-                continue
             for scene in (gen.get("storyboard") or []):
                 for key in ("image_path", "audio_path", "clip_path"):
                     p = scene.get(key)
@@ -118,7 +117,10 @@ async def lifespan(app: FastAPI):
         cleanup_stale_temp_files()
     except Exception as e:
         print(f"Startup temp cleanup failed (non-fatal): {e}")
+    job_queue.recover_interrupted()
+    worker = asyncio.create_task(asyncio.to_thread(drain_jobs))
     yield
+    await worker
 
 
 app = FastAPI(title="AI Video Presenter Backend", version="1.0.0", lifespan=lifespan)
@@ -126,7 +128,7 @@ app = FastAPI(title="AI Video Presenter Backend", version="1.0.0", lifespan=life
 # Enable CORS for Next.js app
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], # In development, allow all origins
+    allow_origins=os.getenv("CORS_ORIGINS", "http://localhost:3000,http://127.0.0.1:3000").split(","),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -221,7 +223,7 @@ def download_file(url, folder, prefix):
         ext = url.split('.')[-1].split('?')[0]
         if len(ext) > 4 or not ext.isalnum():
             ext = "mp4"
-        out_path = os.path.abspath(os.path.join(folder, f"{prefix}_{int(time.time())}.{ext}"))
+        out_path = os.path.abspath(os.path.join(folder, f"{prefix}_{uuid.uuid4().hex}.{ext}"))
         response = requests.get(url, headers=headers, stream=True, timeout=45)
         if response.status_code == 200:
             with open(out_path, 'wb') as f:
@@ -778,12 +780,12 @@ def generate_speech_audio(text: str, voice_key: str, speed: float = 1.0, effect:
         kokoro = Kokoro(onnx_path, voices_path)
         samples, sample_rate = kokoro.create(text, voice=voice, speed=speed, lang="en-us")
         
-        raw_output_path = os.path.abspath(os.path.join("temp", f"voice_raw_{int(time.time())}.wav"))
+        raw_output_path = os.path.abspath(os.path.join("temp", f"voice_raw_{uuid.uuid4().hex}.wav"))
         sf.write(raw_output_path, samples, sample_rate)
         
         audio_path = raw_output_path
         if effect == "Kid (High Pitch)":
-            pitch_output_path = os.path.abspath(os.path.join("temp", f"voice_kid_{int(time.time())}.wav"))
+            pitch_output_path = os.path.abspath(os.path.join("temp", f"voice_kid_{uuid.uuid4().hex}.wav"))
             ffmpeg_cmd = ["ffmpeg", "-y", "-i", raw_output_path, "-af", "asetrate=24000*1.3,atempo=1/1.3", pitch_output_path]
             vq.run_ffmpeg(ffmpeg_cmd, label="kid-pitch voice effect")
             try:
@@ -793,7 +795,7 @@ def generate_speech_audio(text: str, voice_key: str, speed: float = 1.0, effect:
             audio_path = pitch_output_path
             
         elif effect == "Deep (Low Pitch)":
-            pitch_output_path = os.path.abspath(os.path.join("temp", f"voice_deep_{int(time.time())}.wav"))
+            pitch_output_path = os.path.abspath(os.path.join("temp", f"voice_deep_{uuid.uuid4().hex}.wav"))
             ffmpeg_cmd = ["ffmpeg", "-y", "-i", raw_output_path, "-af", "asetrate=24000*0.82,atempo=1/0.82", pitch_output_path]
             vq.run_ffmpeg(ffmpeg_cmd, label="deep-pitch voice effect")
             try:
@@ -899,7 +901,7 @@ def generate_leonardo_motion(image_id: str, prompt: str):
                 if videos:
                     video_url = videos[0].get("url")
                     vid_data = requests.get(video_url).content
-                    out_path = os.path.abspath(os.path.join("temp", f"motion_{int(time.time())}.mp4"))
+                    out_path = os.path.abspath(os.path.join("temp", f"motion_{uuid.uuid4().hex}.mp4"))
                     with open(out_path, "wb") as f:
                         f.write(vid_data)
                     return out_path
@@ -1051,7 +1053,7 @@ def api_generate_speech(req: SpeechRequest):
     
     # Return relative URL path
     rel_path = os.path.relpath(path, os.path.abspath(os.path.curdir))
-    return {"path": path, "url": f"http://localhost:8000/{rel_path.replace(os.path.sep, '/')}"}
+    return {"path": path, "url": f"{PUBLIC_BASE_URL}/{rel_path.replace(os.path.sep, '/')}"}
 
 #: How each scene's visuals are sourced.
 VISUAL_SOURCE_MODES = ("Smart Mix", "Real Footage Only", "AI Only")
@@ -1175,8 +1177,13 @@ def run_viral_shorts_pipeline_new(
         1 for s in scenes
         if not (s.get("image_path") and os.path.exists(s.get("image_path", "")))
     )
-    est_cost = cost_tracker.estimate_render_cost(scenes_needing_image, visual_mode)
-    cost_tracker.assert_within_budget(est_cost)
+    provider = image_providers.resolve_provider(image_provider)
+    motion_scenes = sum(1 for scene in scenes if not scene.get("clip_path")
+                        and (provider == "leonardo" or scene.get("image_id")))
+    est_cost = cost_tracker.estimate_render_cost(scenes_needing_image, visual_mode,
+                                                provider=provider, motion_scenes=motion_scenes)
+    if est_cost > 0:
+        cost_tracker.assert_within_budget(est_cost)
 
     scene_videos = []
     scene_audios = []
@@ -1198,7 +1205,9 @@ def run_viral_shorts_pipeline_new(
         if generation_id else None
     )
 
+    render_token = uuid.uuid4().hex
     for idx, scene in enumerate(scenes):
+        _log(f"Scene {idx+1}/{len(scenes)}: preparing assets.")
         sc_text = scene["narration"]
         sc_visual_prompt = scene["visual_prompt"]
         
@@ -1210,6 +1219,7 @@ def run_viral_shorts_pipeline_new(
         
         # Pick speaker voice
         if not custom_storyboard and not custom_script_data:
+            sc_speaker = voice
             sc_voice_key = voice
         else:
             sc_speaker = scene.get("speaker", voice)
@@ -1274,7 +1284,8 @@ def run_viral_shorts_pipeline_new(
             def _dispatch_image(p):
                 prov = image_providers.resolve_provider(image_provider)
                 if prov == "leonardo":
-                    return generate_leonardo_image(p, leonardo_model, "9:16")
+                    return cost_tracker.run_paid(generation_id, "image",
+                        lambda: generate_leonardo_image(p, leonardo_model, "9:16"))
                 # Ask for the delivery frame size. Each provider generates at
                 # whatever it can actually do well and upscales from there, so
                 # the Ken Burns stage never has to blow up a tiny frame.
@@ -1287,12 +1298,10 @@ def run_viral_shorts_pipeline_new(
                 label=f"image scene {idx+1}", logger=_log
             )
             sc_img, image_id = img_res
-            if image_providers.resolve_provider(image_provider) == "leonardo":
-                cost_tracker.record(generation_id, "image")
         else:
             _log(f"Scene {idx+1}: reusing existing image (resume).")
 
-        scene_video_path = os.path.abspath(os.path.join("temp", f"scene_vid_{int(time.time())}_{idx}.mp4"))
+        scene_video_path = os.path.abspath(os.path.join("temp", f"scene_vid_{render_token}_{idx}.mp4"))
 
         # Make video segment (slideshow with zoompan or motion video)
         motion_vid_path = None
@@ -1300,12 +1309,11 @@ def run_viral_shorts_pipeline_new(
             # Motion is best-effort: retry, but fall back to slideshow if it never succeeds.
             try:
                 motion_vid_path = retry_call(
-                    lambda: generate_leonardo_motion(image_id, final_visual_prompt),
+                    lambda: cost_tracker.run_paid(generation_id, "motion",
+                        lambda: generate_leonardo_motion(image_id, final_visual_prompt)),
                     attempts=2, base_delay=4.0,
                     label=f"motion scene {idx+1}", logger=_log
                 )
-                if motion_vid_path:
-                    cost_tracker.record(generation_id, "motion")
             except RetryError:
                 _log(f"Scene {idx+1}: motion generation failed; falling back to slideshow.")
                 motion_vid_path = None
@@ -1314,12 +1322,11 @@ def run_viral_shorts_pipeline_new(
             # Best-effort: retry, then fall back to slideshow if it never succeeds.
             try:
                 motion_vid_path = retry_call(
-                    lambda: generate_hailuo_video(final_visual_prompt, first_frame_path=sc_img),
+                    lambda: cost_tracker.run_paid(generation_id, "motion",
+                        lambda: generate_hailuo_video(final_visual_prompt, first_frame_path=sc_img), service="hailuo"),
                     attempts=2, base_delay=5.0,
                     label=f"hailuo scene {idx+1}", logger=_log
                 )
-                if motion_vid_path:
-                    cost_tracker.record(generation_id, "motion")
             except RetryError:
                 _log(f"Scene {idx+1}: Hailuo generation failed; falling back to slideshow.")
                 motion_vid_path = None
@@ -1351,12 +1358,13 @@ def run_viral_shorts_pipeline_new(
         
         aud_rel = os.path.relpath(sc_audio, os.path.abspath(os.path.curdir))
         scene_entry = {
+            **scene,
             "scene": idx + 1,
             "speaker": sc_speaker,
             "narration": sc_text,
-            "visual_prompt": final_visual_prompt,
+            "visual_prompt": sc_visual_prompt,
             "image_id": image_id,
-            "audio_url": f"http://localhost:8000/{aud_rel.replace(os.path.sep, '/')}",
+            "audio_url": f"{PUBLIC_BASE_URL}/{aud_rel.replace(os.path.sep, '/')}",
             "audio_path": sc_audio,
             "duration": sc_duration,
             "visual_source": "stock" if sc_clip else "generated",
@@ -1366,11 +1374,11 @@ def run_viral_shorts_pipeline_new(
         if sc_clip:
             clip_rel = os.path.relpath(sc_clip, os.path.abspath(os.path.curdir))
             scene_entry["clip_path"] = sc_clip
-            scene_entry["clip_url"] = f"http://localhost:8000/{clip_rel.replace(os.path.sep, '/')}"
+            scene_entry["clip_url"] = f"{PUBLIC_BASE_URL}/{clip_rel.replace(os.path.sep, '/')}"
         if sc_img:
             img_rel = os.path.relpath(sc_img, os.path.abspath(os.path.curdir))
             scene_entry["image_path"] = sc_img
-            scene_entry["image_url"] = f"http://localhost:8000/{img_rel.replace(os.path.sep, '/')}"
+            scene_entry["image_url"] = f"{PUBLIC_BASE_URL}/{img_rel.replace(os.path.sep, '/')}"
         storyboard.append(scene_entry)
 
         # Write asset paths back into the source scene so a re-run resumes.
@@ -1607,6 +1615,7 @@ class DraftRequest(BaseModel):
     duration_preset: str = DEFAULT_DURATION_PRESET
 
 class RenderRequest(QualityOptions):
+    local_image_model: Optional[str] = None
     generation_id: str
     storyboard: List[dict]
     visual_mode: str = "Cinematic Slideshow"
@@ -1632,6 +1641,9 @@ class SingleAssetRegenRequest(BaseModel):
     voice: Optional[str] = None
     speed: Optional[float] = 1.0
     leonardo_model: Optional[str] = None
+    image_provider: Optional[str] = None
+    local_image_model: Optional[str] = None
+    visual_source_mode: str = "Smart Mix"
 
 class DbUploadRequest(BaseModel):
     video_generation_id: str
@@ -1702,6 +1714,7 @@ def run_draft_task(gen_id: str, req: "DraftRequest") -> None:
         db_manager.update_video_generation(gen_id, status="failed", error_message=str(e))
         notify("Draft script failed", f"Draft for '{req.prompt}' failed: {e}",
               context={"generation_id": gen_id})
+        raise
 
 
 @app.post("/api/draft-script")
@@ -1710,11 +1723,20 @@ def api_draft_script(req: DraftRequest, background_tasks: BackgroundTasks):
     db_manager.create_video_generation(
         gen_id, req.prompt, req.prompt, None, None, status="drafting"
     )
-    background_tasks.add_task(run_draft_task, gen_id, req)
+    job_queue.enqueue("draft", gen_id, {**req.model_dump(), "generation_id": gen_id})
+    background_tasks.add_task(drain_jobs)
     return {"success": True, "generation_id": gen_id, "status": "drafting"}
 
 @app.post("/api/regenerate-scene-asset")
 def api_regenerate_scene_asset(req: SingleAssetRegenRequest):
+    try:
+        with job_queue.resource_guard(req.generation_id):
+            return regenerate_scene_asset(req)
+    except job_queue.JobConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+
+
+def regenerate_scene_asset(req: SingleAssetRegenRequest):
     gen = db_manager.get_video_generation(req.generation_id)
     if not gen:
         raise HTTPException(status_code=404, detail="Video generation not found")
@@ -1729,15 +1751,31 @@ def api_regenerate_scene_asset(req: SingleAssetRegenRequest):
         if req.asset_type == "image":
             prompt = req.prompt or scene.get("visual_prompt")
             model = req.leonardo_model or "Lucid Realism (High Quality Face)"
-            path, image_id = generate_leonardo_image(prompt, model, "9:16")
+            provider = image_providers.resolve_provider(req.image_provider)
+            script = gen.get("script_data") or {}
+            composed = script_utils.compose_image_prompt(
+                subject=script.get("global_subject_focus", ""), scene=prompt,
+                style=script.get("global_visual_style", ""))
+            if provider == "leonardo":
+                path, image_id = cost_tracker.run_paid(req.generation_id, "image",
+                    lambda: generate_leonardo_image(composed, model, "9:16"))
+            else:
+                path, image_id = image_providers.generate_image(
+                    provider, composed, image_providers.DELIVERY_W, image_providers.DELIVERY_H)
             if not path:
-                raise ValueError("Leonardo image generation failed")
+                raise ValueError("Image generation failed")
                 
             rel_path = os.path.relpath(path, os.path.abspath(os.path.curdir))
             scene["image_path"] = path
-            scene["image_url"] = f"http://localhost:8000/{rel_path.replace(os.path.sep, '/')}"
+            scene["image_url"] = f"{PUBLIC_BASE_URL}/{rel_path.replace(os.path.sep, '/')}"
             scene["image_id"] = image_id
             scene["visual_prompt"] = prompt
+            scene["image_provider"] = provider
+            scene["image_model"] = model
+            scene.pop("clip_path", None)
+            scene.pop("clip_url", None)
+            scene["visual_source"] = "generated"
+            scene.pop("visual_fingerprint", None)
             
         elif req.asset_type == "audio":
             text = req.prompt or scene.get("narration")
@@ -1750,35 +1788,38 @@ def api_regenerate_scene_asset(req: SingleAssetRegenRequest):
             duration = info.duration
             rel_path = os.path.relpath(path, os.path.abspath(os.path.curdir))
             scene["audio_path"] = path
-            scene["audio_url"] = f"http://localhost:8000/{rel_path.replace(os.path.sep, '/')}"
+            scene["audio_url"] = f"{PUBLIC_BASE_URL}/{rel_path.replace(os.path.sep, '/')}"
             scene["duration"] = duration
             scene["narration"] = text
             scene["speaker"] = voice
+            scene["audio_speed"] = req.speed or 1.0
+            scene.pop("audio_fingerprint", None)
             
         else:
             raise HTTPException(status_code=400, detail="Invalid asset type")
             
+        options = RenderRequest(generation_id=req.generation_id, storyboard=storyboard,
+            image_provider=req.image_provider, local_image_model=req.local_image_model,
+            leonardo_model=req.leonardo_model or "Lucid Realism (High Quality Face)",
+            visual_source_mode=req.visual_source_mode, speed=req.speed or 1.0)
+        prepared = prepare_storyboard(options, gen)[req.scene_index]
+        key = "visual_fingerprint" if req.asset_type == "image" else "audio_fingerprint"
+        scene[key] = prepared[key]
         db_manager.update_video_generation(req.generation_id, storyboard=storyboard)
         return {
             "success": True,
             "scene": scene
         }
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 def run_render_task(generation_id: str, req: RenderRequest):
-    # Resume: prefer the storyboard persisted in the DB (it may already carry
-    # asset paths from a previous partial run) over the request payload.
-    storyboard_in = req.storyboard
     existing = db_manager.get_video_generation(generation_id)
-    if existing and existing.get("storyboard"):
-        persisted = {s.get("scene"): s for s in existing["storyboard"]}
-        for sc in storyboard_in:
-            prev = persisted.get(sc.get("scene"))
-            if prev and not sc.get("image_path"):
-                sc["image_path"] = prev.get("image_path")
-                sc["image_id"] = prev.get("image_id")
-                sc["audio_path"] = prev.get("audio_path")
+    if not existing:
+        raise ValueError("Generation no longer exists.")
+    storyboard_in = prepare_storyboard(req, existing or {})
 
     # Preserve the global visual anchors (style + recurring subject) saved at
     # draft time so the chosen art style (e.g. stickman) survives to render.
@@ -1787,11 +1828,20 @@ def run_render_task(generation_id: str, req: RenderRequest):
     render_script_data = dict(persisted_script)
     render_script_data["scenes"] = storyboard_in
 
+    logs = []
+    def _log(message):
+        logs.append(message)
+        db_manager.update_video_generation(generation_id, logs=logs[-500:])
+
     def _persist_progress(sb):
-        db_manager.update_video_generation(generation_id, storyboard=sb)
+        # Preserve scenes that have not rendered yet, including their edits.
+        merged = list(storyboard_in)
+        merged[:len(sb)] = sb
+        db_manager.update_video_generation(generation_id, storyboard=merged)
 
     try:
-        db_manager.update_video_generation(generation_id, status="rendering")
+        db_manager.update_video_generation(generation_id, status="rendering", error_message="",
+                                           logs=[], storyboard=storyboard_in)
 
         final_video, storyboard, topic, script_data = run_viral_shorts_pipeline_new(
             prompt="",
@@ -1812,6 +1862,7 @@ def run_render_task(generation_id: str, req: RenderRequest):
             enable_transition_sfx=req.enable_transition_sfx,
             custom_script_data=render_script_data,
             on_scene_complete=_persist_progress,
+            log_callback=_log,
             generation_id=generation_id,
             **quality_kwargs(req)
         )
@@ -1825,16 +1876,23 @@ def run_render_task(generation_id: str, req: RenderRequest):
             print(f"Post-render temp cleanup failed (non-fatal): {e}")
     except Exception as e:
         print(f"Rendering failed: {e}")
-        db_manager.update_video_generation(generation_id, status="failed")
+        db_manager.update_video_generation(generation_id, status="failed", error_message=str(e))
         notify(
             "Storyboard render failed",
             f"Render task for generation {generation_id} failed: {e}",
             context={"generation_id": generation_id, "topic": (existing or {}).get("topic")}
         )
+        raise
 
 @app.post("/api/render-storyboard")
 def api_render_storyboard(req: RenderRequest, background_tasks: BackgroundTasks):
-    background_tasks.add_task(run_render_task, req.generation_id, req)
+    if not db_manager.get_video_generation(req.generation_id):
+        raise HTTPException(status_code=404, detail="Generation not found")
+    try:
+        job_queue.enqueue("render", req.generation_id, req.model_dump())
+    except job_queue.JobConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    background_tasks.add_task(drain_jobs)
     return {"success": True, "generation_id": req.generation_id}
 
 @app.get("/api/youtube/auth-status")
@@ -2007,6 +2065,8 @@ def process_upload_job(job_id: str):
                         logs.append(f"YouTube upload progress: {pct}%")
                     db_manager.update_upload_job(job_id, logs=logs)
 
+                if not db_manager.reserve_platform_upload(gen_id, "youtube"):
+                    raise ValueError("An earlier upload may have reached YouTube. Check your channel before retrying; the upload reservation has been retained.")
                 vid_id = upload_video_to_youtube(
                     video_file,
                     yt_meta.get("title", "AI Generated Short"),
@@ -2029,6 +2089,7 @@ def process_upload_job(job_id: str):
             f"Upload job {job_id} failed: {e}",
             context={"job_id": job_id, "platforms": job.get("platforms")}
         )
+        raise
 
 @app.get("/api/history")
 def api_get_history():
@@ -2036,7 +2097,7 @@ def api_get_history():
     for row in rows:
         if row.get("final_video_path"):
             rel = os.path.relpath(row["final_video_path"], os.path.abspath(os.path.curdir))
-            row["video_url"] = f"http://localhost:8000/{rel.replace(os.path.sep, '/')}"
+            row["video_url"] = f"{PUBLIC_BASE_URL}/{rel.replace(os.path.sep, '/')}"
         else:
             row["video_url"] = ""
     return rows
@@ -2047,10 +2108,18 @@ def api_get_upload_queue():
 
 
 @app.post("/api/schedule-upload")
-def api_schedule_upload(req: DbUploadRequest):
+def api_schedule_upload(req: DbUploadRequest, background_tasks: BackgroundTasks):
     """Upload to YouTube now. Always immediate: the deferred/scheduled-time
     path and its background polling thread were removed along with the rest
     of the autonomous scheduler -- this is a one-click publish button."""
+    generation = db_manager.get_video_generation(req.video_generation_id)
+    if not generation or generation.get("status") != "completed" or not generation.get("final_video_path"):
+        raise HTTPException(status_code=400, detail="Render this video successfully before uploading.")
+    if req.platforms != ["youtube"] or req.youtube_privacy not in ("private", "unlisted", "public"):
+        raise HTTPException(status_code=422, detail="Choose YouTube and a valid privacy setting.")
+    previous = db_manager.get_platform_upload(req.video_generation_id, "youtube")
+    if previous:
+        raise HTTPException(status_code=409, detail="This video has already been uploaded or has an upload requiring review.")
     job_id = str(uuid.uuid4())
 
     db_manager.create_upload_job(
@@ -2064,12 +2133,18 @@ def api_schedule_upload(req: DbUploadRequest):
             "privacy": req.youtube_privacy
         },
         {},
-        status="running",
+        status="queued",
     )
 
-    t = threading.Thread(target=process_upload_job, args=(job_id,))
-    t.daemon = True
-    t.start()
+    try:
+        job_queue.enqueue("upload", req.video_generation_id, {"job_id": job_id})
+    except job_queue.JobConflict as exc:
+        with db_manager.get_db_connection() as conn:
+            conn.execute("DELETE FROM upload_jobs WHERE id = ?", (job_id,))
+        conn.close()
+        raise HTTPException(status_code=409, detail=str(exc))
+
+    background_tasks.add_task(drain_jobs)
 
     return {"success": True, "job_id": job_id}
 
@@ -2078,7 +2153,7 @@ def static_url(path: Optional[str]) -> str:
     if not path or not os.path.exists(path):
         return ""
     rel = os.path.relpath(path, os.path.abspath(os.path.curdir))
-    return f"http://localhost:8000/{rel.replace(os.path.sep, '/')}"
+    return f"{PUBLIC_BASE_URL}/{rel.replace(os.path.sep, '/')}"
 
 
 def thumbnail_url_for(video_path: Optional[str]) -> str:
@@ -2120,8 +2195,13 @@ def api_generation_status(generation_id: str):
 @app.delete("/api/generation/{generation_id}")
 def api_delete_generation(generation_id: str):
     try:
-        db_manager.delete_video_generation(generation_id)
+        with job_queue.resource_guard(generation_id):
+            db_manager.delete_video_generation(generation_id)
         return {"success": True}
+    except HTTPException:
+        raise
+    except ValueError as e:
+        raise HTTPException(status_code=409, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -2134,6 +2214,15 @@ def get_upload_status(job_id: str):
     return job
 
 
+
+def drain_jobs():
+    job_queue.drain({
+        "draft": lambda payload: run_draft_task(payload.pop("generation_id"), DraftRequest(**payload)),
+        "render": lambda payload: run_render_task(payload["generation_id"], RenderRequest(**payload)),
+        "upload": lambda payload: process_upload_job(payload["job_id"]),
+    })
+
+
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("backend:app", host="0.0.0.0", port=8000, reload=False)
+    uvicorn.run("backend:app", host=os.getenv("BACKEND_HOST", "127.0.0.1"), port=8000, reload=False)

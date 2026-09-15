@@ -22,7 +22,7 @@ fi
 
 if [[ ! -d frontend/node_modules ]]; then
   echo "Installing frontend dependencies..."
-  (cd frontend && npm install)
+  (cd frontend && npm ci)
 fi
 
 # --- Rotate the backend log before each run ----------------------------------
